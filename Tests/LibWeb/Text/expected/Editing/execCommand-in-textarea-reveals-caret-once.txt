@@ -1,0 +1,2 @@
+layout during edits: (no layout)
+caret revealed after the next rendering update: true

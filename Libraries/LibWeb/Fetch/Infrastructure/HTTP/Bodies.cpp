@@ -11,6 +11,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/IncrementalReadLoopReadRequest.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Streams/ReadableStream.h>
@@ -18,110 +19,117 @@
 
 namespace Web::Fetch::Infrastructure {
 
+extern "C" {
+
+// Called by Bindings/Rust/src/fetch/infrastructure/http/bodies.rs.
+bool web_fetch_body_length(Body*, u64* out_length);
+}
+
 GC_DEFINE_ALLOCATOR(Body);
 
-GC::Ref<Body> Body::create(GC::Ref<Streams::ReadableStream> stream)
+FetchBody::FetchBody(Optional<Core::ImmutableBytes> source, Optional<u64> length)
+    : m_source(move(source))
+    , m_length(length)
 {
-    return GC::Heap::the().allocate<Body>(stream);
 }
 
-GC::Ref<Body> Body::create(GC::Ref<Streams::ReadableStream> stream, SourceType source, Optional<u64> length)
+ResponseBody::ResponseBody(Bytes bytes, Optional<u64> length)
+    : m_bytes(move(bytes))
+    , m_length(length)
 {
-    return GC::Heap::the().allocate<Body>(stream, source, length);
 }
 
-Body::Body(GC::Ref<Streams::ReadableStream> stream)
+ResponseBody ResponseBody::from_bytes(Core::ImmutableBytes bytes)
+{
+    auto length = bytes.size();
+    return ResponseBody { move(bytes), length };
+}
+
+ResponseBody ResponseBody::from_extracted_body(Body const& body)
+{
+    if (auto const& source = body.source(); source.has_value())
+        return ResponseBody { *source, body.length() };
+    return ResponseBody { ReadThroughStream {}, body.length() };
+}
+
+Optional<Core::ImmutableBytes const&> ResponseBody::source() const
+{
+    if (auto const* bytes = m_bytes.get_pointer<Core::ImmutableBytes>())
+        return *bytes;
+    return {};
+}
+
+GC::Ref<Body> Body::create(GC::Ref<Streams::ReadableStream> stream, FetchBody fetch_body)
+{
+    return GC::Heap::the().allocate<Body>(stream, move(fetch_body), NeverSniffed {});
+}
+
+GC::Ref<Body> Body::create_over_bytes(JS::Realm& realm, Core::ImmutableBytes bytes)
+{
+    auto [extracted_body, _] = safely_extract_body(realm, bytes);
+    auto resource_header = bytes.slice(0, min(bytes.size(), MAX_SNIFF_BYTES));
+    return GC::Heap::the().allocate<Body>(extracted_body->stream(), FetchBody {}, ReadResourceHeader { move(resource_header) });
+}
+
+GC::Ref<Body> Body::create_over_arriving_bytes(GC::Ref<Streams::ReadableStream> stream, ResourceHeaderReader reader)
+{
+    return GC::Heap::the().allocate<Body>(stream, FetchBody {}, UnreadResourceHeader { reader });
+}
+
+Body::Body(GC::Ref<Streams::ReadableStream> stream, FetchBody fetch_body, ResourceHeader resource_header)
     : m_stream(stream)
+    , m_fetch_body(move(fetch_body))
+    , m_resource_header(move(resource_header))
 {
-}
-
-Body::Body(GC::Ref<Streams::ReadableStream> stream, SourceType source, Optional<u64> length)
-    : m_stream(stream)
-    , m_source(move(source))
-    , m_length(move(length))
-{
-}
-
-void Body::set_source(Core::ImmutableBytes source, Optional<u64> length)
-{
-    m_source = move(source);
-    m_length = length;
 }
 
 void Body::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_stream);
+    if (auto const* unread = m_resource_header.get_pointer<UnreadResourceHeader>())
+        visitor.visit(unread->reader);
     visitor.visit(m_sniff_bytes_callback);
-    m_source.visit(
-        [&](GC::Ref<FileAPI::Blob> const& blob) { visitor.visit(blob); },
-        [](auto const&) {});
 }
 
-void Body::append_sniff_bytes(ReadonlyBytes bytes)
+Optional<Body::SniffBytes> Body::sniff_bytes_if_available() const
 {
-    if (m_sniff_bytes_complete)
-        return;
-
-    size_t space_remaining = MAX_SNIFF_BYTES - m_sniff_bytes.size();
-    if (space_remaining == 0) {
-        set_sniff_bytes_complete();
-        return;
-    }
-
-    size_t to_append = min(bytes.size(), space_remaining);
-    m_sniff_bytes.append(bytes.slice(0, to_append));
-
-    if (m_sniff_bytes.size() >= MAX_SNIFF_BYTES)
-        set_sniff_bytes_complete();
-}
-
-void Body::set_sniff_bytes_complete()
-{
-    if (m_sniff_bytes_complete)
-        return;
-    m_sniff_bytes_complete = true;
-    if (m_sniff_bytes_callback) {
-        auto callback = exchange(m_sniff_bytes_callback, nullptr);
-        callback->function()(m_sniff_bytes);
-    }
-}
-
-Optional<ReadonlyBytes> Body::sniff_bytes_if_available() const
-{
-    // Non-streaming body: source has bytes
-    if (m_source.has<ByteBuffer>()) {
-        auto const& buffer = m_source.get<ByteBuffer>();
-        return buffer.bytes().slice(0, min(buffer.size(), MAX_SNIFF_BYTES));
-    }
-
-    if (m_source.has<Core::ImmutableBytes>()) {
-        auto bytes = m_source.get<Core::ImmutableBytes>().bytes();
-        return bytes.slice(0, min(bytes.size(), MAX_SNIFF_BYTES));
-    }
-
-    if (m_source.has<GC::Ref<FileAPI::Blob>>()) {
-        auto raw = m_source.get<GC::Ref<FileAPI::Blob>>()->raw_bytes();
-        return raw.slice(0, min(raw.size(), MAX_SNIFF_BYTES));
-    }
-
-    // Streaming body: bytes captured during fetch
-    if (m_sniff_bytes_complete)
-        return m_sniff_bytes;
-
-    // Still waiting for bytes
+    VERIFY(!m_resource_header.has<NeverSniffed>());
+    if (auto const* read = m_resource_header.get_pointer<ReadResourceHeader>())
+        return SniffBytes { read->bytes.bytes(), read->outcome };
     return {};
 }
 
 void Body::wait_for_sniff_bytes(SniffBytesCallback on_ready)
 {
-    if (auto bytes = sniff_bytes_if_available(); bytes.has_value()) {
-        on_ready->function()(bytes.value());
+    if (auto sniff_bytes = sniff_bytes_if_available(); sniff_bytes.has_value()) {
+        on_ready->function()(sniff_bytes.value());
         return;
     }
 
-    // Wait for bytes to arrive
+    VERIFY(!m_sniff_bytes_callback);
     m_sniff_bytes_callback = on_ready;
+
+    auto const* unread = m_resource_header.get_pointer<UnreadResourceHeader>();
+    if (!unread)
+        return;
+    auto reader = unread->reader;
+    m_resource_header = ReadingResourceHeader {};
+    reader->function()(GC::create_function(heap(), GC::captures(*this), [](Body& body, Core::ImmutableBytes bytes, SniffOutcome outcome) {
+        body.did_read_resource_header(move(bytes), outcome);
+    }));
+}
+
+void Body::did_read_resource_header(Core::ImmutableBytes bytes, SniffOutcome outcome)
+{
+    VERIFY(m_resource_header.has<ReadingResourceHeader>());
+    m_resource_header = ReadResourceHeader { move(bytes), outcome };
+
+    auto steps = GC::create_function(heap(), GC::captures(*this), [](Body& body) {
+        auto callback = exchange(body.m_sniff_bytes_callback, nullptr);
+        callback->function()(*body.sniff_bytes_if_available());
+    });
+    HTML::queue_a_task(HTML::Task::Source::Networking, HTML::current_event_loop(), nullptr, steps);
 }
 
 // https://fetch.spec.whatwg.org/#concept-body-clone
@@ -137,7 +145,7 @@ GC::Ref<Body> Body::clone(JS::Realm& realm)
     m_stream = out1;
 
     // 3. Return a body whose stream is out2 and other members are copied from body.
-    return Body::create(*out2, m_source, m_length);
+    return Body::create(*out2, m_fetch_body);
 }
 
 // https://fetch.spec.whatwg.org/#body-fully-read
@@ -150,19 +158,19 @@ void Body::fully_read(JS::Realm& realm, Web::Fetch::Infrastructure::Body::Proces
         task_destination = HTML::ParallelQueue::create();
 
     // 2. Let successSteps given a byte sequence bytes be to queue a fetch task to run processBody given bytes, with taskDestination.
-    auto success_steps = [process_body, task_destination](ByteBuffer bytes) {
-        queue_fetch_task(task_destination, GC::create_function(GC::Heap::the(), [process_body, bytes = move(bytes)]() mutable {
+    auto success_steps = GC::create_function(GC::Heap::the(), GC::captures(process_body, task_destination), [](ProcessBodyCallback process_body, TaskDestination const& task_destination, ByteBuffer bytes) {
+        queue_fetch_task(task_destination, GC::create_function(GC::Heap::the(), GC::captures(process_body, move(bytes)), [](ProcessBodyCallback process_body, ByteBuffer& bytes) {
             process_body->function()(move(bytes));
         }));
-    };
+    });
 
     // 3. Let errorSteps optionally given an exception exception be to queue a fetch task to run processBodyError given
     //    exception, with taskDestination.
-    auto error_steps = [process_body_error, task_destination](JS::Value exception) {
-        queue_fetch_task(task_destination, GC::create_function(GC::Heap::the(), [process_body_error, exception]() {
+    auto error_steps = GC::create_function(GC::Heap::the(), GC::captures(process_body_error, task_destination), [](ProcessBodyErrorCallback process_body_error, TaskDestination const& task_destination, JS::Value exception) {
+        queue_fetch_task(task_destination, GC::create_function(GC::Heap::the(), GC::captures(process_body_error, exception), [](ProcessBodyErrorCallback process_body_error, JS::Value exception) {
             process_body_error->function()(exception);
         }));
-    };
+    });
 
     // 4. Let reader be the result of getting a reader for body’s stream. If that threw an exception, then run errorSteps
     //    with that exception and return.
@@ -170,12 +178,12 @@ void Body::fully_read(JS::Realm& realm, Web::Fetch::Infrastructure::Body::Proces
 
     if (reader.is_exception()) {
         auto throw_completion = WebIDL::exception_to_throw_completion(realm.vm(), realm, reader.release_error());
-        error_steps(throw_completion.release_value());
+        error_steps->function()(throw_completion.release_value());
         return;
     }
 
     // 5. Read all bytes from reader, given successSteps and errorSteps.
-    reader.value()->read_all_bytes(GC::create_function(GC::Heap::the(), move(success_steps)), GC::create_function(GC::Heap::the(), move(error_steps)));
+    reader.value()->read_all_bytes(success_steps, error_steps);
 }
 
 // https://fetch.spec.whatwg.org/#body-incrementally-read
@@ -193,7 +201,7 @@ GC::Ref<Streams::ReadableStreamDefaultReader> Body::incrementally_read(JS::Realm
 
     // 3. Perform the incrementally-read loop given reader, taskDestination, processBodyChunk, processEndOfBody, and processBodyError.
     VERIFY(!task_destination.has<Empty>());
-    incrementally_read_loop(reader, task_destination.get<GC::Ref<JS::Object>>(), process_body_chunk, process_end_of_body, process_body_error);
+    incrementally_read_loop(reader, task_destination, process_body_chunk, process_end_of_body, process_body_error);
     return reader;
 }
 
@@ -221,9 +229,24 @@ GC::Ref<Body> byte_sequence_as_body(JS::Realm& realm, ReadonlyBytes bytes)
     return body;
 }
 
+// https://fetch.spec.whatwg.org/#byte-sequence-as-a-body
+// NB: Each view of the body makes its stream from these bytes.
+ResponseBody byte_sequence_as_response_body(ReadonlyBytes bytes)
+{
+    return ResponseBody::from_bytes(MUST(Core::ImmutableBytes::copy(bytes)));
+}
+
 void cancel_incremental_read(Streams::ReadableStreamDefaultReader& reader)
 {
     reader.cancel({});
+}
+
+bool web_fetch_body_length(Body* body, u64* out_length)
+{
+    if (!body->length().has_value())
+        return false;
+    *out_length = *body->length();
+    return true;
 }
 
 }

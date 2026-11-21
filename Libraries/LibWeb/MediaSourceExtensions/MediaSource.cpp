@@ -5,11 +5,11 @@
  */
 
 #include <LibGC/Heap.h>
-#include <LibMedia/CodecParameters.h>
 #include <LibMedia/MediaSourceExtensions/ISOBMFFByteStreamParser.h>
 #include <LibMedia/MediaSourceExtensions/WebMByteStreamParser.h>
 #include <LibMediaClient/Client.h>
 #include <LibMediaClient/RemotePlaybackManager.h>
+#include <LibMediaCodecs/CodecParameters.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/HTML/AudioTrackList.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -83,7 +83,7 @@ void MediaSource::queue_a_media_source_task(GC::Ref<GC::Function<void()>> task)
     if (media_element_assigned_to() != nullptr)
         document = media_element_assigned_to()->document();
 
-    HTML::queue_a_task(HTML::Task::Source::Unspecified, HTML::main_thread_event_loop(), document, task);
+    HTML::queue_a_task(HTML::Task::Source::Unspecified, HTML::current_event_loop(), document, task);
 }
 
 bool MediaSource::ready_state_is_closed() const
@@ -100,6 +100,11 @@ void MediaSource::set_ready_state_to_open_and_fire_sourceopen_event()
 {
     m_ready_state = ReadyState::Open;
 
+    // NB: [[live seekable range]] outlives an attachment, so a MediaSource attached again hands it to its new media
+    //     element's playback manager.
+    if (m_live_seekable_range.has_value() && m_media_element_assigned_to)
+        m_media_element_assigned_to->playback_manager().set_live_seekable_range(m_live_seekable_range);
+
     // AD-HOC: Notify all demuxers that we have new data coming in and cannot consider the end of the buffer to be
     //         the end of the stream.
     for (size_t i = 0; i < m_source_buffers->length(); i++) {
@@ -107,9 +112,9 @@ void MediaSource::set_ready_state_to_open_and_fire_sourceopen_event()
         source_buffer.clear_reached_end_of_stream({});
     }
 
-    queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        auto event = create_associated_event(EventNames::sourceopen);
-        dispatch_event(event);
+    queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        auto event = self.create_associated_event(EventNames::sourceopen);
+        self.dispatch_event(event);
     }));
 }
 
@@ -152,7 +157,7 @@ void MediaSource::detach_from_media_element(Badge<HTML::HTMLMediaElement>)
     m_active_source_buffers->remove_all_buffers({});
 
     // 7. Queue a task to fire an event named removesourcebuffer at activeSourceBuffers.
-    queue_a_media_source_task(GC::create_function(GC::Heap::the(), [media_source = GC::Ref(*this), source_buffers = m_active_source_buffers] {
+    queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*this), m_active_source_buffers), [](auto& media_source, auto& source_buffers) {
         source_buffers->dispatch_event(media_source->create_associated_event(EventNames::removesourcebuffer));
     }));
 
@@ -160,13 +165,13 @@ void MediaSource::detach_from_media_element(Badge<HTML::HTMLMediaElement>)
     m_source_buffers->remove_all_buffers({});
 
     // 9. Queue a task to fire an event named removesourcebuffer at sourceBuffers.
-    queue_a_media_source_task(GC::create_function(GC::Heap::the(), [media_source = GC::Ref(*this), source_buffers = m_source_buffers] {
+    queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*this), m_source_buffers), [](auto& media_source, auto& source_buffers) {
         source_buffers->dispatch_event(media_source->create_associated_event(EventNames::removesourcebuffer));
     }));
 
     // 10. Queue a task to fire an event named sourceclose at the MediaSource.
-    queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(create_associated_event(EventNames::sourceclose));
+    queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.create_associated_event(EventNames::sourceclose));
     }));
 
     // AD-HOC: Sever the media element assignment that was established when this MediaSource was attached.
@@ -186,6 +191,68 @@ GC::Ref<SourceBufferList> MediaSource::active_source_buffers()
 Utf16String MediaSource::next_track_id()
 {
     return Utf16String::number(m_next_track_id++);
+}
+
+// https://w3c.github.io/media-source/#active-source-buffer-changes
+void MediaSource::selected_video_track_changed(Badge<HTML::VideoTrack>, GC::Ptr<SourceBuffer> previously_selected_track_source_buffer, GC::Ptr<SourceBuffer> newly_selected_track_source_buffer)
+{
+    // If the selected video track changes, then run the following steps:
+    // 1. If the SourceBuffer associated with the previously selected video track is not associated with any other
+    //    enabled tracks, run the following steps:
+    auto previously_selected_track_source_buffer_became_inactive = [&] {
+        if (!previously_selected_track_source_buffer || !m_active_source_buffers->contains(*previously_selected_track_source_buffer))
+            return false;
+        return !previously_selected_track_source_buffer->is_associated_with_an_enabled_or_selected_track();
+    }();
+    if (previously_selected_track_source_buffer_became_inactive) {
+        // 1. Remove the SourceBuffer from activeSourceBuffers.
+        m_active_source_buffers->remove(*previously_selected_track_source_buffer);
+
+        // 2. Queue a task to fire an event named removesourcebuffer at activeSourceBuffers
+        queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*this), m_active_source_buffers), [](auto& media_source, auto& source_buffers) {
+            source_buffers->dispatch_event(media_source->create_associated_event(EventNames::removesourcebuffer));
+        }));
+    }
+
+    // 2. If the SourceBuffer associated with the newly selected video track is not already in activeSourceBuffers,
+    //    run the following steps:
+    if (newly_selected_track_source_buffer && !m_active_source_buffers->contains(*newly_selected_track_source_buffer)) {
+        // 1. Add the SourceBuffer to activeSourceBuffers.
+        m_active_source_buffers->insert_in_order_of(*newly_selected_track_source_buffer, m_source_buffers);
+
+        // 2. Queue a task to fire an event named addsourcebuffer at activeSourceBuffers
+        queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*this), m_active_source_buffers), [](auto& media_source, auto& source_buffers) {
+            source_buffers->dispatch_event(media_source->create_associated_event(EventNames::addsourcebuffer));
+        }));
+    }
+}
+
+// https://w3c.github.io/media-source/#active-source-buffer-changes
+void MediaSource::audio_track_enabled_changed(Badge<HTML::AudioTrack>, SourceBuffer& source_buffer, bool enabled)
+{
+    // If an audio track becomes disabled and the SourceBuffer associated with this track is not associated with any
+    // other enabled or selected track, then run the following steps:
+    if (!enabled && m_active_source_buffers->contains(source_buffer) && !source_buffer.is_associated_with_an_enabled_or_selected_track()) {
+        // 1. Remove the SourceBuffer associated with the audio track from activeSourceBuffers
+        m_active_source_buffers->remove(source_buffer);
+
+        // 2. Queue a task to fire an event named removesourcebuffer at activeSourceBuffers
+        queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*this), m_active_source_buffers), [](auto& media_source, auto& source_buffers) {
+            source_buffers->dispatch_event(media_source->create_associated_event(EventNames::removesourcebuffer));
+        }));
+    }
+
+    // If an audio track becomes enabled and the SourceBuffer associated with this track is not already in
+    // activeSourceBuffers, then run the following steps:
+    if (enabled && !m_active_source_buffers->contains(source_buffer)) {
+        // 1. Add the SourceBuffer associated with the audio track to activeSourceBuffers
+        m_active_source_buffers->insert_in_order_of(source_buffer, m_source_buffers);
+
+        // 2. Queue a task to fire an event named addsourcebuffer at activeSourceBuffers
+        queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*this), m_active_source_buffers), [](auto& media_source, auto& source_buffers) {
+            source_buffers->dispatch_event(media_source->create_associated_event(EventNames::addsourcebuffer));
+        }));
+    }
 }
 
 // https://w3c.github.io/media-source/#dom-mediasource-onsourceopen
@@ -265,8 +332,12 @@ WebIDL::ExceptionOr<GC::Ref<SourceBuffer>> MediaSource::add_source_buffer(Utf16S
     // FIXME: 7. If buffer's [[generate timestamps flag]] is true, set buffer's mode to "sequence".
     //           Otherwise, set buffer's mode to "segments".
     // 8. Append buffer to this's sourceBuffers.
-    // 9. Queue a task to fire an event named addsourcebuffer at this's sourceBuffers.
     m_source_buffers->append(buffer);
+
+    // 9. Queue a task to fire an event named addsourcebuffer at this's sourceBuffers.
+    queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(*this), m_source_buffers), [](auto& media_source, auto& source_buffers) {
+        source_buffers->dispatch_event(media_source->create_associated_event(EventNames::addsourcebuffer));
+    }));
 
     // 10. Return buffer.
     return buffer;
@@ -300,8 +371,8 @@ void MediaSource::run_end_of_stream_algorithm(Optional<EndOfStreamError> const& 
     m_ready_state = ReadyState::Ended;
 
     // 2. Queue a task to fire an event named sourceended at the MediaSource.
-    queue_a_media_source_task(GC::create_function(GC::Heap::the(), [this] {
-        dispatch_event(create_associated_event(EventNames::sourceended));
+    queue_a_media_source_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.dispatch_event(self.create_associated_event(EventNames::sourceended));
     }));
 
     // AD-HOC: Notify all demuxers that end of stream was reached, so that they can return the requisite error and
@@ -356,6 +427,39 @@ double MediaSource::duration() const
 
     // 2. Return the current value of the attribute.
     return m_duration;
+}
+
+// https://w3c.github.io/media-source/#dom-mediasource-duration
+// https://w3c.github.io/media-source/#dom-mediasource-setliveseekablerange
+WebIDL::ExceptionOr<void> MediaSource::set_live_seekable_range(double start, double end)
+{
+    // 1. If the readyState attribute is not "open" then throw an InvalidStateError exception and abort these steps.
+    if (m_ready_state != ReadyState::Open)
+        return WebIDL::InvalidStateError::create("MediaSource is not open"_utf16);
+
+    // 2. If start is negative or greater than end, then throw a TypeError exception and abort these steps.
+    if (start < 0 || start > end)
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "start must not be negative or greater than end"_utf16 };
+
+    // 3. Set [[live seekable range]] to be a new normalized TimeRanges object containing a single range whose start
+    //    position is start and end position is end.
+    m_live_seekable_range = Media::TimeRanges::Range { AK::Duration::from_seconds_f64(start), AK::Duration::from_seconds_f64(end) };
+    media_element_assigned_to()->playback_manager().set_live_seekable_range(m_live_seekable_range);
+    return {};
+}
+
+// https://w3c.github.io/media-source/#dom-mediasource-clearliveseekablerange
+WebIDL::ExceptionOr<void> MediaSource::clear_live_seekable_range()
+{
+    // 1. If the readyState attribute is not "open" then throw an InvalidStateError exception and abort these steps.
+    if (m_ready_state != ReadyState::Open)
+        return WebIDL::InvalidStateError::create("MediaSource is not open"_utf16);
+
+    // 2. If [[live seekable range]] contains a range, then set [[live seekable range]] to be a new empty TimeRanges
+    //    object.
+    m_live_seekable_range.clear();
+    media_element_assigned_to()->playback_manager().set_live_seekable_range({});
+    return {};
 }
 
 // https://w3c.github.io/media-source/#dom-mediasource-duration
@@ -429,8 +533,14 @@ void MediaSource::assign_duration_change(double new_duration)
     // FIXME: Mirror to the Window when workers are supported.
     //        Update the media element's duration to new duration.
     //        Run the HTMLMediaElement duration change algorithm.
-    media_element_assigned_to()->set_duration({}, new_duration);
-    media_element_assigned_to()->playback_manager().set_duration(AK::Duration::from_seconds_f64(new_duration));
+    // NB: The element seeks if its playback position is past the new duration, and that seek reads the seekable ranges,
+    //     which the playback manager computes from the duration. So the playback manager gets the new duration first,
+    //     but the element compares the position from before the change: The playback manager caps a pending seek's
+    //     target at its duration. An infinite duration, a live stream's, is unbounded for the playback manager.
+    auto& media_element = *media_element_assigned_to();
+    auto playback_position = media_element.current_playback_position();
+    media_element.playback_manager().set_duration(isinf(new_duration) ? AK::Duration::max() : AK::Duration::from_seconds_f64(new_duration));
+    media_element.set_duration({}, new_duration, playback_position);
 }
 
 // https://w3c.github.io/media-source/#dom-mediasource-istypesupported

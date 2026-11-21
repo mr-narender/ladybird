@@ -4,42 +4,53 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Assertions.h>
 #include <AK/FFIHelpers.h>
 #include <LibGC/Heap.h>
+#include <LibHTTP/Cache/Utilities.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
+#include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/SpeculativeHTMLParser.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
 #include <LibWeb/HTMLTokenizerRustFFI.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(SpeculativeHTMLParser);
 
-GC::Ref<SpeculativeHTMLParser> SpeculativeHTMLParser::create(GC::Ref<DOM::Document> document, Utf16String pending_input, URL::URL base_url, ParserScriptingMode scripting_mode)
+GC::Ref<SpeculativeHTMLParser> SpeculativeHTMLParser::create(GC::Ref<DOM::Document> document, ParserScriptingMode scripting_mode)
 {
-    return document->relevant_settings_object().realm().create<SpeculativeHTMLParser>(document, move(pending_input), move(base_url), scripting_mode);
+    return document->relevant_settings_object().realm().create<SpeculativeHTMLParser>(document, scripting_mode);
 }
 
-SpeculativeHTMLParser::SpeculativeHTMLParser(GC::Ref<DOM::Document> document, Utf16String pending_input, URL::URL base_url, ParserScriptingMode scripting_mode)
+SpeculativeHTMLParser::SpeculativeHTMLParser(GC::Ref<DOM::Document> document, ParserScriptingMode scripting_mode)
     : m_document(document)
-    , m_input(move(pending_input))
-    , m_base_url(move(base_url))
-    , m_scripting_mode(scripting_mode)
+    , m_scanner(rust_html_preload_scanner_create(scripting_mode != ParserScriptingMode::Disabled))
 {
 }
 
-SpeculativeHTMLParser::~SpeculativeHTMLParser() = default;
+void SpeculativeHTMLParser::finalize()
+{
+    Base::finalize();
+    rust_html_preload_scanner_destroy(m_scanner);
+    m_scanner = nullptr;
+}
 
 void SpeculativeHTMLParser::visit_edges(JS::Cell::Visitor& visitor)
 {
@@ -53,6 +64,20 @@ void SpeculativeHTMLParser::stop()
     // 3. Throw away any pending content in speculativeParser's input stream, and discard any future content
     //    that would have been added to it.
     m_stopped = true;
+}
+
+void SpeculativeHTMLParser::take_unscanned_input(RustFfiTokenizerHandle* tokenizer, URL::URL const& base_url)
+{
+    m_stopped = false;
+
+    // NB: A scan resolves URLs against the document's base URL as it was when the scan started, so once that has
+    //     changed, the scan starts over.
+    auto start_over = base_url != m_document_base_url;
+    m_document_base_url = base_url;
+
+    // NB: A scan that starts over leaves behind any base element the last one found ahead of the parser.
+    if (!rust_html_preload_scanner_append_parser_input(m_scanner, tokenizer, start_over))
+        m_base_url = base_url;
 }
 
 void SpeculativeHTMLParser::run()
@@ -69,15 +94,7 @@ void SpeculativeHTMLParser::run()
         return !parser.m_stopped;
     };
 
-    auto scripting_enabled = m_scripting_mode != ParserScriptingMode::Disabled;
-    auto input = m_input.utf16_view();
-    if (input.has_ascii_storage()) {
-        auto bytes = input.bytes();
-        rust_html_preload_scanner_scan(bytes.data(), bytes.size(), scripting_enabled, this, scanner_callback);
-    } else {
-        auto code_units = input.utf16_span();
-        rust_html_preload_scanner_scan_utf16(reinterpret_cast<u16 const*>(code_units.data()), code_units.size(), scripting_enabled, this, scanner_callback);
-    }
+    rust_html_preload_scanner_scan(m_scanner, this, scanner_callback);
 }
 
 namespace {
@@ -131,14 +148,53 @@ CORSSettingAttribute cors_setting_from_preload_scanner(RustFfiPreloadScannerCors
 void issue_speculative_fetch(JS::Realm& realm, DOM::Document& document, URL::URL url, Optional<Fetch::Infrastructure::Request::Destination> destination, CORSSettingAttribute cors_setting)
 {
     auto request = create_potential_CORS_request(url, destination, cors_setting);
-    request->set_client(&document.relevant_settings_object());
+    request->set_client(document.relevant_settings_object().address());
 
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
-    auto algorithms = Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input));
+    // AD-HOC: The spec expects caching rules, which are not yet fully specified, to stop the normal parser from fetching
+    //         the same resource again. A response the HTTP cache can't store would be fetched twice, so once the
+    //         speculative fetch succeeds, offer its response to the normal parser's fetch the way a preload is, through
+    //         the document's map of preloaded resources. That fetch still runs main fetch's checks before using it.
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::ConsumeForCallback };
+    fetch_algorithms_input.process_response_consume_body = GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { document }, GC::Weak { document.active_parser() }, request), [](GC::Ref<DOM::Document>& document, GC::Weak<HTMLParser>& parser, NonnullRefPtr<Fetch::Infrastructure::Request>& request, GC::Ref<Fetch::Infrastructure::ResponseView> response_view, Fetch::Infrastructure::FetchAlgorithms::BodyBytes body_bytes) {
+        auto response = response_view->record();
+        auto* byte_sequence = body_bytes.get_pointer<Core::ImmutableBytes>();
+        if (response->is_network_error() || !byte_sequence)
+            return;
+
+        // NB: Only the parser that fetched it may still use the response.
+        if (!parser || document->active_parser() != parser.ptr())
+            return;
+
+        auto key = create_a_preload_key(*request);
+        if (document->map_of_preloaded_resources().contains(key))
+            return;
+
+        // NB: The server may have changed a failed or no-store response since, so fetch it again.
+        auto internal_response = response->unsafe_response();
+        if (!Fetch::Infrastructure::is_ok_status(internal_response->status()))
+            return;
+        if (auto cache_control = internal_response->header_list()->get("Cache-Control"sv); cache_control.has_value() && HTTP::contains_cache_control_directive(*cache_control, "no-store"sv))
+            return;
+
+        // NB: The preload key doesn't hold the request headers a response varies on, and the normal parser's request
+        //     may send others (e.g. a script may have set a cookie since). Accept-Encoding doesn't change in between.
+        auto vary_field_names = HTTP::vary_field_names(*internal_response->header_list());
+        if (!vary_field_names.has_value() || any_of(*vary_field_names, [](auto const& name) { return name != "accept-encoding"sv; }))
+            return;
+
+        // NB: Keep the filtered response, which main fetch uses as is. Unfiltered, it would be treated as same-origin.
+        auto preloaded_response = response->clone();
+        preloaded_response->unsafe_response()->set_body(Fetch::Infrastructure::ResponseBody::from_bytes(*byte_sequence));
+
+        auto entry = PreloadEntry::create();
+        entry->response = move(preloaded_response);
+        entry->is_speculative = true;
+        document->map_of_preloaded_resources().set(key, entry);
+    });
 
     // The fetch stays alive via ResourceLoader's GC::Root callbacks for the duration of the
     // network request, so we don't need to retain the FetchController.
-    (void)Fetch::Fetching::fetch(realm, request, algorithms);
+    (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 }
 
 Utf16String utf16_string_from_preload_scanner(u8 const* pointer, size_t length)
@@ -151,15 +207,7 @@ Utf16String utf16_string_from_preload_scanner(u8 const* pointer, size_t length)
 bool media_attribute_matches_environment(DOM::Document const& document, RustFfiPreloadScannerEntry const& entry)
 {
     auto media = utf16_string_from_preload_scanner(entry.media_ptr, entry.media_len);
-    if (media.is_empty())
-        return true;
-
-    auto media_queries = parse_media_query_list(media);
-    for (auto const& media_query : media_queries) {
-        if (media_query->evaluate(document))
-            return true;
-    }
-    return false;
+    return CSS::RustMediaList::parse(media).evaluate(document);
 }
 
 // Speculatively fetches url the way "fetch a single module script" would for a module script element or a modulepreload
@@ -190,17 +238,17 @@ void issue_speculative_module_fetch(DOM::Document& document, URL::URL const& url
     request->set_url(url);
     request->set_mode(Fetch::Infrastructure::Request::Mode::CORS);
     request->set_referrer(Fetch::Infrastructure::Request::Referrer::Client);
-    request->set_client(&settings_object);
+    request->set_client(settings_object.address());
     request->set_destination(destination);
     if (first_is_one_of(destination,
             Fetch::Infrastructure::Request::Destination::Worker,
             Fetch::Infrastructure::Request::Destination::SharedWorker,
             Fetch::Infrastructure::Request::Destination::ServiceWorker))
         request->set_mode(Fetch::Infrastructure::Request::Mode::SameOrigin);
-    request->set_initiator_type(Fetch::Infrastructure::Request::InitiatorType::Script);
+    // NB: The request has no initiator type: only the fetch that uses the response reports its timing.
     set_up_module_script_request(request, options);
 
-    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DrainAndDiscard };
     auto algorithms = Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input));
     (void)Fetch::Fetching::fetch(settings_object.realm(), request, algorithms);
 }

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        const script = `
+            setTimeout(() => postMessage("timeout fired"), 40);
+            setInterval(() => postMessage("interval fired"), 40);
+            setTimeout(() => {}, 1000000);
+            postMessage("armed");
+        `;
+        const worker = new Worker(URL.createObjectURL(new Blob([script], { type: "text/javascript" })));
+        const messages = [];
+        const { promise: terminated, resolve } = Promise.withResolvers();
+        // Terminate from the handler of the first message, so that no later message can be delivered before it.
+        worker.onmessage = event => {
+            messages.push(event.data);
+            worker.terminate();
+            resolve();
+        };
+        await terminated;
+        await timeout(100);
+        for (const message of messages) println(message);
+    });
+</script>

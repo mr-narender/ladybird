@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    .item { color: rgb(0, 128, 0); }
+</style>
+<div><span class="item">a</span><span class="item">b</span></div>
+<script>
+    // A read of a pseudo-element no rule styles is answered privately: the engine derives the
+    // record for that read alone and leaves itself as it found it. A read of an alike sibling's
+    // pseudo-element does the same work again, rather than taking the first read's record from a
+    // cache the first read left behind.
+    test(() => {
+        internals.updateStyle();
+        const [first, second] = document.querySelectorAll(".item");
+        println(`first ::before color: ${getComputedStyle(first, "::before").color}`);
+        println(`second ::before color: ${getComputedStyle(second, "::before").color}`);
+    });
+</script>

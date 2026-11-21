@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<script>
+asyncTest(async done => {
+    const video = document.createElement("video");
+    document.body.append(video);
+    await new Promise(resolve => {
+        video.onsuspend = resolve;
+        video.src = "../../../LibMedia/vp9_in_webm.webm";
+    });
+
+    // This shared demuxer fixture starts audio at 0.5 ms and video at 11 ms. Both tracks have data from the first
+    // cluster, so either one is buffered from the earliest possible position, 0.5 ms.
+    const startWithVideo = video.buffered.start(0);
+    println(`Starts at the earliest possible position: ${Math.abs(startWithVideo - 0.0005) < 0.000001}`);
+    video.videoTracks[0].selected = false;
+    const audioStart = video.buffered.start(0);
+    println(`Audio-only starts at the same position: ${audioStart === startWithVideo}`);
+    video.videoTracks[0].selected = true;
+    println(`Reselecting video restores start: ${video.buffered.start(0) === startWithVideo}`);
+    video.audioTracks[0].enabled = false;
+    println(`Video-only retains start: ${video.buffered.start(0) === startWithVideo}`);
+    video.videoTracks[0].selected = false;
+    println(`No active tracks: ${video.buffered.length === 0}`);
+    video.audioTracks[0].enabled = true;
+    println(`Re-enabling audio restores its range: ${video.buffered.start(0) === audioStart}`);
+    done();
+});
+</script>

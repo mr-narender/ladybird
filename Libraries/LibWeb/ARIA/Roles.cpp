@@ -5,6 +5,7 @@
  */
 
 #include <AK/GenericShorthands.h>
+#include <LibWeb/ARIA/AriaData.h>
 #include <LibWeb/ARIA/Roles.h>
 
 namespace Web::ARIA {
@@ -51,118 +52,24 @@ bool is_abstract_role(Role role)
         Role::window);
 }
 
-// https://www.w3.org/TR/wai-aria-1.2/#widget_roles
-bool is_widget_role(Role role)
+Optional<AriaLive> implicit_aria_live_for_role(Role role)
 {
-    return first_is_one_of(role,
-        Role::button,
-        Role::checkbox,
-        Role::gridcell,
-        Role::link,
-        Role::menuitem,
-        Role::menuitemcheckbox,
-        Role::menuitemradio,
-        Role::option,
-        Role::progressbar,
-        Role::radio,
-        Role::scrollbar,
-        Role::searchbox,
-        Role::separator, // TODO: Only when focusable
-        Role::slider,
-        Role::spinbutton,
-        Role::switch_,
-        Role::tab,
-        Role::tabpanel,
-        Role::textbox,
-        Role::treeitem,
-        Role::combobox,
-        Role::grid,
-        Role::listbox,
-        Role::menu,
-        Role::menubar,
-        Role::radiogroup,
-        Role::tablist,
-        Role::tree,
-        Role::treegrid);
-}
-
-// https://www.w3.org/TR/wai-aria-1.2/#document_structure_roles
-bool is_document_structure_role(Role role)
-{
-    return first_is_one_of(role,
-        Role::application,
-        Role::article,
-        Role::blockquote,
-        Role::caption,
-        Role::cell,
-        Role::code,
-        Role::columnheader,
-        Role::definition,
-        Role::deletion,
-        Role::directory,
-        Role::document,
-        Role::emphasis,
-        Role::feed,
-        Role::figure,
-        Role::generic,
-        Role::group,
-        Role::heading,
-        Role::img,
-        Role::insertion,
-        Role::list,
-        Role::listitem,
-        Role::math,
-        Role::meter,
-        Role::none,
-        Role::note,
-        Role::paragraph,
-        Role::presentation,
-        Role::row,
-        Role::rowgroup,
-        Role::rowheader,
-        Role::separator, // TODO: Only when not focusable
-        Role::strong,
-        Role::subscript,
-        Role::suggestion,
-        Role::superscript,
-        Role::table,
-        Role::term,
-        Role::time,
-        Role::toolbar,
-        Role::tooltip);
-}
-
-// https://www.w3.org/TR/wai-aria-1.2/#landmark_roles
-bool is_landmark_role(Role role)
-{
-    return first_is_one_of(role,
-        Role::banner,
-        Role::complementary,
-        Role::contentinfo,
-        Role::form,
-        Role::main,
-        Role::navigation,
-        Role::region,
-        Role::search);
-}
-
-// https://www.w3.org/TR/wai-aria-1.2/#live_region_roles
-bool is_live_region_role(Role role)
-{
-    return first_is_one_of(role,
-        Role::alert,
-        Role::log,
-        Role::marquee,
-        Role::status,
-        Role::timer);
-}
-
-// https://www.w3.org/TR/wai-aria-1.2/#window_roles
-bool is_windows_role(Role role)
-{
-    return first_is_one_of(role,
-        Role::alertdialog,
-        Role::dialog);
+    // ARIA 1.2 gives alert, log, and status a default aria-live in their Implicit Value for Role entries,
+    // and marquee and timer none. Blink, WebKit, and Gecko all make those two off (GetImplicitAriaLive(),
+    // defaultLiveRegionStatusForRole(), and the eOffLiveAttr rule of their role-map entries) — so an update
+    // inside one isn't announced through an enclosing polite region — and so do we.
+    switch (role) {
+    case Role::alert:
+        return AriaLive::Assertive;
+    case Role::log:
+    case Role::status:
+        return AriaLive::Polite;
+    case Role::marquee:
+    case Role::timer:
+        return AriaLive::Off;
+    default:
+        return {};
+    }
 }
 
 // https://www.w3.org/TR/wai-aria-1.2/#namefromcontent

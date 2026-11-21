@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<div id="scroller" style="width: 100px; height: 100px; overflow: scroll">
+    <div style="width: 100px; height: 2000px"></div>
+</div>
+<div style="height: 1000vh"></div>
+<script>
+    promiseTest(async () => {
+        const scroller = document.getElementById("scroller");
+
+        await waitForCondition(() => compositorScrollsWheelStepAt(50, 50, 0, 120) && compositorScrollsWheelStepAt(400, 400, 0, 120));
+
+        // Scroll updates and events can coalesce, so their count cannot establish smoothness.
+        // The compositor's Rust tests check intermediate offsets with controlled timestamps.
+        const scrollEventsUntilScrollend = async (target, x, y, deltas) => {
+            let scrollEventCount = 0;
+            const countScrollEvent = () => ++scrollEventCount;
+            target.addEventListener("scroll", countScrollEvent);
+            const finished = scrollendEvent(target);
+            for (const delta of deltas)
+                internals.wheel(x, y, 0, delta);
+            await finished;
+            target.removeEventListener("scroll", countScrollEvent);
+            return scrollEventCount;
+        };
+
+        const scrollerStepEvents = await scrollEventsUntilScrollend(scroller, 50, 50, [120]);
+        println(`a step scrolled the scroll container: ${scrollerStepEvents > 0 && scroller.scrollTop === 120}`);
+
+        const scrollerForwardEvents = await scrollEventsUntilScrollend(scroller, 50, 50, [120, 120]);
+        println(`two more steps scrolled the scroll container to 360: ${scrollerForwardEvents > 0 && scroller.scrollTop === 360}`);
+
+        const scrollerBackEvents = await scrollEventsUntilScrollend(scroller, 50, 50, [-120, -120, 120]);
+        println(`two steps back and one forward scrolled the scroll container to 240: ${scrollerBackEvents > 0 && scroller.scrollTop === 240}`);
+
+        const viewportStepEvents = await scrollEventsUntilScrollend(document, 400, 400, [120]);
+        println(`a step scrolled the viewport: ${viewportStepEvents > 0 && window.scrollY === 120}`);
+
+        const viewportForwardEvents = await scrollEventsUntilScrollend(document, 400, 400, [120, 120]);
+        println(`two more steps scrolled the viewport to 360: ${viewportForwardEvents > 0 && window.scrollY === 360}`);
+
+        const viewportBackEvents = await scrollEventsUntilScrollend(document, 400, 400, [-120, -120, 120]);
+        println(`two steps back and one forward scrolled the viewport to 240: ${viewportBackEvents > 0 && window.scrollY === 240}`);
+    });
+</script>

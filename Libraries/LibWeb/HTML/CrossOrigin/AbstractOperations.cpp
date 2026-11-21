@@ -7,10 +7,13 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <LibGC/CellAllocator.h>
+#include <LibGC/HeapBlock.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Error.h>
 #include <LibJS/Runtime/GlobalObject.h>
+#include <LibJS/Runtime/HostObject.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/PropertyDescriptor.h>
@@ -35,7 +38,9 @@ namespace Web::HTML {
 
 GC::Ptr<RemoteWindow> remote_window_from(JS::Value value)
 {
-    if (auto window_proxy = value.as_if<WindowProxy>())
+    if (!value.is_object())
+        return {};
+    if (auto* window_proxy = WindowProxy::from_object(value.as_object()))
         return window_proxy->remote_window();
     return {};
 }
@@ -44,7 +49,7 @@ static Optional<Variant<GC::Ref<Location const>, GC::Ref<Window const>, GC::Ref<
 {
     // NOTE: A WindowProxy is checked against its [[Window]], which is the Window object the bindings operate on, or the
     //       RemoteWindow standing for one hosted by another process.
-    if (auto const* window_proxy = as_if<WindowProxy>(object)) {
+    if (auto const* window_proxy = WindowProxy::from_object(object)) {
         if (auto remote_window = window_proxy->remote_window())
             return GC::Ref<RemoteWindow const> { *remote_window };
         if (auto window = window_proxy->window())
@@ -56,14 +61,6 @@ static Optional<Variant<GC::Ref<Location const>, GC::Ref<Window const>, GC::Ref<
             return GC::Ref<Location const> { *location };
     }
     return {};
-}
-
-bool is_cross_origin_platform_object(JS::Object const& object)
-{
-    auto platform_object = cross_origin_exposed_platform_object(object);
-    if (!platform_object.has_value())
-        return false;
-    return !platform_object->visit([](auto object) { return is_platform_object_same_origin(*object); });
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#integration-with-idl
@@ -139,15 +136,6 @@ Vector<CrossOriginProperty> cross_origin_properties(Variant<HTML::Location const
         });
 }
 
-// https://html.spec.whatwg.org/multipage/browsers.html#cross-origin-accessible-window-property-name
-bool is_cross_origin_accessible_window_property_name(JS::PropertyKey const& property_key)
-{
-    // A JavaScript property name P is a cross-origin accessible window property name if it is "window", "self", "location", "close", "closed", "focus", "blur", "frames", "length", "top", "opener", "parent", "postMessage", or an array index property name.
-    static NeverDestroyed<Array<Utf16FlyString, 13>> property_names { Array<Utf16FlyString, 13> {
-        "window"_utf16_fly_string, "self"_utf16_fly_string, "location"_utf16_fly_string, "close"_utf16_fly_string, "closed"_utf16_fly_string, "focus"_utf16_fly_string, "blur"_utf16_fly_string, "frames"_utf16_fly_string, "length"_utf16_fly_string, "top"_utf16_fly_string, "opener"_utf16_fly_string, "parent"_utf16_fly_string, "postMessage"_utf16_fly_string } };
-    return (property_key.is_string() && any_of(*property_names, [&](auto const& name) { return property_key.as_string() == name; })) || property_key.is_number();
-}
-
 // 7.2.3.2 CrossOriginPropertyFallback ( P ), https://html.spec.whatwg.org/multipage/browsers.html#crossoriginpropertyfallback-(-p-)
 JS::ThrowCompletionOr<JS::PropertyDescriptor> cross_origin_property_fallback(JS::VM& vm, JS::PropertyKey const& property_key)
 {
@@ -193,6 +181,59 @@ bool is_platform_object_same_origin(RemoteWindow const&)
     return false;
 }
 
+GC_DEFINE_ALLOCATOR(CrossOriginPropertyDescriptorMap);
+
+CrossOriginPropertyDescriptorMap::CrossOriginPropertyDescriptorMap()
+    : GC::WeakContainer(heap())
+{
+}
+
+Optional<JS::PropertyDescriptor> CrossOriginPropertyDescriptorMap::get(CrossOriginKey const& key) const
+{
+    return m_descriptors.get(key).copy();
+}
+
+void CrossOriginPropertyDescriptorMap::set(CrossOriginKey const& key, JS::PropertyDescriptor descriptor)
+{
+    m_descriptors.set(key, move(descriptor));
+}
+
+void CrossOriginPropertyDescriptorMap::visit_edges(Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    for (auto const& [key, descriptor] : m_descriptors) {
+        auto& current_settings_object = *key.current_settings_object;
+        if (descriptor.value.has_value())
+            visitor.visit_ephemeron(current_settings_object, *descriptor.value);
+        if (descriptor.get.has_value() && *descriptor.get)
+            visitor.visit_ephemeron(current_settings_object, JS::Value { descriptor.get->ptr() });
+        if (descriptor.set.has_value() && *descriptor.set)
+            visitor.visit_ephemeron(current_settings_object, JS::Value { descriptor.set->ptr() });
+    }
+}
+
+void CrossOriginPropertyDescriptorMap::remove_dead_cells(Badge<GC::Heap>)
+{
+    m_descriptors.remove_all_matching([&](CrossOriginKey const& key, JS::PropertyDescriptor const&) {
+        auto const& current_settings_object = *key.current_settings_object;
+        auto* block = GC::HeapBlock::from_cell(&current_settings_object);
+        return !heap().is_live_heap_block(block) || current_settings_object.state() != Cell::State::Live || !current_settings_object.is_marked();
+    });
+}
+
+CrossOriginPropertyDescriptorMap& cross_origin_property_descriptor_map(JS::HostObject& location_or_window_wrapper)
+{
+    if (auto* map = JS::host_data_if<CrossOriginPropertyDescriptorMap>(location_or_window_wrapper))
+        return *map;
+
+    VERIFY(JS::is_host_instance_of(location_or_window_wrapper, Bindings::location_wrapper_host_class)
+        || JS::is_host_instance_of(location_or_window_wrapper, Bindings::window_wrapper_host_class));
+    VERIFY(!location_or_window_wrapper.host_data());
+    auto map = location_or_window_wrapper.heap().allocate<CrossOriginPropertyDescriptorMap>();
+    location_or_window_wrapper.set_host_data(map);
+    return *map;
+}
+
 // 7.2.3.4 CrossOriginGetOwnPropertyHelper ( O, P ), https://html.spec.whatwg.org/multipage/nav-history-apis.html#crossorigingetownpropertyhelper-(-o,-p-)
 static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_impl(JS::Object& object,
     Variant<HTML::Location const*, HTML::Window*, HTML::RemoteWindow*> const& platform_object,
@@ -203,9 +244,12 @@ static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_imp
     auto const* object_ptr = &object;
 
     // 1. Let crossOriginKey be a tuple consisting of the current settings object, O's relevant settings object, and P.
+    // NB: The relevant settings object of a Window hosted by another process lives there. It is the same for every
+    //     entry of the RemoteWindow's map.
+    auto relevant_settings_object = platform_object.has<HTML::RemoteWindow*>() ? 0 : (FlatPtr)&HTML::relevant_settings_object(*object_ptr);
     auto cross_origin_key = CrossOriginKey {
-        .current_settings_object = (FlatPtr)&HTML::current_settings_object(),
-        .relevant_settings_object = (FlatPtr)&HTML::relevant_settings_object(*object_ptr),
+        .current_settings_object = HTML::current_settings_object(),
+        .relevant_settings_object = relevant_settings_object,
         .property_key = property_key,
     };
 
@@ -225,9 +269,8 @@ static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_imp
             continue;
 
         // 1. If the value of the [[CrossOriginPropertyDescriptorMap]] internal slot of O contains an entry whose key is crossOriginKey, then return that entry's value.
-        auto it = cross_origin_property_descriptor_map.find(cross_origin_key);
-        if (it != cross_origin_property_descriptor_map.end())
-            return it->value.descriptor;
+        if (auto descriptor = cross_origin_property_descriptor_map.get(cross_origin_key); descriptor.has_value())
+            return descriptor;
 
         // 2. Let originalDesc be OrdinaryGetOwnProperty(O, P).
         // NB: originalDesc might have been replaced by page script, for example via [Replaceable], so the functions
@@ -242,10 +285,10 @@ static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_imp
             // 2. If IsCallable(value) is true, then set value to an anonymous built-in function, created in the current Realm Record, that performs the same steps as the IDL operation P on object O.
             JS::Value value = platform_object.visit(
                 [&](HTML::Location const*) {
-                    return Bindings::LocationWrapper::create_cross_origin_method(realm, entry.property);
+                    return Bindings::create_location_cross_origin_method(realm, entry.property);
                 },
                 [&](auto*) {
-                    return Bindings::WindowWrapper::create_cross_origin_method(realm, entry.property);
+                    return Bindings::create_window_cross_origin_method(realm, entry.property);
                 });
 
             // 3. Set crossOriginDesc to PropertyDescriptor { [[Value]]: value, [[Enumerable]]: false, [[Writable]]: false, [[Configurable]]: true }.
@@ -259,7 +302,7 @@ static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_imp
             // 2. If e.[[NeedsGet]] is true, then set crossOriginGet to an anonymous built-in function, created in the current Realm Record, that performs the same steps as the getter of the IDL attribute P on object O.
             if (*entry.needs_get) {
                 VERIFY(!platform_object.has<HTML::Location const*>());
-                cross_origin_get = Bindings::WindowWrapper::create_cross_origin_getter(realm, entry.property).ptr();
+                cross_origin_get = Bindings::create_window_cross_origin_getter(realm, entry.property).ptr();
             }
 
             // 3. Let crossOriginSet be undefined.
@@ -269,10 +312,10 @@ static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_imp
             if (*entry.needs_set) {
                 cross_origin_set = platform_object.visit(
                     [&](HTML::Location const*) -> GC::Ptr<JS::FunctionObject> {
-                        return Bindings::LocationWrapper::create_cross_origin_setter(realm, entry.property).ptr();
+                        return Bindings::create_location_cross_origin_setter(realm, entry.property).ptr();
                     },
                     [&](auto*) -> GC::Ptr<JS::FunctionObject> {
-                        return Bindings::WindowWrapper::create_cross_origin_setter(realm, entry.property).ptr();
+                        return Bindings::create_window_cross_origin_setter(realm, entry.property).ptr();
                     });
             }
 
@@ -281,7 +324,7 @@ static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_imp
         }
 
         // 6. Create an entry in the value of the [[CrossOriginPropertyDescriptorMap]] internal slot of O with key crossOriginKey and value crossOriginDesc.
-        cross_origin_property_descriptor_map.set(cross_origin_key, CrossOriginCachedPropertyDescriptor { cross_origin_descriptor });
+        cross_origin_property_descriptor_map.set(cross_origin_key, cross_origin_descriptor);
 
         // 7. Return crossOriginDesc.
         return cross_origin_descriptor;
@@ -291,22 +334,19 @@ static Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper_imp
     return {};
 }
 
-Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper(JS::Object& object, HTML::Location const& location,
-    CrossOriginPropertyDescriptorMap& cross_origin_property_descriptor_map, JS::PropertyKey const& property_key)
+Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper(JS::HostObject& location_wrapper, HTML::Location const& location, JS::PropertyKey const& property_key)
 {
-    return cross_origin_get_own_property_helper_impl(object, Variant<HTML::Location const*, HTML::Window*, HTML::RemoteWindow*> { &location }, cross_origin_property_descriptor_map, property_key);
+    return cross_origin_get_own_property_helper_impl(location_wrapper, Variant<HTML::Location const*, HTML::Window*, HTML::RemoteWindow*> { &location }, cross_origin_property_descriptor_map(location_wrapper), property_key);
 }
 
-Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper(JS::Object& object, HTML::Window& window,
-    CrossOriginPropertyDescriptorMap& cross_origin_property_descriptor_map, JS::PropertyKey const& property_key)
+Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper(JS::HostObject& window_wrapper, HTML::Window& window, JS::PropertyKey const& property_key)
 {
-    return cross_origin_get_own_property_helper_impl(object, Variant<HTML::Location const*, HTML::Window*, HTML::RemoteWindow*> { &window }, cross_origin_property_descriptor_map, property_key);
+    return cross_origin_get_own_property_helper_impl(window_wrapper, Variant<HTML::Location const*, HTML::Window*, HTML::RemoteWindow*> { &window }, cross_origin_property_descriptor_map(window_wrapper), property_key);
 }
 
-Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper(JS::Object& object, HTML::RemoteWindow& window,
-    CrossOriginPropertyDescriptorMap& cross_origin_property_descriptor_map, JS::PropertyKey const& property_key)
+Optional<JS::PropertyDescriptor> cross_origin_get_own_property_helper(JS::HostObject& window_proxy, HTML::RemoteWindow& window, JS::PropertyKey const& property_key)
 {
-    return cross_origin_get_own_property_helper_impl(object, Variant<HTML::Location const*, HTML::Window*, HTML::RemoteWindow*> { &window }, cross_origin_property_descriptor_map, property_key);
+    return cross_origin_get_own_property_helper_impl(window_proxy, Variant<HTML::Location const*, HTML::Window*, HTML::RemoteWindow*> { &window }, window.cross_origin_property_descriptor_map(), property_key);
 }
 
 // 7.2.3.5 CrossOriginGet ( O, P, Receiver ), https://html.spec.whatwg.org/multipage/browsers.html#crossoriginget-(-o,-p,-receiver-)

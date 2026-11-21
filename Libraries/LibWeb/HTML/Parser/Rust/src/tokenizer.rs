@@ -233,6 +233,9 @@ pub struct HtmlTokenizer {
     stop_at_insertion_point: bool,
     cdata_allowed: bool,
     entity_matcher: NamedCharacterReferenceMatcher,
+    // Where the input that a speculative HTML parser's preload scanner has been given ends, while it's still a place
+    // the scanner can go on from.
+    speculative_scan_end: Option<usize>,
 }
 
 #[inline]
@@ -270,7 +273,8 @@ fn is_whitespace(c: u32) -> bool {
     matches!(c, 0x09 | 0x0A | 0x0C | 0x20)
 }
 
-/// Numeric character reference replacement table (spec section 13.2.5.5).
+/// Numeric character reference replacement table.
+/// https://html.spec.whatwg.org/multipage/parsing.html#table-charref-overrides
 fn numeric_char_ref_replacement(code: u32) -> Option<u32> {
     match code {
         0x80 => Some(0x20AC),
@@ -365,6 +369,7 @@ impl HtmlTokenizer {
             stop_at_insertion_point: false,
             cdata_allowed: false,
             entity_matcher: NamedCharacterReferenceMatcher::new(),
+            speculative_scan_end: None,
         }
     }
 
@@ -391,6 +396,12 @@ impl HtmlTokenizer {
         self.insertion_point = None;
     }
 
+    /// Undefine the insertion point along with every old insertion point that is waiting to be restored.
+    pub fn discard_insertion_points(&mut self) {
+        self.insertion_point = None;
+        self.old_insertion_points.fill(None);
+    }
+
     pub fn is_insertion_point_defined(&self) -> bool {
         self.insertion_point.is_some()
     }
@@ -404,7 +415,7 @@ impl HtmlTokenizer {
         self.input.extend_from_slice(code_units);
     }
 
-    pub fn append_ascii_input(&mut self, bytes: &[u8]) {
+    pub fn append_latin1_input(&mut self, bytes: &[u8]) {
         self.input.extend(bytes.iter().map(|byte| u16::from(*byte)));
     }
 
@@ -413,6 +424,7 @@ impl HtmlTokenizer {
             let ip = ip.min(self.input.len());
             self.input.splice(ip..ip, code_units.iter().copied());
             self.insertion_point = Some(ip + code_units.len());
+            self.forget_speculative_scan_end_before(ip);
             for old_insertion_point in &mut self.old_insertion_points {
                 if let Some(old_ip) = old_insertion_point
                     && ip <= *old_ip
@@ -423,11 +435,12 @@ impl HtmlTokenizer {
         }
     }
 
-    pub fn insert_ascii_input_at_insertion_point(&mut self, bytes: &[u8]) {
+    pub fn insert_latin1_input_at_insertion_point(&mut self, bytes: &[u8]) {
         if let Some(ip) = self.insertion_point {
             let ip = ip.min(self.input.len());
             self.input.splice(ip..ip, bytes.iter().map(|byte| u16::from(*byte)));
             self.insertion_point = Some(ip + bytes.len());
+            self.forget_speculative_scan_end_before(ip);
             for old_insertion_point in &mut self.old_insertion_points {
                 if let Some(old_ip) = old_insertion_point
                     && ip <= *old_ip
@@ -440,6 +453,29 @@ impl HtmlTokenizer {
 
     pub fn unparsed_input(&self) -> String {
         String::from_utf16_lossy(&self.input[self.current_offset..])
+    }
+
+    /// The input a speculative HTML parser's preload scanner hasn't been given yet, and whether the scanner can go on
+    /// from where it stopped. It can't once this tokenizer has got past that point, or input was inserted before it;
+    /// the input then runs from the current position, and the scanner has to start over there.
+    pub fn input_for_speculative_scan(&mut self) -> (&[u16], bool) {
+        let (start, continues) = match self.speculative_scan_end {
+            Some(end) if end >= self.current_offset => (end, true),
+            _ => (self.current_offset, false),
+        };
+        self.speculative_scan_end = Some(self.input.len());
+        (&self.input[start..], continues)
+    }
+
+    /// Makes the next speculative scan start over at the current position.
+    pub fn forget_speculative_scan_end(&mut self) {
+        self.speculative_scan_end = None;
+    }
+
+    fn forget_speculative_scan_end_before(&mut self, offset: usize) {
+        if self.speculative_scan_end.is_some_and(|end| offset < end) {
+            self.speculative_scan_end = None;
+        }
     }
 
     fn can_discard_consumed_input(&self) -> bool {
@@ -463,6 +499,11 @@ impl HtmlTokenizer {
             return;
         }
 
+        // All of the input is consumed, so a preload scanner that has been given all of it can still go on from there.
+        self.speculative_scan_end = self
+            .speculative_scan_end
+            .filter(|end| *end == self.input.len())
+            .map(|_| 0);
         self.input = Vec::new();
         self.current_offset = 0;
         self.prev_offset = 0;
@@ -1114,7 +1155,8 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x3F) => {
-                        // '?' - parse error
+                        // FIXME: Set the temporary buffer to the empty string. Switch to the processing instruction open state.
+                        // NB: Until processing instructions are supported, retain the bogus-comment fallback.
                         self.create_new_token(TokenType::Comment);
                         self.current_token.start_position = self.nth_last_position(2);
                         self.reconsume(State::BogusComment);
@@ -2602,7 +2644,8 @@ impl HtmlTokenizer {
                     }
                 },
 
-                // 13.2.5.72 Character reference state
+                // https://html.spec.whatwg.org/multipage/parsing.html#character-reference-state
+                // Character reference state
                 State::CharacterReference => {
                     self.temporary_buffer.clear();
                     self.temporary_buffer.push(0x26); // '&'
@@ -2629,7 +2672,8 @@ impl HtmlTokenizer {
                     }
                 }
 
-                // 13.2.5.73 Named character reference state
+                // https://html.spec.whatwg.org/multipage/parsing.html#named-character-reference-state
+                // Named character reference state
                 State::NamedCharacterReference => {
                     // Insertion-point path: feed one character at a time.
                     if self.stop_at_insertion_point && self.insertion_point.is_some() {
@@ -2712,7 +2756,8 @@ impl HtmlTokenizer {
                     }
                 }
 
-                // 13.2.5.74 Ambiguous ampersand state
+                // https://html.spec.whatwg.org/multipage/parsing.html#ambiguous-ampersand-state
+                // Ambiguous ampersand state
                 State::AmbiguousAmpersand => match current_input_character {
                     Some(cp) if is_ascii_alphanumeric(cp) => {
                         if self.consumed_as_part_of_an_attribute() {
@@ -2739,7 +2784,8 @@ impl HtmlTokenizer {
                     }
                 },
 
-                // 13.2.5.75 Numeric character reference state
+                // https://html.spec.whatwg.org/multipage/parsing.html#numeric-character-reference-state
+                // Numeric character reference state
                 State::NumericCharacterReference => {
                     self.character_reference_code = 0;
                     match current_input_character {
@@ -2750,13 +2796,15 @@ impl HtmlTokenizer {
                             continue;
                         }
                         _ => {
+                            // NB: DecimalCharacterReferenceStart implements the ASCII digit and anything-else cases of this state.
                             self.reconsume(State::DecimalCharacterReferenceStart);
                             continue;
                         }
                     }
                 }
 
-                // 13.2.5.76 Hexadecimal character reference start state
+                // https://html.spec.whatwg.org/multipage/parsing.html#hexadecimal-character-reference-start-state
+                // Hexadecimal character reference start state
                 State::HexadecimalCharacterReferenceStart => match current_input_character {
                     Some(cp) if is_ascii_hex_digit(cp) => {
                         self.reconsume(State::HexadecimalCharacterReference);
@@ -2773,14 +2821,16 @@ impl HtmlTokenizer {
                     }
                 },
 
-                // 13.2.5.77 Decimal character reference start state
+                // NB: This implementation-only state handles the non-X/x cases of the numeric character reference state.
                 State::DecimalCharacterReferenceStart => match current_input_character {
                     Some(cp) if is_ascii_digit(cp) => {
+                        // Reconsume in the decimal character reference state.
                         self.reconsume(State::DecimalCharacterReference);
                         continue;
                     }
                     _ => {
-                        // parse error
+                        // This is an absence-of-digits-in-numeric-character-reference parse error.
+                        // Flush code points consumed as a character reference. Reconsume in the return state.
                         self.flush_codepoints_consumed_as_character_reference();
                         self.reconsume_in_return_state(current_input_character);
                         if !self.queued_tokens.is_empty() {
@@ -2790,7 +2840,8 @@ impl HtmlTokenizer {
                     }
                 },
 
-                // 13.2.5.78 Hexadecimal character reference state
+                // https://html.spec.whatwg.org/multipage/parsing.html#hexadecimal-character-reference-state
+                // Hexadecimal character reference state
                 State::HexadecimalCharacterReference => match current_input_character {
                     Some(cp) if is_ascii_digit(cp) => {
                         self.character_reference_code =
@@ -2818,7 +2869,8 @@ impl HtmlTokenizer {
                     }
                 },
 
-                // 13.2.5.79 Decimal character reference state
+                // https://html.spec.whatwg.org/multipage/parsing.html#decimal-character-reference-state
+                // Decimal character reference state
                 State::DecimalCharacterReference => match current_input_character {
                     Some(cp) if is_ascii_digit(cp) => {
                         self.character_reference_code =
@@ -2836,7 +2888,8 @@ impl HtmlTokenizer {
                     }
                 },
 
-                // 13.2.5.80 Numeric character reference end state
+                // https://html.spec.whatwg.org/multipage/parsing.html#numeric-character-reference-end-state
+                // Numeric character reference end state
                 State::NumericCharacterReferenceEnd => {
                     // Don't consume
                     if current_input_character.is_some() {

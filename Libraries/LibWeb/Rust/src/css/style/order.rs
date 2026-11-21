@@ -14,42 +14,49 @@
 //! only reads the order labels imply. Relabeling is therefore invisible to selector truth, cascade
 //! winners, and computed values.
 
-use super::capacity::capacity_bytes;
-
 define_id! {
     /// A stable handle on one position in an order. The numeric label behind it may be rewritten at
     /// any time; the handle does not change.
     pub struct OrderToken();
 }
 
-impl OrderToken {
-    #[must_use]
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-}
-
 /// One totally ordered axis: stylesheet order within a tree context, nested rule order within a
 /// sheet, or layer order within an origin.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct OrderMaintenance {
     labels: Vec<u64>,
     free_entries: Vec<u32>,
     order: Vec<OrderToken>,
+    /// How many times the labels were spread evenly again.
+    relabels: u64,
 }
 
 impl OrderMaintenance {
+    pub(super) fn heap_size(&self) -> usize {
+        use crate::heap_size::vec_bytes;
+        vec_bytes(&self.labels) + vec_bytes(&self.free_entries) + vec_bytes(&self.order)
+    }
+
+    /// Give up the room the order holds beyond its entries.
+    pub(super) fn shrink_to_fit(&mut self) {
+        self.labels.shrink_to_fit();
+        self.free_entries.shrink_to_fit();
+        self.order.shrink_to_fit();
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.order.len()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
@@ -58,6 +65,13 @@ impl OrderMaintenance {
     #[must_use]
     pub fn rank(&self, token: OrderToken) -> u64 {
         self.labels[token.0 as usize]
+    }
+
+    /// How many times the order was relabeled, which moves the ranks of its positions without
+    /// moving their order.
+    #[must_use]
+    pub fn relabels(&self) -> u64 {
+        self.relabels
     }
 
     /// Insert at the end of the order.
@@ -88,16 +102,7 @@ impl OrderMaintenance {
         self.free_entries.push(token.0);
     }
 
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.labels, self.free_entries, self.order];
-            cached [];
-            nested [];
-            skip [];
-        }
-    }
-
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = OrderToken> + '_ {
         self.order.iter().copied()
     }
@@ -133,6 +138,7 @@ impl OrderMaintenance {
         let length = u64::try_from(self.order.len()).expect("order length exceeds label space");
         let step = u64::MAX / (length + 1);
         assert!(step >= 2, "order label space exhausted");
+        self.relabels += 1;
         for (index, token) in self.order.iter().enumerate() {
             self.labels[token.0 as usize] = step * (index as u64 + 1);
         }
@@ -235,10 +241,8 @@ mod tests {
         assert!(order.is_empty());
         assert_eq!(order.iter().count(), 0);
 
-        let bytes = order.capacity_bytes();
         let reinserted: Vec<OrderToken> = (0..300).map(|_| order.insert_last()).collect();
         assert!(is_sorted(&order, &reinserted));
-        assert_eq!(order.capacity_bytes(), bytes);
     }
 
     #[test]

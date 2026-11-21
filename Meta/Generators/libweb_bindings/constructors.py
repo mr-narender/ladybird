@@ -20,16 +20,11 @@ from Utils.webidl_parser import Constructor
 from Utils.webidl_parser import Interface
 
 
-def bindings_constructor_call(
-    interface: Interface, arguments: str, needs_argument_count: bool, needs_realm: bool
-) -> str:
+def bindings_constructor_call(interface: Interface, arguments: str, needs_realm: bool) -> str:
     arguments_with_leading_comma = f", {arguments}" if arguments else ""
-    argument_count = ", vm.argument_count()" if needs_argument_count else ""
     if needs_realm:
-        return f"Web::Bindings::construct_{idl_identifier_cpp_name(interface)}(realm{arguments_with_leading_comma}{argument_count})"
-    if arguments:
-        return f"Web::Bindings::construct_{idl_identifier_cpp_name(interface)}({arguments}{argument_count})"
-    return f"Web::Bindings::construct_{idl_identifier_cpp_name(interface)}({argument_count.removeprefix(', ')})"
+        return f"Web::Bindings::construct_{idl_identifier_cpp_name(interface)}(realm{arguments_with_leading_comma})"
+    return f"Web::Bindings::construct_{idl_identifier_cpp_name(interface)}({arguments})"
 
 
 def write_constructor_function(
@@ -41,7 +36,7 @@ def write_constructor_function(
     overload_index: int,
 ) -> None:
     out.write(
-        f"""JS::ThrowCompletionOr<GC::Ref<JS::Object>> {interface.constructor_class}::construct{overload_index}([[maybe_unused]] InterfaceConstructor& constructor, [[maybe_unused]] JS::FunctionObject& new_target)
+        f"""JS::ThrowCompletionOr<GC::Ref<JS::Object>> {interface.constructor_class}::construct{overload_index}([[maybe_unused]] JS::HostFunction& constructor, [[maybe_unused]] JS::FunctionObject& new_target)
 {{
 """
     )
@@ -112,27 +107,20 @@ def write_constructor_steps(
     // 3.2. Let prototype be ? Get(newTarget, "prototype").
     auto prototype = TRY(new_target.get(vm.names.prototype));
 
-    JS::Realm* target_realm = nullptr;
-
     // 3.3. If Type(prototype) is not Object, then:
     if (!prototype.is_object()) {{
         // 1. Let targetRealm be ? GetFunctionRealm(newTarget).
-        target_realm = TRY(JS::get_function_realm(vm, new_target));
+        auto* target_realm = TRY(JS::get_function_realm(vm, new_target));
         VERIFY(target_realm);
 
         // 2. Set prototype to the interface prototype object for interface in targetRealm.
         prototype = &Bindings::ensure_web_prototype<{interface.prototype_class}>(*target_realm, interface_name);
-    }} else {{
-        // This path does not need targetRealm, but the shared helper takes a
-        // realm for default-prototype recovery. Use the explicit prototype's
-        // realm without observing newTarget again.
-        target_realm = &prototype.as_object().shape().realm();
     }}
 
 """
     )
     write_argument_count_check(out, interface.name, parameter_list_length(constructor.parameters))
-    write_operation_parameter_conversions(out, constructor.parameters, includes, context, "realm")
+    write_operation_parameter_conversions(out, constructor.parameters, includes, context)
     arguments = ", ".join(idl_identifier_cpp_name(parameter) for parameter in constructor.parameters)
     arguments_with_leading_comma = f", {arguments}" if arguments else ""
     arguments_with_vm = f"vm{arguments_with_leading_comma}"
@@ -172,8 +160,8 @@ def write_constructor_steps(
             f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::construct_impl(realm{arguments_with_leading_comma})) {{ return StaticImplementation::construct_impl(realm{arguments_with_leading_comma}); }}",
             f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::construct_impl({arguments_with_vm})) {{ return StaticImplementation::construct_impl({arguments_with_vm}); }}",
             f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::construct_impl({arguments})) {{ return StaticImplementation::construct_impl({arguments}); }}",
-            f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::create_for_constructor(target_realm->global_object(){arguments_with_leading_comma})) {{ return StaticImplementation::create_for_constructor(target_realm->global_object(){arguments_with_leading_comma}); }}",
-            f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::create_for_constructor(*target_realm{arguments_with_leading_comma})) {{ return StaticImplementation::create_for_constructor(*target_realm{arguments_with_leading_comma}); }}",
+            f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::create_for_constructor(realm.global_object(){arguments_with_leading_comma})) {{ return StaticImplementation::create_for_constructor(realm.global_object(){arguments_with_leading_comma}); }}",
+            f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::create_for_constructor(realm{arguments_with_leading_comma})) {{ return StaticImplementation::create_for_constructor(realm{arguments_with_leading_comma}); }}",
             f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::create_for_constructor({arguments_with_vm})) {{ return StaticImplementation::create_for_constructor({arguments_with_vm}); }}",
             f"[&]<typename StaticImplementation>() -> decltype(StaticImplementation::create_for_constructor({arguments})) {{ return StaticImplementation::create_for_constructor({arguments}); }}",
         ]
@@ -199,7 +187,6 @@ def write_constructor_steps(
         construct_impl_call = bindings_constructor_call(
             interface,
             arguments,
-            "NeedsArgumentCount" in constructor.extended_attributes,
             "RealmFreeConstructor" not in constructor.extended_attributes,
         )
         out.write(
@@ -220,7 +207,7 @@ def write_constructor_steps(
         f"""    auto wrapper = wrap(host_defined_wrapper_world(realm), realm, impl);
 
     // 7. Set instance.[[Prototype]] to prototype.
-    TRY(set_prototype_from_new_target<{interface.prototype_class}>(*target_realm, prototype, interface_name, *wrapper));
+    TRY(set_prototype_from_new_target<{interface.prototype_class}>(realm, prototype, interface_name, *wrapper));
 
     // FIXME: Steps 8...11. of the "internally create a new object implementing the interface {interface.name}" algorithm
     // (https://webidl.spec.whatwg.org/#js-platform-objects) are currently not handled, or are handled within {fully_qualified_name_for_interface(interface)}::construct_impl().

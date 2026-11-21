@@ -6,12 +6,13 @@
 
 use super::rendered_text::{RenderedTextBoundary, RenderedTextEdit, rendered_text_offset_for_dom_offset};
 use super::text_chunker::{code_point_at, code_unit_length_for_code_point};
-use crate::css::css_enums::{text_transform, white_space_collapse};
+use crate::css::css_enums::{text_security, text_transform, white_space_collapse};
 use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TextRenderingOptions {
     pub text_transform: u8,
+    pub text_security: u8,
     pub white_space_collapse: u8,
     pub is_password_input: bool,
     pub dom_start_offset: usize,
@@ -95,6 +96,40 @@ unsafe extern "C" {
     );
     fn unicode_apply_fullwidth_mapping(text: *const u16, length: usize, output: UnicodeTextMappingOutput);
     fn unicode_text_may_require_bidi_processing(text: *const u16, length: usize) -> bool;
+}
+
+// Stand-ins for the Unicode library's mappings, which a unit test links through a document's render state but never
+// reaches.
+#[cfg(test)]
+mod unicode_test_stubs {
+    use super::UnicodeTextMappingOutput;
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_apply_case_mapping(
+        _text: *const u16,
+        _length: usize,
+        _mapping: u8,
+        _locale: *const u16,
+        _locale_length: usize,
+        _preserve_existing: bool,
+        _output: UnicodeTextMappingOutput,
+    ) {
+        unreachable!("no unit test transforms text");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_apply_fullwidth_mapping(
+        _text: *const u16,
+        _length: usize,
+        _output: UnicodeTextMappingOutput,
+    ) {
+        unreachable!("no unit test transforms text");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_text_may_require_bidi_processing(_text: *const u16, _length: usize) -> bool {
+        unreachable!("no unit test transforms text");
+    }
 }
 
 unsafe extern "C" fn allocate_text(context: *mut c_void, length: usize) -> *mut u16 {
@@ -189,6 +224,40 @@ fn map_code_points(source: &[u16], mapping: impl Fn(u32) -> u32) -> TransformedT
     result
 }
 
+fn mask_graphemes(input: TransformedText, mark: u16, source_length: usize) -> TransformedText {
+    let segmenter = super::text_chunker::GraphemeSegmenter::new(&input.text);
+    let mut masked = TransformedText::default();
+    let mut edits = input.edits.iter().peekable();
+    let (mut source_end, mut transform_end) = (0, 0);
+    let (mut span_start, mut mask_start) = (0, 0);
+    let mut offset = 0;
+    while let Some(boundary) = segmenter.next_boundary(offset, false) {
+        masked.text.push(mark);
+        offset = boundary;
+        while let Some(edit) =
+            edits.next_if(|edit| edit.rendered_start_offset + edit.rendered_length_in_code_units <= boundary)
+        {
+            source_end = edit.dom_start_offset + edit.dom_length_in_code_units;
+            transform_end = edit.rendered_start_offset + edit.rendered_length_in_code_units;
+        }
+        // An expanded character can supply several marks. Keep them in one edit so all of them map to that character.
+        if edits.peek().is_some_and(|edit| edit.rendered_start_offset < boundary) {
+            continue;
+        }
+        let dom_boundary = source_end + (boundary - transform_end);
+        masked.append_edit(
+            span_start,
+            dom_boundary - span_start,
+            mask_start,
+            masked.text.len() - mask_start,
+        );
+        span_start = dom_boundary;
+        mask_start = masked.text.len();
+    }
+    masked.append_edit(span_start, source_length - span_start, mask_start, 0);
+    masked
+}
+
 fn normalize_whitespace(text: &mut [u16], collapse: u8) {
     let convert_newlines = matches!(
         collapse,
@@ -215,7 +284,7 @@ pub(super) fn render_text(
     assert!(options.dom_start_offset <= source_length);
     assert!(options.dom_length_in_code_units <= source_length - options.dom_start_offset);
     let mut result = if options.is_password_input {
-        map_code_points(&source, |_| 0x25cf)
+        map_code_points(&source, |_| 0x2022)
     } else {
         match options.text_transform {
             text_transform::NONE | text_transform::FULL_SIZE_KANA => {
@@ -249,6 +318,17 @@ pub(super) fn render_text(
             _ => unreachable!("invalid text-transform value"),
         }
     };
+    if !options.is_password_input {
+        let mark = match options.text_security {
+            text_security::DISC => Some(0x2022),
+            text_security::CIRCLE => Some(0x25e6),
+            text_security::SQUARE => Some(0x25a0),
+            _ => None,
+        };
+        if let Some(mark) = mark {
+            result = mask_graphemes(result, mark, source_length);
+        }
+    }
     // Transform the full source before slicing so contextual casing sees the
     // same surrounding text for both ::first-letter and the remainder.
     if options.dom_start_offset != 0 || options.dom_length_in_code_units != source_length {
@@ -384,8 +464,8 @@ mod tests {
     #[test]
     fn password_masking_counts_code_points_and_preserves_dom_spans() {
         let source = [0x61, 0xd83d, 0xde00, 0xd800, 0x62];
-        let masked = map_code_points(&source, |_| 0x25cf);
-        assert_eq!(masked.text, [0x25cf; 4]);
+        let masked = map_code_points(&source, |_| 0x2022);
+        assert_eq!(masked.text, [0x2022; 4]);
         assert_eq!(
             masked.edits,
             [RenderedTextEdit {

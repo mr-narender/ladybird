@@ -1,0 +1,2 @@
+height: 7px
+::before color: rgb(100, 0, 0)

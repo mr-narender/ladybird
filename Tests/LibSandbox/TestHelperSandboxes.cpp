@@ -7,7 +7,9 @@
 #include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/LexicalPath.h>
+#include <AK/ScopeGuard.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <LibCore/IOSurface.h>
 #include <LibCore/System.h>
 #include <LibTest/TestCase.h>
 #include <Security/Security.h>
@@ -32,6 +34,10 @@ enum class Outcome {
 
 static Outcome run_in_helper_sandbox(Function<ErrorOr<void>()> const& apply_sandbox, Function<bool()> const& operation)
 {
+    // These tests fork without exec, so initialize the native runtime in the parent. Objective-C cannot initialize
+    // classes in a child forked from a multithreaded process, such as one that has already queried CoreGraphics.
+    Core::IOSurfaceHandle::initialize();
+
     auto child = fork();
     VERIFY(child >= 0);
     if (child == 0) {
@@ -133,11 +139,25 @@ TEST_CASE(compositor_sees_the_displays)
 TEST_CASE(renderer_cannot_touch_other_applications_caches)
 {
     OtherApplicationCache other_application;
+    for (auto flags : { O_RDONLY, O_WRONLY })
+        EXPECT_EQ(run_in_helper_sandbox([&] { return RendererSandbox::apply_sandbox({}); }, [&] { return can_open(other_application.file, flags); }), Outcome::Denied);
+}
+
+TEST_CASE(renderer_cannot_touch_profile_cache)
+{
     auto cache_path = temporary_cache_path();
-    for (auto audio_access : { RendererSandbox::AudioAccess::Yes, RendererSandbox::AudioAccess::No }) {
-        for (auto flags : { O_RDONLY, O_WRONLY })
-            EXPECT_EQ(run_in_helper_sandbox([&] { return RendererSandbox::apply_sandbox({}, cache_path.view(), audio_access); }, [&] { return can_open(other_application.file, flags); }), Outcome::Denied);
-    }
+    auto cached_response = ByteString::formatted("{}/response", cache_path);
+    auto fd = open(cached_response.characters(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    VERIFY(fd >= 0);
+    VERIFY(write(fd, "secret", 6) == 6);
+    VERIFY(close(fd) == 0);
+    ScopeGuard cleanup = [&] {
+        unlink(cached_response.characters());
+        rmdir(cache_path.characters());
+    };
+
+    for (auto flags : { O_RDONLY, O_WRONLY })
+        EXPECT_EQ(run_in_helper_sandbox([&] { return RendererSandbox::apply_sandbox({}); }, [&] { return can_open(cached_response, flags); }), Outcome::Denied);
 }
 
 struct HelperSignature {
@@ -178,13 +198,13 @@ TEST_CASE(helpers_run_with_the_hardened_runtime)
 {
     // With the hardened runtime, the kernel refuses to run code from memory that was writable, unless the process may
     // map JIT memory. Only the renderers run code that they compile at runtime.
-    for (auto name : { "Compositor"sv, "ImageDecoder"sv, "MediaServer"sv, "ProcessReaper"sv, "RequestServer"sv, "WasmCompiler"sv, "WebContent"sv, "WebWorker"sv }) {
+    for (auto name : { "AudioServer"sv, "Compositor"sv, "ImageDecoder"sv, "MediaServer"sv, "ProcessReaper"sv, "RequestServer"sv, "WebContent"sv }) {
         auto signature = signature_of_helper(name);
         if (!signature.has_value()) {
             warnln("Skipping {}, which was not built", name);
             continue;
         }
         EXPECT(signature->uses_hardened_runtime);
-        EXPECT_EQ(signature->may_map_jit_memory, name == "WebContent"sv || name == "WebWorker"sv);
+        EXPECT_EQ(signature->may_map_jit_memory, name == "WebContent"sv);
     }
 }

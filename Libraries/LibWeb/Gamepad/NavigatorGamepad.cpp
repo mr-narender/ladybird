@@ -1,242 +1,189 @@
 /*
  * Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
  * Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <AK/TypeCasts.h>
-#include <LibGC/Heap.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/Gamepad/EventNames.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibWeb/Gamepad/Gamepad.h>
-#include <LibWeb/Gamepad/GamepadEvent.h>
+#include <LibWeb/Gamepad/GamepadRegistry.h>
 #include <LibWeb/Gamepad/NavigatorGamepad.h>
 #include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
-
-#include <SDL3/SDL_gamepad.h>
+#include <LibWeb/Page/Page.h>
+#include <LibWeb/WebIDL/DOMException.h>
+#include <LibWebCommon/Gamepad/GamepadInput.h>
 
 namespace Web::Gamepad {
 
-// https://w3c.github.io/gamepad/#dom-navigator-getgamepads
+struct GamepadInputDescriptorABI {
+    bool has_canonical_index;
+    u32 canonical_index;
+    i16 logical_minimum;
+    i16 logical_maximum;
+};
+
+struct GamepadDescriptionABI {
+    GamepadHandle handle;
+    ReadonlyBytes id;
+    bool has_standard_mapping;
+    bool supports_dual_rumble;
+    bool supports_trigger_rumble;
+    ReadonlySpan<GamepadInputDescriptorABI> axes;
+    ReadonlySpan<GamepadInputDescriptorABI> buttons;
+};
+
+struct GamepadStateABI {
+    GamepadHandle handle;
+    ReadonlySpan<i16> axis_values;
+    ReadonlySpan<i16> button_values;
+};
+
+extern "C" {
+// Defined in Bindings/Rust/src/gamepad/exports.rs.
+bool web_rust_gamepad_get_gamepads(JSVM*, HTML::Window* navigator_window, HTML::Window* current_window, void* ctx, void (*on_gamepad)(void*, Gamepad*));
+void web_rust_gamepad_handle_gamepad_connected(JSVM*, HTML::Window*, GamepadDescriptionABI const*);
+void web_rust_gamepad_handle_gamepad_updated(JSVM*, HTML::Window*, GamepadStateABI const*);
+void web_rust_gamepad_handle_gamepad_disconnected(JSVM*, HTML::Window*, GamepadHandle);
+
+// Called by Bindings/Rust/src/gamepad/.
+void web_gamepad_did_start_using_gamepads(HTML::Window*);
+void web_gamepad_play_effect(HTML::Window*, GamepadHandle, u8 effect_type, u16 first_magnitude, u16 second_magnitude, u32 duration);
+void web_gamepad_stop_effects(HTML::Window*, GamepadHandle);
+double web_gamepad_normalize_axis_value(i16 logical_value, i16 logical_minimum, i16 logical_maximum);
+double web_gamepad_normalize_button_value(i16 logical_value, i16 logical_minimum, i16 logical_maximum);
+bool web_gamepad_is_button_pressed(i16 logical_value, i16 logical_minimum, i16 logical_maximum);
+bool web_gamepad_contains_gamepad_user_gesture(GamepadDescriptionABI const*, GamepadStateABI const*);
+}
+
+static JSVM* the_vm()
+{
+    return JS::HostABI::vm_to_abi(JS::VM::the());
+}
+
+static HTML::Window& navigator_window(NavigatorGamepadPartial& navigator)
+{
+    return as<HTML::Navigator>(navigator).window();
+}
+
+static Vector<GamepadInputDescriptorABI> input_descriptors_to_abi(Vector<GamepadInputDescriptor> const& inputs)
+{
+    Vector<GamepadInputDescriptorABI> descriptors;
+    descriptors.ensure_capacity(inputs.size());
+    for (auto const& input : inputs)
+        descriptors.unchecked_append({ input.canonical_index.has_value(), input.canonical_index.value_or(0), input.logical_minimum, input.logical_maximum });
+    return descriptors;
+}
+
+static Vector<GamepadInputDescriptor> input_descriptors_from_abi(ReadonlySpan<GamepadInputDescriptorABI> inputs)
+{
+    Vector<GamepadInputDescriptor> descriptors;
+    descriptors.ensure_capacity(inputs.size());
+    for (auto const& input : inputs) {
+        Optional<u32> canonical_index;
+        if (input.has_canonical_index)
+            canonical_index = input.canonical_index;
+        descriptors.unchecked_append({ canonical_index, input.logical_minimum, input.logical_maximum });
+    }
+    return descriptors;
+}
+
 WebIDL::ExceptionOr<GC::RootVector<GC::Ptr<Gamepad>>> NavigatorGamepadPartial::get_gamepads()
 {
-    // 1. Let doc be the current global object's associated Document.
-    auto& window = HTML::current_window();
-    auto& document = window.associated_document();
-
-    // 2. If doc is null or doc is not fully active, then return an empty list.
     GC::RootVector<GC::Ptr<Gamepad>> gamepads;
-    if (!document.is_fully_active())
-        return gamepads;
-
-    // 3. If doc is not allowed to use the "gamepad" permission, then throw a "SecurityError" DOMException and abort these steps.
-    if (!document.is_allowed_to_use_feature(DOM::PolicyControlledFeature::Gamepad))
+    auto allowed = web_rust_gamepad_get_gamepads(the_vm(), &navigator_window(*this), &HTML::current_window(), &gamepads, [](void* ctx, Gamepad* gamepad) {
+        static_cast<GC::RootVector<GC::Ptr<Gamepad>>*>(ctx)->append(gamepad);
+    });
+    if (!allowed)
         return WebIDL::SecurityError::create("Not allowed to use gamepads"_utf16);
-
-    // 4. If this.[[hasGamepadGesture]] is false, then return an empty list.
-    if (!m_has_gamepad_gesture)
-        return gamepads;
-
-    // 5. Let now be the current high resolution time given the current global object.
-    auto now = HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window));
-
-    // 6. Let gamepads be an empty list.
-    // NOTE: Already done.
-
-    // 7. For each gamepad of this.[[gamepads]]:
-    for (auto gamepad : m_gamepads) {
-        // 1. If gamepad is not null and gamepad.[[exposed]] is false:
-        if (gamepad && !gamepad->exposed()) {
-            // 1. Set gamepad.[[exposed]] to true.
-            gamepad->set_exposed({}, true);
-
-            // 2. Set gamepad.[[timestamp]] to now.
-            gamepad->set_timestamp({}, now);
-        }
-
-        // 2. Append gamepad to gamepads.
-        gamepads.append(gamepad);
-    }
-
-    // 8. Return gamepads.
     return gamepads;
 }
 
-void NavigatorGamepadPartial::visit_edges(GC::Cell::Visitor& visitor)
+void NavigatorGamepadPartial::handle_gamepad_connected(GamepadDescription const& description)
 {
-    visitor.visit(m_gamepads);
+    auto axes = input_descriptors_to_abi(description.axes);
+    auto buttons = input_descriptors_to_abi(description.buttons);
+    GamepadDescriptionABI description_abi {
+        description.handle,
+        description.id.bytes(),
+        description.has_standard_mapping,
+        description.supports_dual_rumble,
+        description.supports_trigger_rumble,
+        axes,
+        buttons,
+    };
+    web_rust_gamepad_handle_gamepad_connected(the_vm(), &navigator_window(*this), &description_abi);
 }
 
-// https://w3c.github.io/gamepad/#dfn-selecting-an-unused-gamepad-index
-size_t NavigatorGamepadPartial::select_an_unused_gamepad_index(Badge<Gamepad>)
+void NavigatorGamepadPartial::handle_gamepad_updated(Badge<EventHandler>, GamepadState const& state)
 {
-    // 2. Let maxGamepadIndex be the size of navigator.[[gamepads]] − 1.
-    // 3. For each gamepadIndex of the range from 0 to maxGamepadIndex:
-    for (size_t gamepad_index = 0; gamepad_index < m_gamepads.size(); ++gamepad_index) {
-        // 1. If navigator.[[gamepads]][gamepadIndex] is null, then return gamepadIndex.
-        if (!m_gamepads[gamepad_index])
-            return gamepad_index;
-    }
-
-    // 4. Append null to navigator.[[gamepads]].
-    m_gamepads.append(nullptr);
-
-    // 5. Return the size of navigator.[[gamepads]] − 1.
-    return m_gamepads.size() - 1;
+    GamepadStateABI state_abi { state.handle, state.axis_values, state.button_values };
+    web_rust_gamepad_handle_gamepad_updated(the_vm(), &navigator_window(*this), &state_abi);
 }
 
-// https://w3c.github.io/gamepad/#event-gamepadconnected
-void NavigatorGamepadPartial::handle_gamepad_connected(SDL_JoystickID sdl_joystick_id)
+void NavigatorGamepadPartial::handle_gamepad_disconnected(Badge<EventHandler>, GamepadHandle handle)
 {
-    // When a gamepad becomes available on the system, run the following steps:
-    if (m_available_gamepads.contains_slow(sdl_joystick_id))
-        return;
-
-    // 1. Let document be the current global object's associated Document; otherwise null.
-    // FIXME: We can't use the current global object here, since it's not executing in a scripting context.
-    // NOTE: NavigatorGamepad is only available on Window.
-    // NOTE: document is never null.
-    auto& navigator = as<HTML::Navigator>(*this);
-    auto& window = navigator.window();
-    auto& realm = window.principal_realm();
-    auto& global = realm.global_object();
-    auto& document = window.associated_document();
-
-    // 2. If document is not null and is not allowed to use the "gamepad" permission, then abort these steps.
-    if (!document.is_allowed_to_use_feature(DOM::PolicyControlledFeature::Gamepad))
-        return;
-
-    // AD-HOC: In test mode, ignore any non-virtual gamepads.
-    //         All fake gamepads added by Internals are always virtual, and no other ones are.
-    if (HTML::Window::in_test_mode() && !SDL_IsJoystickVirtual(sdl_joystick_id))
-        return;
-
-    m_available_gamepads.append(sdl_joystick_id);
-
-    // 3. Queue a global task on the gamepad task source with the current global object to perform the following steps:
-    HTML::queue_global_task(HTML::Task::Source::Gamepad, global, GC::create_function(GC::Heap::the(), [&window, &document, sdl_joystick_id] mutable {
-        // 1. Let gamepad be a new Gamepad representing the gamepad.
-        auto gamepad = Gamepad::create(window, sdl_joystick_id);
-
-        // 2. Let navigator be gamepad's relevant global object's Navigator object.
-        auto navigator = window.navigator();
-
-        // 3. Set navigator.[[gamepads]][gamepad.index] to gamepad.
-        navigator->m_gamepads[gamepad->index()] = gamepad;
-
-        // 4. If navigator.[[hasGamepadGesture]] is true:
-        if (navigator->m_has_gamepad_gesture) {
-            // 1. Set gamepad.[[exposed]] to true.
-            gamepad->set_exposed({}, true);
-
-            // 2. If document is not null and is fully active, then fire an event named gamepadconnected at gamepad's
-            //    relevant global object using GamepadEvent with its gamepad attribute initialized to gamepad.
-            if (document.is_fully_active()) {
-                GamepadEventInit gamepad_connected_event_init { {}, gamepad };
-                auto gamepad_connected_event = GamepadEvent::create(EventNames::gamepadconnected, gamepad_connected_event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window)));
-                window.dispatch_event(gamepad_connected_event);
-            }
-        }
-    }));
-}
-
-// https://w3c.github.io/gamepad/#dfn-receives-new-button-or-axis-input-values
-void NavigatorGamepadPartial::handle_gamepad_updated(Badge<EventHandler>, SDL_JoystickID sdl_joystick_id)
-{
-    // When the system receives new button or axis input values, run the following steps:
-    // 1. Let gamepad be the Gamepad object representing the device that received new button or axis input values.
-    auto gamepad = m_gamepads.find_if([&sdl_joystick_id](GC::Ptr<Gamepad> gamepad) {
-        return gamepad && gamepad->sdl_joystick_id() == sdl_joystick_id;
-    });
-
-    if (gamepad.is_end())
-        return;
-
-    // 2. Queue a global task on the gamepad task source with gamepad's relevant global object to update gamepad state
-    //    for gamepad.
-    auto& global = (*gamepad)->window().principal_realm().global_object();
-    HTML::queue_global_task(HTML::Task::Source::Gamepad, global, GC::create_function(GC::Heap::the(), [gamepad = GC::Ref { **gamepad }] {
-        gamepad->update_gamepad_state({});
-    }));
-}
-
-void NavigatorGamepadPartial::handle_gamepad_disconnected(Badge<EventHandler>, SDL_JoystickID sdl_joystick_id)
-{
-    // When a gamepad becomes unavailable on the system, run the following steps:
-    m_available_gamepads.remove_first_matching([&sdl_joystick_id](SDL_JoystickID available_gamepad) {
-        return sdl_joystick_id == available_gamepad;
-    });
-
-    // 1. Let gamepad be the Gamepad representing the unavailable device.
-    auto gamepad = m_gamepads.find_if([&sdl_joystick_id](GC::Ptr<Gamepad> gamepad) {
-        return gamepad && gamepad->sdl_joystick_id() == sdl_joystick_id;
-    });
-
-    if (gamepad.is_end())
-        return;
-
-    // 2. Queue a global task on the gamepad task source with gamepad's relevant global object to perform the
-    //    following steps:
-    auto& window = (*gamepad)->window();
-    auto& global = window.principal_realm().global_object();
-    HTML::queue_global_task(HTML::Task::Source::Gamepad, global, GC::create_function(GC::Heap::the(), [gamepad = GC::Ref { **gamepad }, &window] {
-        // 1. Set gamepad.[[connected]] to false.
-        gamepad->set_connected({}, false);
-
-        // 2. Let document be gamepad's relevant global object's associated Document; otherwise null.
-        auto& document = window.associated_document();
-
-        // 3. If gamepad.[[exposed]] is true and document is not null and is fully active, then fire an event named
-        //    gamepaddisconnected at gamepad's relevant global object using GamepadEvent with its gamepad attribute
-        //    initialized to gamepad.
-        if (gamepad->exposed() && document.is_fully_active()) {
-            GamepadEventInit gamepad_disconnected_event_init { {}, gamepad };
-            auto gamepad_disconnected_event = GamepadEvent::create(EventNames::gamepaddisconnected, gamepad_disconnected_event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window)));
-            window.dispatch_event(gamepad_disconnected_event);
-        }
-
-        // 4. Let navigator be gamepad's relevant global object's Navigator object.
-        auto navigator = window.navigator();
-
-        // 5. Set navigator.[[gamepads]][gamepad.index] to null.
-        navigator->m_gamepads[gamepad->index()] = nullptr;
-
-        // 6. While navigator.[[gamepads]] is not empty and the last item of navigator.[[gamepads]] is null, remove the
-        //    last item of navigator.[[gamepads]].
-        while (!navigator->m_gamepads.is_empty() && navigator->m_gamepads.last() == nullptr) {
-            (void)navigator->m_gamepads.take_last();
-        }
-    }));
+    web_rust_gamepad_handle_gamepad_disconnected(the_vm(), &navigator_window(*this), handle);
 }
 
 void NavigatorGamepadPartial::check_for_connected_gamepads()
 {
-    // "(SDL_JoystickID *) Returns a 0 terminated array of joystick instance IDs or NULL on failure; call
-    // SDL_GetError() for more information. This should be freed with SDL_free() when it is no longer needed."
-    int gamepad_count = 0;
-    SDL_JoystickID* connected_gamepads = SDL_GetGamepads(&gamepad_count);
-    if (!connected_gamepads)
-        return;
-
-    for (int gamepad_index = 0; gamepad_index < gamepad_count; ++gamepad_index) {
-        handle_gamepad_connected(connected_gamepads[gamepad_index]);
-    }
-
-    SDL_free(connected_gamepads);
+    GamepadRegistry::the().for_each_connected_gamepad([this](GamepadDescription const& description) {
+        handle_gamepad_connected(description);
+    });
 }
 
-void NavigatorGamepadPartial::set_has_gamepad_gesture(Badge<Gamepad>, bool value)
+void web_gamepad_did_start_using_gamepads(HTML::Window* window)
 {
-    m_has_gamepad_gesture = value;
+    window->page().client().page_did_start_using_gamepads();
 }
 
-GC::RootVector<GC::Ptr<Gamepad>> NavigatorGamepadPartial::gamepads(Badge<Gamepad>) const
+void web_gamepad_play_effect(HTML::Window* window, GamepadHandle handle, u8 effect_type, u16 first_magnitude, u16 second_magnitude, u32 duration)
 {
-    return GC::RootVector<GC::Ptr<Gamepad>> { as<HTML::Navigator>(*this).m_gamepads };
+    // NB: The effect type is the index of the variant of GamepadHapticEffectType.
+    GamepadEffect effect = effect_type == 0
+        ? GamepadEffect { GamepadDualRumbleEffect { first_magnitude, second_magnitude, duration } }
+        : GamepadEffect { GamepadTriggerRumbleEffect { first_magnitude, second_magnitude, duration } };
+    window->page().client().page_did_play_gamepad_effect(handle, effect);
+}
+
+void web_gamepad_stop_effects(HTML::Window* window, GamepadHandle handle)
+{
+    window->page().client().page_did_request_stop_gamepad_effects(handle);
+}
+
+double web_gamepad_normalize_axis_value(i16 logical_value, i16 logical_minimum, i16 logical_maximum)
+{
+    return normalize_axis_value(logical_value, logical_minimum, logical_maximum);
+}
+
+double web_gamepad_normalize_button_value(i16 logical_value, i16 logical_minimum, i16 logical_maximum)
+{
+    return normalize_button_value(logical_value, logical_minimum, logical_maximum);
+}
+
+bool web_gamepad_is_button_pressed(i16 logical_value, i16 logical_minimum, i16 logical_maximum)
+{
+    return is_button_pressed(logical_value, logical_minimum, logical_maximum);
+}
+
+bool web_gamepad_contains_gamepad_user_gesture(GamepadDescriptionABI const* description_abi, GamepadStateABI const* state_abi)
+{
+    GamepadDescription description;
+    description.handle = description_abi->handle;
+    description.axes = input_descriptors_from_abi(description_abi->axes);
+    description.buttons = input_descriptors_from_abi(description_abi->buttons);
+
+    GamepadState state;
+    state.handle = state_abi->handle;
+    state.axis_values = Vector<i16> { state_abi->axis_values };
+    state.button_values = Vector<i16> { state_abi->button_values };
+
+    return contains_gamepad_user_gesture(description, state);
 }
 
 }

@@ -6,10 +6,11 @@
  */
 
 #include <LibGfx/AffineTransform.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Layout/Node.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
+#include <LibWeb/SVG/SVGUnitTypes.h>
 
 namespace Web::SVG {
 
@@ -22,10 +23,10 @@ SVGMaskElement::SVGMaskElement(DOM::Document& document, DOM::QualifiedName tag_n
 
 SVGMaskElement::~SVGMaskElement() = default;
 
-Layout::Node* SVGMaskElement::create_layout_node(CSS::LayoutStyle)
+CSS::ElementBoxKind SVGMaskElement::box_kind() const
 {
     // Masks are handled as a special case in the TreeBuilder.
-    return nullptr;
+    return CSS::ElementBoxKind::NoBox;
 }
 
 void SVGMaskElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
@@ -105,48 +106,16 @@ NumberPercentage SVGMaskElement::mask_height() const
     return m_height.value_or(NumberPercentage::create_percentage(120));
 }
 
-// https://drafts.csswg.org/css-masking/#element-attrdef-mask-maskunits
-CSSPixelRect SVGMaskElement::resolve_masking_area(CSSPixelRect const& target_object_bounding_box, Gfx::FloatSize const& viewport_size, Gfx::AffineTransform const& user_space_to_css_pixels) const
+// https://drafts.fxtf.org/css-masking/#dom-svgmaskelement-maskunits
+GC::Ref<SVGAnimatedEnumeration> SVGMaskElement::mask_units_for_bindings()
 {
-    Gfx::FloatRect masking_area;
-    if (mask_units() == MaskUnits::ObjectBoundingBox) {
-        // objectBoundingBox
-        //     x, y, width and height represent fractions or percentages of the object bounding box of the element to
-        //     which the mask is applied.
-        auto target = target_object_bounding_box.to_type<float>();
-        masking_area = {
-            target.x() + (mask_x().value() * target.width()),
-            target.y() + (mask_y().value() * target.height()),
-            mask_width().value() * target.width(),
-            mask_height().value() * target.height(),
-        };
-    } else {
-        // userSpaceOnUse
-        //     x, y, width and height represent values in the current user coordinate system in place at the time when
-        //     the mask element is referenced (i.e., the user coordinate system for the element referencing the mask
-        //     element via the mask property).
-        // Percentages resolve against the SVG viewport; from https://svgwg.org/svg2-draft/coords.html#Units:
-        //     For any x-coordinate value or width value expressed as a percentage of the SVG viewport, the value to use
-        //     must be the percentage, in user units, of the width parameter of the 'viewBox' applied to that viewport.
-        //     If no 'viewBox' is specified, then the value to use must be the percentage, in user units, of the width
-        //     of the SVG viewport.
-        // (Correspondingly with the height parameter for y-coordinate and height values.)
-        Gfx::FloatRect user_space_masking_area {
-            mask_x().resolve_relative_to(viewport_size.width()),
-            mask_y().resolve_relative_to(viewport_size.height()),
-            mask_width().resolve_relative_to(viewport_size.width()),
-            mask_height().resolve_relative_to(viewport_size.height()),
-        };
-        if (user_space_masking_area.is_empty())
-            return {};
-        masking_area = user_space_to_css_pixels.map(user_space_masking_area);
-    }
+    return svg_animated_enumeration_for_attribute(AttributeNames::maskUnits, svg_unit_type_keywords, to_underlying(SVGUnitType::ObjectBoundingBox));
+}
 
-    // To convey "a negative value or a value of zero disables rendering of the element" to the caller, we return an
-    // empty masking area.
-    if (masking_area.is_empty())
-        return {};
-    return masking_area.to_type<CSSPixels>();
+// https://drafts.fxtf.org/css-masking/#dom-svgmaskelement-maskcontentunits
+GC::Ref<SVGAnimatedEnumeration> SVGMaskElement::mask_content_units_for_bindings()
+{
+    return svg_animated_enumeration_for_attribute(AttributeNames::maskContentUnits, svg_unit_type_keywords, to_underlying(SVGUnitType::UserSpaceOnUse));
 }
 
 }

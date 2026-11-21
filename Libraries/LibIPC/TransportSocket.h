@@ -10,10 +10,12 @@
 #include <AK/Atomic.h>
 #include <AK/ConditionVariable.h>
 #include <AK/Mutex.h>
+#include <AK/Optional.h>
 #include <AK/Platform.h>
 #include <AK/Queue.h>
 #include <AK/SinglyLinkedList.h>
 #include <AK/SinglyLinkedListSizePolicy.h>
+#include <AK/Time.h>
 #include <LibCore/Socket.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/AutoCloseFileDescriptor.h>
@@ -31,9 +33,15 @@
 
 namespace IPC {
 
+// NB: One sendmsg() carries a limited number of descriptors, and at least one byte with them. A message with more
+//     descriptors sends the rest ahead of it, in Attachments frames that have no payload. A Payload frame's fd_count
+//     counts every descriptor of its message, including those that arrived ahead of it. A SharedMemoryPayload frame
+//     has no bytes, and its shared memory is the last descriptor of its message.
 struct SocketMessageHeader {
     enum class Type : u8 {
         Payload = 0,
+        Attachments = 1,
+        SharedMemoryPayload = 2,
     };
     Type type { Type::Payload };
     u32 payload_size { 0 };
@@ -42,7 +50,8 @@ struct SocketMessageHeader {
 
 class SendQueue : public AtomicRefCounted<SendQueue> {
 public:
-    void enqueue_message(SocketMessageHeader, MessageDataType payload, Vector<NonnullRefPtr<AutoCloseFileDescriptor>>&& fds);
+    // Answers whether the queue was empty before this message.
+    bool enqueue_message(SocketMessageHeader, MessageDataType payload, Vector<NonnullRefPtr<AutoCloseFileDescriptor>>&& fds);
     struct BytesAndFds {
         Vector<u8> bytes;
         Vector<int> fds;
@@ -78,6 +87,7 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static constexpr socklen_t SOCKET_BUFFER_SIZE = 128 * KiB;
+    static constexpr size_t MAX_INLINE_PAYLOAD_SIZE = 64 * KiB;
 
     struct Paired {
         NonnullOwnPtr<TransportSocket> local;
@@ -85,17 +95,36 @@ public:
     };
     static ErrorOr<Paired> create_paired();
     static ErrorOr<NonnullOwnPtr<TransportSocket>> from_socket(NonnullOwnPtr<Core::LocalSocket> socket);
+    static ErrorOr<NonnullOwnPtr<TransportSocket>> adopt_fd(int fd);
+    // The bytes and attachments are what the last owner read off the socket without seeing the end of the message.
+    static ErrorOr<NonnullOwnPtr<TransportSocket>> adopt_fd(int fd, ByteBuffer unprocessed_bytes, Vector<Attachment> unprocessed_attachments);
 
-    explicit TransportSocket(NonnullOwnPtr<Core::LocalSocket> socket);
+    explicit TransportSocket(NonnullOwnPtr<Core::LocalSocket> socket, ByteBuffer unprocessed_bytes = {}, Vector<Attachment> unprocessed_attachments = {});
     ~TransportSocket();
 
+    // Makes the transports that this thread creates from now on share one IO thread with all others made this way, or
+    // get an IO thread each, as they do by default. A thread per transport is what a latency-critical connection wants.
+    // Sharing is for the many connections of the agents of a process, of which each is rarely busy.
+    static void set_share_io_thread_on_this_thread(bool);
+
     void set_up_read_hook(Function<void()>);
+
+    // Sets what the IO thread shows every message that arrives, before the transport's owner gets to see it, and empty
+    // bytes once the peer is gone. This is for a thread that does not get back to its event loop on its own, like one
+    // stuck in script. It runs while the IO thread holds a lock, so it should only have a look.
+    void set_incoming_message_observer(Function<void(ReadonlyBytes)>);
+
     bool is_open() const;
 
     void close();
     void close_after_sending_all_pending_messages();
 
-    void wait_until_readable();
+    // Returns at the deadline as well, if one is given.
+    void wait_until_readable(Optional<MonotonicTime> deadline = {});
+
+    // Makes wait_until_readable() return, even with nothing to read, now or if none is under way, the next time. Any
+    // thread may call this.
+    void interrupt_wait_until_readable();
 
     // Wait until everything posted so far has been written to the socket.
     void flush();
@@ -117,6 +146,8 @@ public:
     };
     ShouldShutdown read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&&);
 
+    // Whole messages that have been read stay here for the old owner to take, and anything newer reaches the new owner.
+    // A message read in part goes to the new owner, along with the handle.
     ErrorOr<TransportHandle> release_for_transfer();
 
     // Test seam: When set to a non-zero value, the IO thread wakes the consumer and then pauses for the given duration
@@ -131,11 +162,14 @@ public:
     static void set_skip_inloop_read_for_test(bool);
 
 private:
+    friend class SharedIOThread;
+
     enum class TransferState {
         Continue,
         SocketClosed,
     };
     [[nodiscard]] TransferState transfer_data(ReadonlyBytes& bytes, Vector<int>& fds);
+    [[nodiscard]] bool send_queued_messages_on_this_thread();
 
     static ErrorOr<void> send_message(Core::LocalSocket&, ReadonlyBytes& bytes, Vector<int>& unowned_fds);
 
@@ -145,6 +179,11 @@ private:
         Stopped,
     };
     intptr_t io_thread_loop();
+    // One round of IO: what to poll the socket for, or nothing once IO is over, and what to do about what poll() found.
+    Optional<short> events_to_poll();
+    void handle_polled_events(short events);
+    // Runs on the IO thread as IO is over. A transport on the shared IO thread can be gone once this returns.
+    void finish_io();
     void stop_io_thread(IOThreadState desired_state);
     void wake_io_thread();
     enum class MoreToRead {
@@ -154,13 +193,17 @@ private:
     [[nodiscard]] MoreToRead read_incoming_messages();
     void parse_unprocessed_messages(Vector<NonnullOwnPtr<Message>>&);
     void notify_read_available();
+    void notify_incoming_message_observer(ReadonlyBytes);
     bool incoming_is_behind_socket() const;
 
     NonnullOwnPtr<Core::LocalSocket> m_socket;
     Atomic<bool> m_socket_is_open { true };
 
+    bool m_shares_io_thread { false };
     RefPtr<Threading::Thread> m_io_thread;
     RefPtr<SendQueue> m_send_queue;
+    // Held by the thread that takes bytes from the send queue and writes them to the socket, which keeps them in order.
+    Mutex m_send_mutex;
     Atomic<IOThreadState> m_io_thread_state { IOThreadState::Running };
     Atomic<bool> m_is_being_transferred { false };
     Atomic<bool> m_peer_eof { false };
@@ -169,12 +212,16 @@ private:
     Mutex m_incoming_mutex;
     ConditionVariable m_incoming_cv { m_incoming_mutex };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
+    // NB: This has a lock of its own, as the observer may interrupt a wait, which takes m_incoming_mutex.
+    Mutex m_incoming_message_observer_mutex;
+    Function<void(ReadonlyBytes)> m_incoming_message_observer;
     // True while the IO thread is between reading the socket and appending what it read.
     bool m_read_in_progress { false };
     // Consumer-visible EOF, guarded by m_incoming_mutex. Distinct from m_peer_eof. This is set only after the final
     // batch of messages have been parsed and appended to m_incoming_messages under the same lock.
     bool m_incoming_eof { false };
     bool m_receive_loop_finished { false };
+    bool m_wait_until_readable_interrupted { false };
 
     static Atomic<u32> s_eof_drain_window_for_test_ms;
     static Atomic<bool> s_skip_inloop_read_for_test;

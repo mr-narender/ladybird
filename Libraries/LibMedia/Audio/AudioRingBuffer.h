@@ -7,8 +7,8 @@
 #pragma once
 
 #include <AK/FixedArray.h>
-#include <LibMedia/Audio/SampleSpecification.h>
-#include <LibMedia/AudioBlock.h>
+#include <LibAudio/SampleSpecification.h>
+#include <LibMediaCodecs/AudioBlock.h>
 
 namespace Audio {
 

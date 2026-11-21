@@ -33,23 +33,24 @@ public:
 
     unsigned type() const { return m_type; }
 
-    bool is_accepted() const { return m_accepted; }
-    void accept() { m_accepted = true; }
-    void ignore() { m_accepted = false; }
-
 private:
     unsigned m_type { Type::Invalid };
-    bool m_accepted { true };
 };
 
 class TimerEvent final : public Event {
 public:
-    explicit TimerEvent()
+    explicit TimerEvent(u64 timer_generation)
         : Event(Event::Timer)
+        , m_timer_generation(timer_generation)
     {
     }
 
     ~TimerEvent() = default;
+
+    u64 timer_generation() const { return m_timer_generation; }
+
+private:
+    u64 m_timer_generation { 0 };
 };
 
 class NotifierActivationEvent final : public Event {

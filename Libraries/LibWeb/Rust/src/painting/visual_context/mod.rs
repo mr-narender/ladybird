@@ -10,15 +10,18 @@
 pub mod basic_shapes;
 pub mod box_build;
 pub mod build;
+pub(crate) mod compositor_scroll_table;
 pub mod delta;
 pub mod dirty;
 pub mod dump;
 pub mod incremental;
 pub mod node_values;
+pub mod offset_transform;
 pub mod reconcile;
 pub mod records;
 pub mod refresh;
 pub mod shape;
+pub(crate) mod trace;
 
 pub use dump::VisualContextTreeDump;
 pub use libcompositing_rust::visual_context::*;

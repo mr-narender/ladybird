@@ -1,10 +1,5 @@
 // Shared by the small correctness test and Meta/style-update-capture.py.
 function createStyleUpdateFixture(elementCount, scenario, seed, measure = false) {
-    const snapshot = () => ({
-        rust: internals.styleEngineCounters(),
-        cpp: internals.getStyleInvalidationCounters(),
-        ffi: internals.styleFfiCounters(),
-    });
     const now = () => (measure ? performance.now() * 1000 : null);
     const elapsed = start => (measure ? now() - start : null);
     const check = (node, property, expected) => {
@@ -15,20 +10,21 @@ function createStyleUpdateFixture(elementCount, scenario, seed, measure = false)
     };
     const observe = checks => checks.map(([node, property, expected]) => check(node, property, expected));
     const interval = (name, kind, mutate, checks) => {
-        const before = snapshot();
         const start = now();
         mutate();
         const mutationMicroseconds = elapsed(start);
         const observationStart = now();
         const observations = observe(checks());
         const observationMicroseconds = elapsed(observationStart);
-        const after = snapshot();
-        return { name, kind, before, after, mutationMicroseconds, observationMicroseconds, observations };
+        return { name, kind, mutationMicroseconds, observationMicroseconds, observations };
     };
     if (!Number.isInteger(elementCount) || elementCount < 100 || !["connected", "detached"].includes(scenario))
         throw new Error("Invalid fixture configuration");
     const style = document.createElement("style");
+    // Each fixture's sheet text is distinct, so that its construction compiles the sheet rather than reusing
+    // the compiled sheet an earlier fixture left behind.
     style.textContent = `
+        /* ${scenario} ${seed} */
         .fixture { color: rgb(10, 20, 30) }
         .fixture.theme { color: rgb(40, 50, 60) }
         .fixture .item { display: block; opacity: 1; margin: 0; padding: 0; border: 0 solid black }
@@ -170,7 +166,6 @@ function createStyleUpdateFixture(elementCount, scenario, seed, measure = false)
     let nextStep = 0;
     return {
         setup,
-        snapshot,
         step(index) {
             if (index !== nextStep++) throw new Error("Fixture mutations must run exactly once in order");
             const [name, mutate, checks] = steps[index];

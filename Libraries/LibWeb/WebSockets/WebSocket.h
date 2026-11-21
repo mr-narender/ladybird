@@ -10,7 +10,6 @@
 #include <AK/ByteBuffer.h>
 #include <AK/Utf16String.h>
 #include <LibCore/EventReceiver.h>
-#include <LibGC/ActivityRoot.h>
 #include <LibJS/Forward.h>
 #include <LibRequests/Forward.h>
 #include <LibRequests/WebSocket.h>
@@ -54,6 +53,7 @@ public:
     Requests::WebSocket::ReadyState ready_state() const;
     Utf16String extensions() const;
     WebIDL::ExceptionOr<Utf16String> protocol() const;
+    u64 buffered_amount() const;
 
     Bindings::BinaryType binary_type() { return m_binary_type; }
     void set_binary_type(Bindings::BinaryType binary_type) { m_binary_type = binary_type; }
@@ -62,13 +62,15 @@ public:
     WebIDL::ExceptionOr<void> send(WebSocketSendData const& data);
 
     void make_disappear();
-    bool has_activity_root() const { return m_activity_root.is_taken(); }
 
 private:
     void on_open();
     void on_message(ByteBuffer message, bool is_text);
+    void on_closing_handshake_started();
     void on_error();
     void on_close(u16 code, Utf16String reason, bool was_clean);
+
+    void set_ready_state(Requests::WebSocket::ReadyState);
 
     JS::Object& relevant_global_object() const;
 
@@ -81,13 +83,14 @@ private:
     HTML::WindowOrWorkerGlobalScopeMixin& relevant_global_scope() const;
     ErrorOr<void> establish_web_socket_connection(URL::URL const& url_record, Vector<Utf16String> const& protocols, HTML::EnvironmentSettingsObject& client);
     bool should_be_kept_alive() const;
-    void update_activity_root();
+    void update_pending_activity();
 
     URL::URL m_url;
+    Requests::WebSocket::ReadyState m_ready_state { Requests::WebSocket::ReadyState::Connecting };
     Bindings::BinaryType m_binary_type { Bindings::BinaryType::Blob };
+    u64 m_buffered_amount { 0 };
     RefPtr<Requests::WebSocket> m_websocket;
     GC::Ref<DOM::EventTarget> m_global_object;
-    GC::ActivityRoot m_activity_root;
     bool m_has_disappeared { false };
 
     IntrusiveListNode<WebSocket> m_list_node;

@@ -19,25 +19,23 @@ namespace Web {
 static constexpr double DEAD_ZONE_RADIUS { 15 };
 static constexpr double SPEED_FACTOR = 5.0;
 static constexpr double MAX_SPEED_PER_SECOND = 5000.0;
-static constexpr double SCROLL_INTERVAL_MS = 16.0;
+static constexpr double MAX_FRAME_INTERVAL_MS = 100.0;
 
 MiddleButtonScrollHandler::MiddleButtonScrollHandler(DOM::Element& container, CSSPixelPoint origin)
     : m_container_element(container)
     , m_origin(origin)
     , m_mouse_position(origin)
 {
-    auto const* layout_node = m_container_element->document().layout_node();
-    if (layout_node && Painting::has_committed_box(*layout_node))
-        Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommands);
+    request_indicator_repaint();
 }
 
-MiddleButtonScrollHandler::~MiddleButtonScrollHandler()
+// The handler can die along with its navigable in a GC sweep, after its element and document are already gone — so
+// the destructor must not touch them. Instead, EventHandler asks for the repaint when it stops the scroll.
+MiddleButtonScrollHandler::~MiddleButtonScrollHandler() = default;
+
+void MiddleButtonScrollHandler::request_indicator_repaint()
 {
-    if (!m_container_element->document().layout_is_up_to_date())
-        return;
-    auto const* layout_node = m_container_element->document().layout_node();
-    if (layout_node && Painting::has_committed_box(*layout_node))
-        Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommands);
+    static_cast<DOM::Node&>(m_container_element->document()).set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 void MiddleButtonScrollHandler::visit_edges(JS::Cell::Visitor& visitor) const
@@ -65,24 +63,28 @@ GC::Ptr<DOM::Element> MiddleButtonScrollHandler::find_scrollable_ancestor(DOM::D
     return {};
 }
 
-void MiddleButtonScrollHandler::perform_tick()
+void MiddleButtonScrollHandler::perform_tick(double frame_timestamp)
 {
+    auto elapsed_ms = clamp(frame_timestamp - m_last_frame_time.value_or(frame_timestamp), 0.0, MAX_FRAME_INTERVAL_MS);
+    m_last_frame_time = frame_timestamp;
+
     auto distance_x = (m_mouse_position.x() - m_origin.x()).to_double();
     auto distance_y = (m_mouse_position.y() - m_origin.y()).to_double();
 
     if (auto distance = AK::hypot(distance_x, distance_y); distance < DEAD_ZONE_RADIUS)
         return;
 
+    Layout::ForcedReadScope read { m_container_element->document() };
     m_container_element->document().update_layout(DOM::UpdateLayoutReason::AutoScrollSelection);
     m_mouse_has_moved_beyond_dead_zone = true;
 
-    auto* layout_node = AutoScrollHandler::auto_scroll_layout_node(m_container_element);
+    auto* layout_node = AutoScrollHandler::auto_scroll_layout_node(read, m_container_element);
     if (!layout_node)
         return;
 
     auto speed_x = clamp(distance_x * SPEED_FACTOR, -MAX_SPEED_PER_SECOND, MAX_SPEED_PER_SECOND);
     auto speed_y = clamp(distance_y * SPEED_FACTOR, -MAX_SPEED_PER_SECOND, MAX_SPEED_PER_SECOND);
-    auto elapsed_seconds = SCROLL_INTERVAL_MS / 1000.0;
+    auto elapsed_seconds = elapsed_ms / 1000.0;
 
     m_fractional_delta += CSSPixelPoint {
         CSSPixels(speed_x * elapsed_seconds),
@@ -98,6 +100,8 @@ void MiddleButtonScrollHandler::perform_tick()
         // until it runs out of scrolls, so it is held open for as long as this handler lives.
         if (!m_scroll_gesture_hold)
             m_scroll_gesture_hold = make<HTML::UserScrollGestureHold>(*navigable);
+        if (auto stable_node_id = Painting::async_scroll_node_stable_id(*layout_node); stable_node_id.has_value())
+            m_scroll_gesture_hold->hold(stable_node_id.value());
         navigable->note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type::EndPosition);
     }
     Painting::scroll_by(*layout_node, scroll_x, scroll_y);

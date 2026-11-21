@@ -1,3 +1,0 @@
-dependent color: rgb(1, 2, 3)
-update recomputations: 2
-read recomputations: 0

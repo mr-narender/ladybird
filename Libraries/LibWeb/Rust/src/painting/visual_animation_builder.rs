@@ -9,9 +9,11 @@
 //! values, the animations an effect has built and published, and the document-wide list the visual
 //! context tree receives.
 
-use std::ffi::c_void;
-
-use crate::css::absolutize::{COLOR_SYNTAX_LEGACY, number_from_value};
+use crate::animations::keyframes::{
+    CompositeOperationOrAuto, Keyframe, KeyframeEasing, KeyframeSet, KeyframeValue, offset_of_key,
+};
+use crate::css::absolutize::number_from_value;
+use crate::css::color_resolution::{ColorResolutionInput, FfiColorResolutionStyle, to_color};
 use crate::css::css_enums::keyword;
 use crate::css::css_pixels::CssPixels;
 use crate::css::easing::Easing;
@@ -21,23 +23,25 @@ use crate::css::style_value::{
     FILTER_KIND_BLUR, FILTER_KIND_COLOR, FILTER_KIND_DROP_SHADOW, FILTER_KIND_HUE_ROTATE, RetainedStyleValueData,
     StyleValueData, is_none_keyword,
 };
+use crate::css::style_value::{ShadowPayload, TransformationPayload};
 use crate::css::table_group_builder::{
     TRANSFORM_PARAMETER_ANGLE, TRANSFORM_PARAMETER_LENGTH, TRANSFORM_PARAMETER_LENGTH_NONE,
     TRANSFORM_PARAMETER_LENGTH_PERCENTAGE, TRANSFORM_PARAMETER_NUMBER, TRANSFORM_PARAMETER_NUMBER_PERCENTAGE,
     angle_degrees, angle_radians, length_px_unrounded,
 };
+use crate::css::value_codes::COLOR_SYNTAX_LEGACY;
 use crate::painting::filter_bytes::{FfiFilterFunction, FfiFilterFunctionKind};
 use crate::painting::host::{
-    FfiCompositorAnimationBuildOutcome, FfiCompositorAnimationHost, FfiCompositorAnimationKeyframe,
-    FfiCompositorAnimationRequest, FfiCompositorAnimationTiming, FfiCompositorKeyframeValueState,
-    FfiVisualAnimationTargetKind, FfiVisualAnimationTransformOperationKind, TARGETED_TRANSFORM_PROPERTY_ROTATE,
-    TARGETED_TRANSFORM_PROPERTY_SCALE, TARGETED_TRANSFORM_PROPERTY_TRANSFORM, TARGETED_TRANSFORM_PROPERTY_TRANSLATE,
+    FfiCompositorAnimationBuildOutcome, FfiCompositorAnimationHost, FfiCompositorAnimationRequest,
+    FfiCompositorAnimationTiming, FfiVisualAnimationTargetKind, FfiVisualAnimationTransformOperationKind,
+    TARGETED_TRANSFORM_PROPERTY_ROTATE, TARGETED_TRANSFORM_PROPERTY_SCALE, TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
+    TARGETED_TRANSFORM_PROPERTY_TRANSLATE,
 };
 use crate::painting::visual_animation::{
     VisualAnimation, VisualAnimationKeyframe, VisualAnimationTransformOperation, VisualAnimationValue,
 };
-use libcompositing_rust::ffi::ffi_slice;
 use libgfx_rust::{Color, ColorFilterType};
+use std::sync::Arc;
 
 const TARGET_KIND_COUNT: usize = 4;
 
@@ -72,18 +76,6 @@ impl AnimatedProperty {
         }
     }
 
-    fn state_in(self, keyframe: &FfiCompositorAnimationKeyframe) -> FfiCompositorKeyframeValueState {
-        match self {
-            Self::Opacity => keyframe.opacity,
-            Self::BackgroundColor => keyframe.background_color,
-            Self::Filter => keyframe.filter,
-            Self::Translate => keyframe.translate,
-            Self::Rotate => keyframe.rotate,
-            Self::Scale => keyframe.scale,
-            Self::Transform => keyframe.transform,
-        }
-    }
-
     fn targeted_transform_flag(self) -> u8 {
         match self {
             Self::Translate => TARGETED_TRANSFORM_PROPERTY_TRANSLATE,
@@ -103,52 +95,112 @@ impl<'a> Host<'a> {
         Self(host)
     }
 
+    /// The value of `property` a keyframe gives, `value`, resolved for the target.
     fn resolved_keyframe_value(
         &self,
-        keyframe_index: usize,
         property: AnimatedProperty,
-        uses_underlying_style: bool,
+        value: KeyframeValueOf<'_>,
     ) -> Option<RetainedStyleValueData> {
-        // SAFETY: The host returns a retained style value or null, synchronously.
-        let value = unsafe {
-            (self.0.resolved_keyframe_value)(
-                self.0.context,
-                keyframe_index,
-                property.property_id(),
-                uses_underlying_style,
-            )
+        let declared_value = match value {
+            KeyframeValueOf::Absent => return None,
+            KeyframeValueOf::UnderlyingStyle => std::ptr::null(),
+            KeyframeValueOf::Declared(value) => value.pointer().cast(),
         };
+        // SAFETY: The host returns a retained style value or null, synchronously. The declared value is the keyframe
+        //         set's, which the request keeps live.
+        let value = unsafe { (self.0.resolved_keyframe_value)(self.0.context, property.property_id(), declared_value) };
         if value.is_null() {
             return None;
         }
         // SAFETY: The host hands over one strong reference, which the wrapper releases.
         Some(unsafe { RetainedStyleValueData::from_retained_pointer(value.cast()) })
     }
-
-    fn resolve_color(&self, value: &StyleValueData) -> Option<Color> {
-        let mut color = Color::TRANSPARENT;
-        // SAFETY: The value is live for the call and the host writes the color synchronously.
-        let has_color =
-            unsafe { (self.0.resolve_color)(self.0.context, std::ptr::from_ref(value).cast(), &raw mut color) };
-        has_color.then_some(color)
-    }
 }
 
-/// A build request with its keyframes in reach.
+/// What a keyframe gives a property: a value of its own, the target's underlying style, or nothing.
+#[derive(Clone, Copy)]
+enum KeyframeValueOf<'a> {
+    Absent,
+    UnderlyingStyle,
+    Declared(&'a RetainedStyleValueData),
+}
+
+/// A build request with the keyframes the effect runs in reach.
 pub struct Request<'a> {
     ffi: &'a FfiCompositorAnimationRequest,
-    keyframes: &'a [FfiCompositorAnimationKeyframe],
+    keyframe_set: Option<Arc<KeyframeSet>>,
+    /// The translation in CSS pixels that the x and y of a <use> element apply after its transform.
+    additional_translation: (f32, f32),
 }
 
 impl<'a> Request<'a> {
     /// # Safety
     ///
-    /// The request's keyframe range must be live.
+    /// The request's keyframe set must be null or one the host holds a reference to.
     pub unsafe fn new(ffi: &'a FfiCompositorAnimationRequest) -> Self {
         Self {
             ffi,
-            // SAFETY: The caller guarantees the keyframe range is live.
-            keyframes: unsafe { ffi_slice(ffi.keyframes, ffi.keyframe_count) },
+            // SAFETY: Guaranteed by the caller.
+            keyframe_set: (!ffi.keyframe_set.is_null())
+                .then(|| unsafe { KeyframeSet::retained_from_host(ffi.keyframe_set.cast()) }),
+            additional_translation: (0.0, 0.0),
+        }
+    }
+
+    pub fn set_additional_translation(&mut self, x: f32, y: f32) {
+        self.additional_translation = (x, y);
+    }
+
+    /// A request for the keyframes of `keyframe_set`, for a unit test.
+    #[cfg(test)]
+    fn with_keyframe_set(ffi: &'a FfiCompositorAnimationRequest, keyframe_set: &Arc<KeyframeSet>) -> Self {
+        Self {
+            ffi,
+            keyframe_set: Some(Arc::clone(keyframe_set)),
+            additional_translation: (0.0, 0.0),
+        }
+    }
+
+    /// The keyframes the effect runs, in the order they are used.
+    fn keyframes(&self) -> &[Keyframe] {
+        self.keyframe_set.as_deref().map_or(&[], KeyframeSet::keyframes)
+    }
+
+    /// What `keyframe`, one of the effect's, gives `property`.
+    fn value_of(&self, keyframe: &Keyframe, property: AnimatedProperty) -> KeyframeValueOf<'_> {
+        let Some(keyframe_set) = &self.keyframe_set else {
+            return KeyframeValueOf::Absent;
+        };
+        let property_id = property.property_id();
+        match keyframe_set
+            .declarations_of(keyframe)
+            .iter()
+            .find(|declaration| declaration.property_id == property_id)
+            .map(|declaration| &declaration.value)
+        {
+            None => KeyframeValueOf::Absent,
+            Some(KeyframeValue::ElementValue) => KeyframeValueOf::UnderlyingStyle,
+            Some(KeyframeValue::Declared(value)) => KeyframeValueOf::Declared(value),
+        }
+    }
+
+    /// The easing `keyframe`, one of the effect's, runs to the next one, or none for one still to be substituted
+    /// against the target, which keeps the effect off the compositor.
+    fn easing_of(&self, keyframe: &Keyframe) -> Option<Easing> {
+        match &keyframe.easing {
+            // SAFETY: The host keeps the default easing's points live for the build.
+            KeyframeEasing::None => Some(unsafe { Easing::from_descriptor(&self.ffi.default_easing) }),
+            KeyframeEasing::Easing(easing) => Some(easing.clone()),
+            KeyframeEasing::Value(_) => None,
+        }
+    }
+
+    /// Whether `keyframe`, one of the effect's, replaces the value beneath it.
+    fn replaces(&self, keyframe: &Keyframe) -> bool {
+        match keyframe.composite {
+            CompositeOperationOrAuto::Replace => true,
+            CompositeOperationOrAuto::Add | CompositeOperationOrAuto::Accumulate => false,
+            CompositeOperationOrAuto::Auto => self.ffi.effect_composite_is_replace,
         }
     }
 
@@ -158,6 +210,18 @@ impl<'a> Request<'a> {
 
     pub fn layout_node(&self) -> crate::layout::node_data::NodeSlotId {
         self.ffi.layout_node
+    }
+
+    /// The color a resolved color value names for the target.
+    fn resolve_color(&self, value: &StyleValueData) -> Option<Color> {
+        let target_style = FfiColorResolutionStyle {
+            inherited_ui_values: self.ffi.target_inherited_ui_values,
+            inherited_text_values: self.ffi.target_inherited_text_values,
+        };
+        // SAFETY: The host keeps the target's style group payloads live for the build.
+        let input = unsafe { ColorResolutionInput::for_ffi_style(&raw const target_style) };
+        let color = to_color(value, &input)?;
+        Some(Color::from_rgba(color.r, color.g, color.b, color.a))
     }
 
     fn targets(&self, property: AnimatedProperty) -> bool {
@@ -186,12 +250,14 @@ impl<'a> Request<'a> {
 
     fn cache_key(&self) -> KeyframeValueCacheKey {
         KeyframeValueCacheKey {
-            key_frame_set_identity: self.ffi.key_frame_set_identity,
+            keyframe_set: self.keyframe_set.clone(),
             target_style_generation: self.ffi.target_style_generation,
             style_environment_version: self.ffi.style_environment_version,
             reference_box_width: self.ffi.reference_box_width,
             reference_box_height: self.ffi.reference_box_height,
             device_pixels_per_css_pixel: self.ffi.device_pixels_per_css_pixel,
+            additional_translation_x: self.additional_translation.0,
+            additional_translation_y: self.additional_translation.1,
         }
     }
 }
@@ -212,27 +278,24 @@ fn opacity_from_style_value(value: &StyleValueData) -> Option<f32> {
 }
 
 fn is_legacy_color_function(value: &StyleValueData) -> bool {
-    matches!(value, StyleValueData::ColorFunction { color_base, .. } if color_base.color_syntax == COLOR_SYNTAX_LEGACY)
+    matches!(value, StyleValueData::ColorFunction(color_function) if color_function.color_base.color_syntax == COLOR_SYNTAX_LEGACY)
 }
 
 /// Legacy sRGB colors interpolate in gamma-encoded sRGB, which the compositor sampler matches. Modern
 /// color syntaxes stay on the main thread until compositor values can retain their interpolation
 /// color space, and currentcolor with them.
-fn background_color_from_style_value(value: &StyleValueData, host: &Host) -> Option<Color> {
+fn background_color_from_style_value(value: &StyleValueData, request: &Request) -> Option<Color> {
     if matches!(value, StyleValueData::Keyword { keyword: code } if *code == keyword::CURRENTCOLOR) {
         return None;
     }
     if matches!(value, StyleValueData::ColorFunction { .. }) && !is_legacy_color_function(value) {
         return None;
     }
-    host.resolve_color(value)
+    request.resolve_color(value)
 }
 
-fn filter_functions_from_style_value(
-    value: &StyleValueData,
-    device_pixels_per_css_pixel: f32,
-    host: &Host,
-) -> Option<Vec<FfiFilterFunction>> {
+fn filter_functions_from_style_value(value: &StyleValueData, request: &Request) -> Option<Vec<FfiFilterFunction>> {
+    let device_pixels_per_css_pixel = request.device_pixels_per_css_pixel();
     if is_none_keyword(value) {
         return Some(Vec::new());
     }
@@ -267,20 +330,20 @@ fn filter_functions_from_style_value(
                 )
             }
             FILTER_KIND_DROP_SHADOW => {
-                let StyleValueData::Shadow {
+                let StyleValueData::Shadow(shadow_payload) = value.data() else {
+                    return None;
+                };
+                let ShadowPayload {
                     color,
                     offset_x,
                     offset_y,
                     blur_radius,
                     ..
-                } = value.data()
-                else {
-                    return None;
-                };
+                } = &**shadow_payload;
                 // Gfx filters hold 8-bit sRGB colors. Modern color syntaxes and currentcolor stay on the
                 // main thread until compositor filter values can retain their color space and syntax.
                 let color = color.optional_data().filter(|color| is_legacy_color_function(color))?;
-                let color = host.resolve_color(color)?;
+                let color = request.resolve_color(color)?;
                 let resolve_length = |length: &StyleValueData| {
                     length_px_unrounded(length, None).map(|px| device_pixels(px, device_pixels_per_css_pixel))
                 };
@@ -412,9 +475,20 @@ fn transform_operation(
         let angle = if axis < 0.0 { -lowered[3] } else { lowered[3] };
         lowered = vec![angle];
     }
-    if kind == Kind::Translate && lowered.len() == 1 {
-        kind = Kind::TranslateX;
-    }
+    // https://drafts.csswg.org/css-transforms-2/#transform-primitives
+    // Translations and scales take the operation of their primitive, through which the main thread interpolates two
+    // functions that share it, so that keyframes naming different ones line up as the same operation.
+    let primitive = match (kind, lowered.as_slice()) {
+        (Kind::Translate | Kind::TranslateX, &[x]) => Some((Kind::Translate, vec![x, 0.0])),
+        (Kind::TranslateY, &[y]) => Some((Kind::Translate, vec![0.0, y])),
+        (Kind::TranslateZ, &[z]) => Some((Kind::Translate3d, vec![0.0, 0.0, z])),
+        (Kind::Scale, &[scale]) => Some((Kind::Scale, vec![scale, scale])),
+        (Kind::ScaleX, &[x]) => Some((Kind::Scale, vec![x, 1.0])),
+        (Kind::ScaleY, &[y]) => Some((Kind::Scale, vec![1.0, y])),
+        (Kind::ScaleZ, &[z]) => Some((Kind::Scale3d, vec![1.0, 1.0, z])),
+        _ => None,
+    };
+    let (kind, lowered) = primitive.unwrap_or((kind, lowered));
     let operation = VisualAnimationTransformOperation::new(kind, &lowered)?;
     operation.is_valid().then_some(operation)
 }
@@ -453,14 +527,19 @@ fn transform_operations_from_style_value(
     }
 
     let lower = |transformation: &StyleValueData| {
-        let StyleValueData::Transformation {
-            transform_function,
-            values,
-            ..
-        } = transformation
-        else {
+        let StyleValueData::Transformation(transformation_payload) = transformation else {
             return None;
         };
+        let TransformationPayload {
+            transform_function,
+            values,
+            matrix_values,
+            ..
+        } = &**transformation_payload;
+        // Matrix-only precision inputs must not replace unwrapped animation interpolation arguments.
+        if !matrix_values.as_slice().is_empty() {
+            return None;
+        }
         transform_operation(
             *transform_function,
             values.as_slice(),
@@ -489,16 +568,10 @@ fn transform_lists_only_translate_horizontally<'a>(
     let Some(first) = lists.next() else {
         return false;
     };
-    if !first
-        .iter()
-        .all(|operation| matches!(operation.kind, Kind::Translate | Kind::TranslateX))
-    {
+    if !first.iter().all(|operation| operation.kind == Kind::Translate) {
         return false;
     }
-    let translate_y = |operation: &VisualAnimationTransformOperation| match operation.kind {
-        Kind::Translate => operation.values().get(1).copied().unwrap_or(0.0),
-        _ => 0.0,
-    };
+    let translate_y = |operation: &VisualAnimationTransformOperation| operation.values().get(1).copied().unwrap_or(0.0);
     let mut list_count = 1;
     for list in lists {
         list_count += 1;
@@ -521,13 +594,13 @@ fn own_transform_keyframe_operations(
     host: &Host,
 ) -> Option<Vec<Vec<VisualAnimationTransformOperation>>> {
     let mut lists = Vec::new();
-    for (index, keyframe) in request.keyframes.iter().enumerate() {
-        match AnimatedProperty::Transform.state_in(keyframe) {
-            FfiCompositorKeyframeValueState::Absent => continue,
-            FfiCompositorKeyframeValueState::UsesUnderlyingStyle => return None,
-            FfiCompositorKeyframeValueState::Present => {}
-        }
-        let value = host.resolved_keyframe_value(index, AnimatedProperty::Transform, false)?;
+    for keyframe in request.keyframes() {
+        let declared = match request.value_of(keyframe, AnimatedProperty::Transform) {
+            KeyframeValueOf::Absent => continue,
+            KeyframeValueOf::UnderlyingStyle => return None,
+            declared @ KeyframeValueOf::Declared(_) => declared,
+        };
+        let value = host.resolved_keyframe_value(AnimatedProperty::Transform, declared)?;
         lists.push(transform_operations_from_style_value(
             AnimatedProperty::Transform,
             value.data(),
@@ -569,14 +642,34 @@ pub fn effect_transform_preserves_axes(request: &Request, host: &Host) -> bool {
     })
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone)]
 struct KeyframeValueCacheKey {
-    key_frame_set_identity: u64,
+    keyframe_set: Option<Arc<KeyframeSet>>,
     target_style_generation: u64,
     style_environment_version: u64,
     reference_box_width: f32,
     reference_box_height: f32,
     device_pixels_per_css_pixel: f32,
+    additional_translation_x: f32,
+    additional_translation_y: f32,
+}
+
+impl PartialEq for KeyframeValueCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        let same_keyframe_set = match (&self.keyframe_set, &other.keyframe_set) {
+            (Some(keyframe_set), Some(other_keyframe_set)) => Arc::ptr_eq(keyframe_set, other_keyframe_set),
+            (None, None) => true,
+            _ => false,
+        };
+        same_keyframe_set
+            && self.target_style_generation == other.target_style_generation
+            && self.style_environment_version == other.style_environment_version
+            && self.reference_box_width == other.reference_box_width
+            && self.reference_box_height == other.reference_box_height
+            && self.device_pixels_per_css_pixel == other.device_pixels_per_css_pixel
+            && self.additional_translation_x == other.additional_translation_x
+            && self.additional_translation_y == other.additional_translation_y
+    }
 }
 
 /// The values of one target kind lowered from an effect's keyframes, kept while the keyframes and
@@ -594,10 +687,9 @@ type TransformIdentityShapes = [Option<Option<Vec<VisualAnimationTransformOperat
 fn build_keyframe_value_cache(request: &Request, host: &Host, key: KeyframeValueCacheKey) -> KeyframeValueCache {
     let mut identity_shapes: TransformIdentityShapes = Default::default();
     let values = request
-        .keyframes
+        .keyframes()
         .iter()
-        .enumerate()
-        .map(|(index, keyframe)| lower_keyframe(request, host, index, keyframe, &mut identity_shapes))
+        .map(|keyframe| lower_keyframe(request, host, keyframe, &mut identity_shapes))
         .collect();
     KeyframeValueCache { key, values }
 }
@@ -607,8 +699,7 @@ fn build_keyframe_value_cache(request: &Request, host: &Host, key: KeyframeValue
 fn lower_keyframe(
     request: &Request,
     host: &Host,
-    index: usize,
-    keyframe: &FfiCompositorAnimationKeyframe,
+    keyframe: &Keyframe,
     identity_shapes: &mut TransformIdentityShapes,
 ) -> Option<Option<VisualAnimationValue>> {
     let kind = request.target_kind();
@@ -617,25 +708,22 @@ fn lower_keyframe(
         FfiVisualAnimationTargetKind::BackgroundColor => AnimatedProperty::BackgroundColor,
         FfiVisualAnimationTargetKind::Filter => AnimatedProperty::Filter,
         FfiVisualAnimationTargetKind::Transform => {
-            return lower_transform_keyframe(request, host, index, keyframe, identity_shapes);
+            return lower_transform_keyframe(request, host, keyframe, identity_shapes);
         }
     };
-    if property.state_in(keyframe) != FfiCompositorKeyframeValueState::Present {
+    let value = request.value_of(keyframe, property);
+    if matches!(value, KeyframeValueOf::Absent) {
         return Some(None);
     }
-    let resolved = host.resolved_keyframe_value(index, property, false)?;
+    let resolved = host.resolved_keyframe_value(property, value)?;
     let value = match kind {
         FfiVisualAnimationTargetKind::Opacity => {
             VisualAnimationValue::Opacity(opacity_from_style_value(resolved.data())?)
         }
         FfiVisualAnimationTargetKind::BackgroundColor => {
-            VisualAnimationValue::BackgroundColor(background_color_from_style_value(resolved.data(), host)?)
+            VisualAnimationValue::BackgroundColor(background_color_from_style_value(resolved.data(), request)?)
         }
-        _ => VisualAnimationValue::Filter(filter_functions_from_style_value(
-            resolved.data(),
-            request.device_pixels_per_css_pixel(),
-            host,
-        )?),
+        _ => VisualAnimationValue::Filter(filter_functions_from_style_value(resolved.data(), request)?),
     };
     Some(Some(value))
 }
@@ -643,8 +731,7 @@ fn lower_keyframe(
 fn lower_transform_keyframe(
     request: &Request,
     host: &Host,
-    index: usize,
-    keyframe: &FfiCompositorAnimationKeyframe,
+    keyframe: &Keyframe,
     identity_shapes: &mut TransformIdentityShapes,
 ) -> Option<Option<VisualAnimationValue>> {
     let mut operations = Vec::new();
@@ -652,14 +739,13 @@ fn lower_transform_keyframe(
         if !request.targets(*property) {
             continue;
         }
-        let state = property.state_in(keyframe);
-        if state == FfiCompositorKeyframeValueState::Absent {
+        let value = request.value_of(keyframe, *property);
+        if matches!(value, KeyframeValueOf::Absent) {
             // A keyframe that leaves out the only transform property is synthesized by the effect;
             // one that leaves out some of several cannot be lowered.
             return (request.targeted_transform_property_count() == 1).then_some(None);
         }
-        let uses_underlying_style = state == FfiCompositorKeyframeValueState::UsesUnderlyingStyle;
-        let resolved = host.resolved_keyframe_value(index, *property, uses_underlying_style)?;
+        let resolved = host.resolved_keyframe_value(*property, value)?;
         let identity_shape = if is_none_keyword(resolved.data()) {
             identity_shapes[property_index]
                 .get_or_insert_with(|| resolve_transform_identity_shape(request, host, *property))
@@ -675,6 +761,16 @@ fn lower_transform_keyframe(
             identity_shape,
         )?);
     }
+    // The compositor interpolates transform lists function by function, so a function that is the same at the end of
+    // every list applies after whatever the others have interpolated to.
+    let (x, y) = request.additional_translation;
+    if x != 0.0 || y != 0.0 {
+        let scale = request.device_pixels_per_css_pixel();
+        operations.push(VisualAnimationTransformOperation::new(
+            FfiVisualAnimationTransformOperationKind::Translate,
+            &[x * scale, y * scale],
+        )?);
+    }
     Some(Some(VisualAnimationValue::Transform(operations)))
 }
 
@@ -685,11 +781,11 @@ fn resolve_transform_identity_shape(
     host: &Host,
     property: AnimatedProperty,
 ) -> Option<Vec<VisualAnimationTransformOperation>> {
-    for (index, keyframe) in request.keyframes.iter().enumerate() {
-        if property.state_in(keyframe) != FfiCompositorKeyframeValueState::Present {
+    for keyframe in request.keyframes() {
+        let declared @ KeyframeValueOf::Declared(_) = request.value_of(keyframe, property) else {
             continue;
-        }
-        let Some(candidate) = host.resolved_keyframe_value(index, property, false) else {
+        };
+        let Some(candidate) = host.resolved_keyframe_value(property, declared) else {
             continue;
         };
         if is_none_keyword(candidate.data()) {
@@ -736,9 +832,9 @@ impl CompositorAnimationEffectState {
         let mut outcome = FfiCompositorAnimationBuildOutcome::default();
         let kind = request.target_kind();
         if request
-            .keyframes
+            .keyframes()
             .iter()
-            .any(|keyframe| !keyframe.composite_is_replace || !keyframe.easing_is_supported)
+            .any(|keyframe| !request.replaces(keyframe) || matches!(keyframe.easing, KeyframeEasing::Value(_)))
         {
             return outcome;
         }
@@ -746,17 +842,18 @@ impl CompositorAnimationEffectState {
         let Some(values) = self.resolved_values_for_target(request, host).values.as_ref() else {
             return outcome;
         };
-        debug_assert_eq!(values.len(), request.keyframes.len());
+        debug_assert_eq!(values.len(), request.keyframes().len());
         let keyframes: Vec<VisualAnimationKeyframe> = request
-            .keyframes
+            .keyframes()
             .iter()
             .zip(values)
             .filter_map(|(keyframe, value)| {
-                value.as_ref().map(|value| VisualAnimationKeyframe {
-                    offset: keyframe.offset,
-                    // SAFETY: The request's easing point ranges are live for the build.
-                    easing: unsafe { Easing::from_descriptor(&keyframe.easing) },
-                    value: value.clone(),
+                let value = value.as_ref()?.clone();
+                Some(VisualAnimationKeyframe {
+                    #[expect(clippy::cast_precision_loss)]
+                    offset: offset_of_key(keyframe.key as f64),
+                    easing: request.easing_of(keyframe)?,
+                    value,
                 })
             })
             .collect();
@@ -779,12 +876,7 @@ impl CompositorAnimationEffectState {
             monotonic_time_at_anchor_ns: timing.monotonic_time_at_anchor_ns,
             local_time_at_anchor_ms: timing.local_time_at_anchor_ms,
             playback_rate: timing.playback_rate,
-            start_delay_ms: timing.start_delay_ms,
-            iteration_duration_ms: timing.iteration_duration_ms,
-            iteration_count: timing.iteration_count,
-            iteration_start: timing.iteration_start,
-            playback_direction: timing.playback_direction,
-            fill_mode: timing.fill_mode,
+            timing: timing.effect,
             // SAFETY: The request's easing point ranges are live for the build.
             easing: unsafe { Easing::from_descriptor(&timing.easing) },
             keyframes,
@@ -853,28 +945,21 @@ impl CompositorAnimationEffectState {
     }
 }
 
-/// # Safety
-///
-/// `state` must be a live handle from `compositor_animation_effect_state_create`.
-pub(crate) unsafe fn effect_state_from_handle<'a>(state: *mut c_void) -> &'a mut CompositorAnimationEffectState {
-    // SAFETY: The caller guarantees a live, exclusively used handle.
-    unsafe { &mut *state.cast::<CompositorAnimationEffectState>() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::animations::timing::{AnimationEffectTiming, FillMode, TimeValue};
     use crate::css::easing::{FfiEasingDescriptor, FfiEasingKind, FfiLinearEasingPoint};
     use crate::css::style_value::{ColorBase, CssString, RetainedStyleValueDataList};
+    use crate::css::style_value::{ColorFunctionPayload, StyleValueBox};
+    use crate::css::style_value_arc::StyleValueArc;
     use crate::css::table_group_builder::angle_unit_index;
-    use crate::painting::host::{FfiVisualAnimationFillMode, FfiVisualAnimationPlaybackDirection};
     use crate::painting::visual_context::publish_compositor_animations;
     use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextState, VisualContextTree};
     use FfiVisualAnimationTransformOperationKind as Kind;
     use libgfx_rust::{FloatMatrix4x4, FloatPoint};
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
     use std::sync::Arc;
 
     fn retained(value: StyleValueData) -> RetainedStyleValueData {
@@ -914,11 +999,12 @@ mod tests {
     }
 
     fn transformation(function: u8, values: Vec<StyleValueData>) -> StyleValueData {
-        StyleValueData::Transformation {
+        StyleValueData::Transformation(StyleValueBox::new(TransformationPayload {
             property: property_id::TRANSFORM,
             transform_function: function,
             values: RetainedStyleValueDataList::from_retained_values(values.into_iter().map(retained).collect()),
-        }
+            matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
+        }))
     }
 
     fn value_list(values: Vec<StyleValueData>) -> StyleValueData {
@@ -930,10 +1016,10 @@ mod tests {
     }
 
     fn color_function(syntax: u8) -> StyleValueData {
-        StyleValueData::ColorFunction {
+        StyleValueData::ColorFunction(StyleValueBox::new(ColorFunctionPayload {
             color_base: ColorBase {
-                has_color_type: false,
-                color_type: 0,
+                has_color_type: true,
+                color_type: crate::css::color_conversion::RGB,
                 color_syntax: syntax,
             },
             channel_0: retained(number_value(255.0)),
@@ -943,7 +1029,7 @@ mod tests {
             has_name: false,
             name: CssString::default(),
             origin_color: RetainedStyleValueData::none(),
-        }
+        }))
     }
 
     fn filter(kind: u8, color_operation: u8, value: StyleValueData) -> StyleValueData {
@@ -955,7 +1041,7 @@ mod tests {
     }
 
     fn shadow(color: Option<StyleValueData>, offset_x: f64, offset_y: f64, blur_radius: Option<f64>) -> StyleValueData {
-        StyleValueData::Shadow {
+        StyleValueData::Shadow(StyleValueBox::new(ShadowPayload {
             shadow_type: 0,
             color: color.map_or_else(RetainedStyleValueData::none, retained),
             offset_x: retained(px(offset_x)),
@@ -963,32 +1049,28 @@ mod tests {
             blur_radius: blur_radius.map_or_else(RetainedStyleValueData::none, |radius| retained(px(radius))),
             spread_distance: RetainedStyleValueData::none(),
             placement: 0,
-        }
+        }))
     }
 
-    /// A main thread whose keyframe values are given up front, counting what the builder asks for.
+    /// A main thread whose keyframe values are given up front, counting what the builder asks for. Each keyframe of a
+    /// test declares its index as the value of a property, which the main thread resolves to the value given for it.
     #[derive(Default)]
     struct TestHost {
-        values: HashMap<(usize, u16, bool), Arc<StyleValueData>>,
-        resolved_color: Option<Color>,
+        values: HashMap<(usize, u16), StyleValueArc>,
+        underlying_values: HashMap<u16, StyleValueArc>,
         resolutions: RefCell<usize>,
     }
 
     impl TestHost {
         fn with_value(mut self, keyframe_index: usize, property: AnimatedProperty, value: StyleValueData) -> Self {
             self.values
-                .insert((keyframe_index, property.property_id(), false), Arc::new(value));
+                .insert((keyframe_index, property.property_id()), StyleValueArc::new(value));
             self
         }
 
-        fn with_underlying_value(
-            mut self,
-            keyframe_index: usize,
-            property: AnimatedProperty,
-            value: StyleValueData,
-        ) -> Self {
-            self.values
-                .insert((keyframe_index, property.property_id(), true), Arc::new(value));
+        fn with_underlying_value(mut self, property: AnimatedProperty, value: StyleValueData) -> Self {
+            self.underlying_values
+                .insert(property.property_id(), StyleValueArc::new(value));
             self
         }
 
@@ -996,33 +1078,27 @@ mod tests {
             FfiCompositorAnimationHost {
                 context: std::ptr::from_ref(self).cast_mut().cast(),
                 resolved_keyframe_value: test_resolved_keyframe_value,
-                resolve_color: test_resolve_color,
             }
         }
     }
 
     unsafe extern "C" fn test_resolved_keyframe_value(
-        context: *mut c_void,
-        keyframe_index: usize,
+        context: *mut std::ffi::c_void,
         property_id: u16,
-        uses_underlying_style: bool,
-    ) -> *const c_void {
+        declared_value: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void {
         let host = unsafe { &*context.cast::<TestHost>() };
         *host.resolutions.borrow_mut() += 1;
-        host.values
-            .get(&(keyframe_index, property_id, uses_underlying_style))
-            .map_or(std::ptr::null(), |value| Arc::into_raw(Arc::clone(value)).cast())
-    }
-
-    unsafe extern "C" fn test_resolve_color(context: *mut c_void, _value: *const c_void, color: *mut Color) -> bool {
-        let host = unsafe { &*context.cast::<TestHost>() };
-        match host.resolved_color {
-            Some(resolved) => {
-                unsafe { *color = resolved };
-                true
+        let value = match unsafe { declared_value.cast::<StyleValueData>().as_ref() } {
+            None => host.underlying_values.get(&property_id),
+            Some(&StyleValueData::Integer { value: keyframe_index }) => {
+                host.values.get(&(keyframe_index as usize, property_id))
             }
-            None => false,
-        }
+            Some(_) => unreachable!("a test keyframe declares its index"),
+        };
+        value.map_or(std::ptr::null(), |value| {
+            StyleValueArc::into_raw(StyleValueArc::clone(value)).cast()
+        })
     }
 
     fn linear_easing() -> FfiEasingDescriptor {
@@ -1049,35 +1125,58 @@ mod tests {
         }
     }
 
-    fn keyframe(
+    /// What a test keyframe gives its property.
+    #[derive(Clone, Copy)]
+    enum ValueState {
+        Absent,
+        UsesUnderlyingStyle,
+        Present,
+    }
+
+    /// One keyframe of a test effect, which gives one property a value.
+    #[derive(Clone)]
+    struct TestKeyframe {
         offset: f64,
         property: AnimatedProperty,
-        state: FfiCompositorKeyframeValueState,
-    ) -> FfiCompositorAnimationKeyframe {
-        let absent = FfiCompositorKeyframeValueState::Absent;
-        let mut keyframe = FfiCompositorAnimationKeyframe {
+        state: ValueState,
+        composite: CompositeOperationOrAuto,
+        easing: KeyframeEasing,
+    }
+
+    fn keyframe(offset: f64, property: AnimatedProperty, state: ValueState) -> TestKeyframe {
+        TestKeyframe {
             offset,
-            easing: linear_easing(),
-            easing_is_supported: true,
-            composite_is_replace: true,
-            opacity: absent,
-            background_color: absent,
-            filter: absent,
-            translate: absent,
-            rotate: absent,
-            scale: absent,
-            transform: absent,
-        };
-        match property {
-            AnimatedProperty::Opacity => keyframe.opacity = state,
-            AnimatedProperty::BackgroundColor => keyframe.background_color = state,
-            AnimatedProperty::Filter => keyframe.filter = state,
-            AnimatedProperty::Translate => keyframe.translate = state,
-            AnimatedProperty::Rotate => keyframe.rotate = state,
-            AnimatedProperty::Scale => keyframe.scale = state,
-            AnimatedProperty::Transform => keyframe.transform = state,
+            property,
+            state,
+            composite: CompositeOperationOrAuto::Auto,
+            easing: KeyframeEasing::None,
         }
-        keyframe
+    }
+
+    /// The keyframe set of `keyframes`, exactly as given, each declaring its index as the value it gives.
+    fn keyframe_set(keyframes: &[TestKeyframe]) -> Arc<KeyframeSet> {
+        use crate::animations::keyframes::KeyframeProperty;
+        Arc::new(KeyframeSet::from_keyframes_as_given(
+            keyframes
+                .iter()
+                .enumerate()
+                .map(|(index, keyframe)| {
+                    let property = KeyframeProperty::Id(keyframe.property.property_id());
+                    let declarations = match keyframe.state {
+                        ValueState::Absent => Vec::new(),
+                        ValueState::UsesUnderlyingStyle => vec![(property, KeyframeValue::ElementValue)],
+                        ValueState::Present => vec![(
+                            property,
+                            KeyframeValue::Declared(retained(StyleValueData::Integer {
+                                value: i32::try_from(index).unwrap(),
+                            })),
+                        )],
+                    };
+                    let key = crate::animations::keyframes::key_of_offset(keyframe.offset);
+                    (key, keyframe.composite, keyframe.easing.clone(), declarations)
+                })
+                .collect(),
+        ))
     }
 
     fn timing() -> crate::painting::host::FfiCompositorAnimationTiming {
@@ -1085,28 +1184,29 @@ mod tests {
             monotonic_time_at_anchor_ns: 1_000,
             local_time_at_anchor_ms: 0.0,
             playback_rate: 1.0,
-            start_delay_ms: 0.0,
-            iteration_duration_ms: 1000.0,
-            iteration_count: f64::INFINITY,
-            iteration_start: 0.0,
-            playback_direction: FfiVisualAnimationPlaybackDirection::Normal,
-            fill_mode: FfiVisualAnimationFillMode::None,
+            effect: AnimationEffectTiming {
+                iteration_duration: TimeValue::milliseconds(1000.0),
+                iteration_count: f64::INFINITY,
+                fill_mode: FillMode::None,
+                ..AnimationEffectTiming::default()
+            },
             easing: linear_easing(),
         }
     }
 
     fn build_request(
         kind: FfiVisualAnimationTargetKind,
-        keyframes: &[FfiCompositorAnimationKeyframe],
         targeted_transform_properties: u8,
     ) -> FfiCompositorAnimationRequest {
         FfiCompositorAnimationRequest {
             target_kind: kind,
             layout_node: crate::layout::node_data::NodeSlotId::INVALID,
+            target_inherited_ui_values: std::ptr::null(),
+            target_inherited_text_values: std::ptr::null(),
             timing: timing(),
-            keyframes: keyframes.as_ptr(),
-            keyframe_count: keyframes.len(),
-            key_frame_set_identity: 7,
+            keyframe_set: std::ptr::null(),
+            effect_composite_is_replace: true,
+            default_easing: linear_easing(),
             target_style_generation: 1,
             style_environment_version: 1,
             reference_box_width: 200.0,
@@ -1117,8 +1217,8 @@ mod tests {
         }
     }
 
-    fn present(offset: f64, property: AnimatedProperty) -> FfiCompositorAnimationKeyframe {
-        keyframe(offset, property, FfiCompositorKeyframeValueState::Present)
+    fn present(offset: f64, property: AnimatedProperty) -> TestKeyframe {
+        keyframe(offset, property, ValueState::Present)
     }
 
     fn operation(kind: Kind, values: &[f32]) -> VisualAnimationTransformOperation {
@@ -1144,8 +1244,9 @@ mod tests {
             present(0.0, AnimatedProperty::Opacity),
             present(1.0, AnimatedProperty::Opacity),
         ];
-        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &keyframes, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, 0);
+        let set = keyframe_set(&keyframes);
+        let request = Request::with_keyframe_set(&ffi_request, &set);
         let mut state = CompositorAnimationEffectState::default();
 
         let outcome = state.build(&request, &Host::new(&ffi_host), |_| vec![3]);
@@ -1168,7 +1269,7 @@ mod tests {
 
         let mut changed_style = ffi_request;
         changed_style.target_style_generation += 1;
-        let request = unsafe { Request::new(&changed_style) };
+        let request = Request::with_keyframe_set(&changed_style, &set);
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
         assert_eq!(*host.resolutions.borrow(), 4, "a style change lowers the values again");
     }
@@ -1183,8 +1284,8 @@ mod tests {
             present(0.0, AnimatedProperty::Opacity),
             present(1.0, AnimatedProperty::Opacity),
         ];
-        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &keyframes, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, 0);
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
         let mut state = CompositorAnimationEffectState::default();
 
         let outcome = state.build(&request, &Host::new(&ffi_host), |_| Vec::new());
@@ -1192,28 +1293,86 @@ mod tests {
         assert!(outcome.missing_visual_context_node);
         assert!(!state.has_pending());
 
-        let mut additive = keyframes;
-        additive[1].composite_is_replace = false;
-        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &additive, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let mut additive = keyframes.clone();
+        additive[1].composite = CompositeOperationOrAuto::Add;
+        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, 0);
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&additive));
         assert!(!state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
 
-        let mut unsupported_easing = keyframes;
-        unsupported_easing[0].easing_is_supported = false;
-        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &unsupported_easing, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let mut unsupported_easing = keyframes.clone();
+        unsupported_easing[0].easing = KeyframeEasing::Value(retained(none()));
+        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, 0);
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&unsupported_easing));
         assert!(!state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
 
-        // A keyframe without the property is left out; too few remain for an animation. Another
-        // keyframe set has an identity of its own.
+        // A keyframe without the property is left out; too few remain for an animation.
         let sparse = [
             present(0.0, AnimatedProperty::Opacity),
-            keyframe(1.0, AnimatedProperty::Opacity, FfiCompositorKeyframeValueState::Absent),
+            keyframe(1.0, AnimatedProperty::Opacity, ValueState::Absent),
         ];
-        let mut ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, &sparse, 0);
-        ffi_request.key_frame_set_identity += 1;
-        let request = unsafe { Request::new(&ffi_request) };
+        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, 0);
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&sparse));
         assert!(!state.build(&request, &Host::new(&ffi_host), |_| vec![3]).built);
+    }
+
+    #[test]
+    fn opacity_keyframes_that_take_the_underlying_style_build_from_it() {
+        let host = TestHost::default()
+            .with_underlying_value(AnimatedProperty::Opacity, opacity_value(0.25))
+            .with_value(1, AnimatedProperty::Opacity, opacity_value(0.5))
+            .with_underlying_value(AnimatedProperty::Opacity, opacity_value(0.25));
+        let ffi_host = host.ffi();
+        let underlying = ValueState::UsesUnderlyingStyle;
+        let keyframes = [
+            keyframe(0.0, AnimatedProperty::Opacity, underlying),
+            present(0.5, AnimatedProperty::Opacity),
+            keyframe(1.0, AnimatedProperty::Opacity, underlying),
+        ];
+        let ffi_request = build_request(FfiVisualAnimationTargetKind::Opacity, 0);
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
+        let mut state = CompositorAnimationEffectState::default();
+
+        assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![1]).built);
+        let animation = pending_animation(&state, FfiVisualAnimationTargetKind::Opacity);
+        assert_eq!(animation.keyframes[0].value, VisualAnimationValue::Opacity(0.25));
+        assert_eq!(animation.keyframes[1].value, VisualAnimationValue::Opacity(0.5));
+        assert_eq!(animation.keyframes[2].value, VisualAnimationValue::Opacity(0.25));
+    }
+
+    #[test]
+    fn transform_precision_inputs_do_not_replace_compositor_interpolation_angles() {
+        let mut value = transformation(transform_function::ROTATE, vec![deg(1e30 * 360.0)]);
+        assert!(
+            transform_operations_from_style_value(
+                AnimatedProperty::Transform,
+                &value_list(vec![value.clone()]),
+                (100.0, 100.0),
+                1.0,
+                None
+            )
+            .is_some()
+        );
+        let StyleValueData::Transformation(transformation_payload) = &mut value else {
+            unreachable!()
+        };
+        let TransformationPayload { matrix_values, .. } = &mut **transformation_payload;
+        *matrix_values = RetainedStyleValueDataList::from_retained_values(vec![retained(StyleValueData::Angle {
+            value: 1e30,
+            unit: crate::css::calc::ANGLE_UNIT_NAMES
+                .iter()
+                .position(|unit| *unit == "turn")
+                .unwrap() as u8,
+        })]);
+        assert!(
+            transform_operations_from_style_value(
+                AnimatedProperty::Transform,
+                &value_list(vec![value]),
+                (100.0, 100.0),
+                1.0,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1242,10 +1401,9 @@ mod tests {
         ];
         let ffi_request = build_request(
             FfiVisualAnimationTargetKind::Transform,
-            &keyframes,
             TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
         let mut state = CompositorAnimationEffectState::default();
 
         let outcome = state.build(&request, &Host::new(&ffi_host), |_| vec![1]);
@@ -1269,7 +1427,7 @@ mod tests {
         );
         assert!(animation.is_valid());
 
-        // A single translation becomes the horizontal one, and a rotation about one axis the
+        // A translation takes its primitive's two values, and a rotation about one axis the
         // rotation about that axis, signed by the axis.
         let lowered = transform_operations_from_style_value(
             AnimatedProperty::Transform,
@@ -1288,8 +1446,8 @@ mod tests {
         assert_eq!(
             lowered,
             Some(vec![
-                operation(Kind::TranslateX, &[3.0]),
-                operation(Kind::TranslateX, &[200.0]),
+                operation(Kind::Translate, &[3.0, 0.0]),
+                operation(Kind::Translate, &[200.0, 0.0]),
                 operation(Kind::RotateZ, &[-std::f32::consts::FRAC_PI_2]),
             ])
         );
@@ -1318,6 +1476,50 @@ mod tests {
     }
 
     #[test]
+    fn transform_keyframes_naming_functions_of_one_primitive_interpolate_together() {
+        let builds = |from: StyleValueData, to: StyleValueData| {
+            let host = TestHost::default()
+                .with_value(0, AnimatedProperty::Transform, value_list(vec![from]))
+                .with_value(1, AnimatedProperty::Transform, value_list(vec![to]));
+            let ffi_host = host.ffi();
+            let keyframes = [
+                present(0.0, AnimatedProperty::Transform),
+                present(1.0, AnimatedProperty::Transform),
+            ];
+            let ffi_request = build_request(
+                FfiVisualAnimationTargetKind::Transform,
+                TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
+            );
+            let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
+            let mut state = CompositorAnimationEffectState::default();
+            state.build(&request, &Host::new(&ffi_host), |_| vec![1]).built
+        };
+
+        assert!(builds(
+            transformation(transform_function::TRANSLATE, vec![px(1.0), px(0.0)]),
+            transformation(transform_function::TRANSLATE_X, vec![px(3.0)]),
+        ));
+        assert!(builds(
+            transformation(transform_function::TRANSLATE_Y, vec![px(1.0)]),
+            transformation(transform_function::TRANSLATE_X, vec![px(3.0)]),
+        ));
+        assert!(builds(
+            transformation(transform_function::SCALE_X, vec![number_value(2.0)]),
+            transformation(transform_function::SCALE, vec![number_value(3.0)]),
+        ));
+        assert!(builds(
+            transformation(transform_function::TRANSLATE_Z, vec![px(1.0)]),
+            transformation(transform_function::TRANSLATE3D, vec![px(0.0), px(0.0), px(3.0)]),
+        ));
+        // A 2D function and a 3D one interpolate through the 3D primitive, which the compositor leaves to the main
+        // thread.
+        assert!(!builds(
+            transformation(transform_function::TRANSLATE, vec![px(1.0)]),
+            transformation(transform_function::TRANSLATE3D, vec![px(0.0), px(0.0), px(3.0)]),
+        ));
+    }
+
+    #[test]
     fn a_none_transform_takes_the_shape_of_the_other_keyframes() {
         let host = TestHost::default()
             .with_value(0, AnimatedProperty::Transform, none())
@@ -1329,7 +1531,7 @@ mod tests {
                     transformation(transform_function::TRANSLATE_Y, vec![px(4.0)]),
                 ]),
             )
-            .with_underlying_value(0, AnimatedProperty::Scale, none())
+            .with_underlying_value(AnimatedProperty::Scale, none())
             .with_value(
                 1,
                 AnimatedProperty::Scale,
@@ -1343,18 +1545,17 @@ mod tests {
         ];
         let ffi_request = build_request(
             FfiVisualAnimationTargetKind::Transform,
-            &keyframes,
             TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
         let mut state = CompositorAnimationEffectState::default();
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![1]).built);
         let animation = pending_animation(&state, FfiVisualAnimationTargetKind::Transform);
         assert_eq!(
             animation.keyframes[0].value,
             VisualAnimationValue::Transform(vec![
-                operation(Kind::Scale, &[1.0]),
-                operation(Kind::TranslateY, &[0.0])
+                operation(Kind::Scale, &[1.0, 1.0]),
+                operation(Kind::Translate, &[0.0, 0.0])
             ])
         );
         assert!(animation.is_valid());
@@ -1363,29 +1564,24 @@ mod tests {
         // the property's own identity when no other keyframe offers a shape... except the second
         // keyframe does, so that shape is taken.
         let keyframes = [
-            keyframe(
-                0.0,
-                AnimatedProperty::Scale,
-                FfiCompositorKeyframeValueState::UsesUnderlyingStyle,
-            ),
+            keyframe(0.0, AnimatedProperty::Scale, ValueState::UsesUnderlyingStyle),
             present(1.0, AnimatedProperty::Scale),
         ];
         let ffi_request = build_request(
             FfiVisualAnimationTargetKind::Transform,
-            &keyframes,
             TARGETED_TRANSFORM_PROPERTY_SCALE,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
         let mut state = CompositorAnimationEffectState::default();
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![1]).built);
         let animation = pending_animation(&state, FfiVisualAnimationTargetKind::Transform);
         assert_eq!(
             animation.keyframes[0].value,
-            VisualAnimationValue::Transform(vec![operation(Kind::Scale, &[1.0])])
+            VisualAnimationValue::Transform(vec![operation(Kind::Scale, &[1.0, 1.0])])
         );
         assert_eq!(
             animation.keyframes[1].value,
-            VisualAnimationValue::Transform(vec![operation(Kind::Scale, &[3.0])])
+            VisualAnimationValue::Transform(vec![operation(Kind::Scale, &[3.0, 3.0])])
         );
     }
 
@@ -1415,10 +1611,9 @@ mod tests {
         ];
         let ffi_request = build_request(
             FfiVisualAnimationTargetKind::Transform,
-            &keyframes,
             TARGETED_TRANSFORM_PROPERTY_TRANSFORM,
         );
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
         assert!(effect_only_translates_horizontally(&request, &Host::new(&ffi_host)));
         assert!(effect_transform_preserves_axes(&request, &Host::new(&ffi_host)));
 
@@ -1430,7 +1625,7 @@ mod tests {
         let mut with_rotate = ffi_request;
         with_rotate.targeted_transform_properties |= TARGETED_TRANSFORM_PROPERTY_ROTATE;
         with_rotate.targets_only_transform = false;
-        let request = unsafe { Request::new(&with_rotate) };
+        let request = Request::with_keyframe_set(&with_rotate, &keyframe_set(&keyframes));
         assert!(!effect_only_translates_horizontally(&request, &Host::new(&ffi_host)));
         assert!(!effect_transform_preserves_axes(&request, &Host::new(&ffi_host)));
 
@@ -1452,7 +1647,7 @@ mod tests {
                 )]),
             );
         let vertical_host = vertical.ffi();
-        let request = unsafe { Request::new(&ffi_request) };
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
         assert!(!effect_only_translates_horizontally(
             &request,
             &Host::new(&vertical_host)
@@ -1462,32 +1657,29 @@ mod tests {
 
     #[test]
     fn filter_keyframes_lower_to_filter_functions() {
-        let host = TestHost {
-            resolved_color: Some(Color::from_rgb(255, 0, 0)),
-            ..TestHost::default()
-        }
-        .with_value(0, AnimatedProperty::Filter, none())
-        .with_value(
-            1,
-            AnimatedProperty::Filter,
-            value_list(vec![
-                filter(FILTER_KIND_BLUR, 0, px(4.0)),
-                filter(
-                    FILTER_KIND_DROP_SHADOW,
-                    0,
-                    shadow(Some(color_function(COLOR_SYNTAX_LEGACY)), 1.0, 2.0, Some(3.0)),
-                ),
-                filter(FILTER_KIND_HUE_ROTATE, 0, deg(90.0)),
-                filter(FILTER_KIND_COLOR, ColorFilterType::Sepia as u8, percentage(50.0)),
-            ]),
-        );
+        let host = TestHost::default()
+            .with_value(0, AnimatedProperty::Filter, none())
+            .with_value(
+                1,
+                AnimatedProperty::Filter,
+                value_list(vec![
+                    filter(FILTER_KIND_BLUR, 0, px(4.0)),
+                    filter(
+                        FILTER_KIND_DROP_SHADOW,
+                        0,
+                        shadow(Some(color_function(COLOR_SYNTAX_LEGACY)), 1.0, 2.0, Some(3.0)),
+                    ),
+                    filter(FILTER_KIND_HUE_ROTATE, 0, deg(90.0)),
+                    filter(FILTER_KIND_COLOR, ColorFilterType::Sepia as u8, percentage(50.0)),
+                ]),
+            );
         let ffi_host = host.ffi();
         let keyframes = [
             present(0.0, AnimatedProperty::Filter),
             present(1.0, AnimatedProperty::Filter),
         ];
-        let ffi_request = build_request(FfiVisualAnimationTargetKind::Filter, &keyframes, 0);
-        let request = unsafe { Request::new(&ffi_request) };
+        let ffi_request = build_request(FfiVisualAnimationTargetKind::Filter, 0);
+        let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
         let mut state = CompositorAnimationEffectState::default();
         assert!(state.build(&request, &Host::new(&ffi_host), |_| vec![2]).built);
         let animation = pending_animation(&state, FfiVisualAnimationTargetKind::Filter);
@@ -1512,20 +1704,17 @@ mod tests {
         assert!(animation.is_valid());
 
         // A drop shadow in a modern color syntax keeps the effect on the main thread.
-        let modern = TestHost {
-            resolved_color: Some(Color::from_rgb(255, 0, 0)),
-            ..TestHost::default()
-        }
-        .with_value(0, AnimatedProperty::Filter, none())
-        .with_value(
-            1,
-            AnimatedProperty::Filter,
-            value_list(vec![filter(
-                FILTER_KIND_DROP_SHADOW,
-                0,
-                shadow(Some(color_function(1)), 1.0, 2.0, None),
-            )]),
-        );
+        let modern = TestHost::default()
+            .with_value(0, AnimatedProperty::Filter, none())
+            .with_value(
+                1,
+                AnimatedProperty::Filter,
+                value_list(vec![filter(
+                    FILTER_KIND_DROP_SHADOW,
+                    0,
+                    shadow(Some(color_function(1)), 1.0, 2.0, None),
+                )]),
+            );
         let modern_host = modern.ffi();
         let mut state = CompositorAnimationEffectState::default();
         assert!(!state.build(&request, &Host::new(&modern_host), |_| vec![2]).built);
@@ -1534,23 +1723,20 @@ mod tests {
     #[test]
     fn background_colors_keep_modern_syntaxes_and_currentcolor_on_the_main_thread() {
         let build = |value: StyleValueData| {
-            let host = TestHost {
-                resolved_color: Some(Color::from_rgb(0, 0, 255)),
-                ..TestHost::default()
-            }
-            .with_value(
-                0,
-                AnimatedProperty::BackgroundColor,
-                color_function(COLOR_SYNTAX_LEGACY),
-            )
-            .with_value(1, AnimatedProperty::BackgroundColor, value);
+            let host = TestHost::default()
+                .with_value(
+                    0,
+                    AnimatedProperty::BackgroundColor,
+                    color_function(COLOR_SYNTAX_LEGACY),
+                )
+                .with_value(1, AnimatedProperty::BackgroundColor, value);
             let ffi_host = host.ffi();
             let keyframes = [
                 present(0.0, AnimatedProperty::BackgroundColor),
                 present(1.0, AnimatedProperty::BackgroundColor),
             ];
-            let ffi_request = build_request(FfiVisualAnimationTargetKind::BackgroundColor, &keyframes, 0);
-            let request = unsafe { Request::new(&ffi_request) };
+            let ffi_request = build_request(FfiVisualAnimationTargetKind::BackgroundColor, 0);
+            let request = Request::with_keyframe_set(&ffi_request, &keyframe_set(&keyframes));
             let mut state = CompositorAnimationEffectState::default();
             let built = state.build(&request, &Host::new(&ffi_host), |_| vec![2]).built;
             built.then(|| pending_animation(&state, FfiVisualAnimationTargetKind::BackgroundColor).clone())
@@ -1558,7 +1744,7 @@ mod tests {
         let legacy = build(color_function(COLOR_SYNTAX_LEGACY)).expect("legacy colors are compositor driven");
         assert_eq!(
             legacy.keyframes[1].value,
-            VisualAnimationValue::BackgroundColor(Color::from_rgb(0, 0, 255))
+            VisualAnimationValue::BackgroundColor(Color::from_rgb(255, 0, 0))
         );
         assert!(build(color_function(1)).is_none());
         assert!(
@@ -1567,12 +1753,19 @@ mod tests {
             })
             .is_none()
         );
-        // A keyword the main thread can resolve, such as a system color, is taken.
-        assert!(build(StyleValueData::Keyword { keyword: keyword::NONE }).is_some());
+        // A keyword that names a color, such as a system color, is taken.
+        let system_color = build(StyleValueData::Keyword {
+            keyword: keyword::CANVAS,
+        })
+        .expect("system colors are compositor driven");
+        assert_eq!(
+            system_color.keyframes[1].value,
+            VisualAnimationValue::BackgroundColor(Color::from_rgb(255, 255, 255))
+        );
     }
 
-    fn tree_with_one_effect() -> Rc<VisualContextTree> {
-        Rc::new(VisualContextTree::create(TransformData {
+    fn tree_with_one_effect() -> Arc<VisualContextTree> {
+        Arc::new(VisualContextTree::create(TransformData {
             matrix: FloatMatrix4x4::identity(),
             origin: FloatPoint { x: 0.0, y: 0.0 },
             sorting_context_root_index: None,
@@ -1580,6 +1773,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: libgfx_rust::FloatRect::default(),
         }))
     }
 
@@ -1587,7 +1781,10 @@ mod tests {
         VisualAnimation {
             node_indices: vec![0],
             monotonic_time_at_anchor_ns: anchor_ns,
-            iteration_duration_ms: 1000.0,
+            timing: AnimationEffectTiming {
+                iteration_duration: TimeValue::milliseconds(1000.0),
+                ..VisualAnimation::default().timing
+            },
             keyframes: vec![
                 VisualAnimationKeyframe {
                     offset: 0.0,
@@ -1619,7 +1816,7 @@ mod tests {
         assert_eq!(again[0].monotonic_time_at_anchor_ns, 100);
 
         let mut retimed = built_opacity_animation(300);
-        retimed.iteration_duration_ms = 500.0;
+        retimed.timing.iteration_duration = TimeValue::milliseconds(500.0);
         state.pending[target_kind_index(FfiVisualAnimationTargetKind::Opacity)] = Some(retimed);
         let changed = state.publish_pending(true);
         assert_eq!(changed[0].monotonic_time_at_anchor_ns, 300);
@@ -1631,30 +1828,27 @@ mod tests {
             tree: Some(tree_with_one_effect()),
             ..VisualContextState::default()
         };
-        assert!(!publish_compositor_animations(&mut visual_context, true).published);
+        assert!(!publish_compositor_animations(&mut visual_context, Vec::new()).published);
 
-        visual_context.pending_compositor_animations = first.clone();
-        let outcome = publish_compositor_animations(&mut visual_context, true);
+        let outcome = publish_compositor_animations(&mut visual_context, first.clone());
         assert!(outcome.published);
         assert!(outcome.parameters_changed);
         assert!(!outcome.timing_anchors_changed);
         assert!(visual_context.tree.as_ref().unwrap().has_visual_animations());
 
-        visual_context.pending_compositor_animations = first.clone();
-        assert!(!publish_compositor_animations(&mut visual_context, true).published);
+        assert!(!publish_compositor_animations(&mut visual_context, first).published);
 
-        visual_context.pending_compositor_animations = again.clone();
-        visual_context.pending_compositor_animations[0].monotonic_time_at_anchor_ns = 500;
-        let outcome = publish_compositor_animations(&mut visual_context, true);
+        let mut again = again;
+        again[0].monotonic_time_at_anchor_ns = 500;
+        let outcome = publish_compositor_animations(&mut visual_context, again);
         assert!(outcome.published);
         assert!(!outcome.parameters_changed);
         assert!(outcome.timing_anchors_changed);
 
-        visual_context.pending_compositor_animations = changed;
-        let outcome = publish_compositor_animations(&mut visual_context, false);
+        // Discarding the pass's animations publishes none.
+        let outcome = publish_compositor_animations(&mut visual_context, Vec::new());
         assert!(outcome.published);
         assert!(outcome.parameters_changed);
         assert!(!visual_context.tree.as_ref().unwrap().has_visual_animations());
-        assert!(visual_context.pending_compositor_animations.is_empty());
     }
 }

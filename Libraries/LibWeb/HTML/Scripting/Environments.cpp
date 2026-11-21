@@ -7,16 +7,22 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <LibGC/Heap.h>
+#include <LibGC/WeakInlines.h>
 #include <LibURL/InternalURLs.h>
 #include <LibWeb/Bindings/HostDefined.h>
+#include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -28,12 +34,13 @@
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 #include <LibWeb/HTML/WorkletGlobalScope.h>
 #include <LibWeb/Infra/SerializedURL.h>
+#include <LibWeb/MixedContent/AbstractOperations.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/SecureContexts/AbstractOperations.h>
 #include <LibWeb/ServiceWorker/ServiceWorker.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerRegistration.h>
 #include <LibWeb/StorageAPI/StorageManager.h>
 #include <LibWeb/WebLocks/LockManager.h>
+#include <LibWebCommon/SecureContexts/AbstractOperations.h>
 
 namespace Web::HTML {
 
@@ -45,16 +52,27 @@ GC::Ref<Environment> Environment::create(EnvironmentId id, URL::URL creation_url
     return GC::Heap::the().allocate<Environment>(move(id), move(creation_url), move(top_level_creation_url), move(top_level_origin), move(target_browsing_context));
 }
 
+Environment::Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
+    : id(move(id))
+    , creation_url(move(creation_url))
+    , top_level_creation_url(move(top_level_creation_url))
+    , top_level_origin(move(top_level_origin))
+    , target_browsing_context(target_browsing_context)
+{
+}
+
 Environment::~Environment() = default;
 
-void Environment::visit_edges(Cell::Visitor& visitor)
+static EnvironmentSettingsObjectAddress allocate_an_address()
 {
-    Base::visit_edges(visitor);
-    visitor.visit(target_browsing_context);
+    static Atomic<u64> s_next_address { 1 };
+    return EnvironmentSettingsObjectAddress { s_next_address.fetch_add(1) };
 }
 
 EnvironmentSettingsObject::EnvironmentSettingsObject(NonnullOwnPtr<JS::ExecutionContext> realm_execution_context)
     : m_realm_execution_context(move(realm_execution_context))
+    , m_address(allocate_an_address())
+    , m_keepalive_quota_accountant(Fetch::Infrastructure::KeepaliveQuotaAccountant::create())
 {
     m_module_map = GC::Heap::the().allocate<ModuleMap>();
 
@@ -79,6 +97,18 @@ void EnvironmentSettingsObject::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_service_worker_registration_object_map);
     visitor.visit(m_service_worker_object_map);
     visitor.visit(m_owned_worker_agents);
+
+    // Keep the fetch records of the fetches that are still under way, since aborting the document or terminating its
+    // fetch group has to reach them. A record whose fetch is over is left to the collector, and leaves the group as
+    // it's finalized.
+    for (auto& fetch_record : m_fetch_group) {
+        auto controller = fetch_record.fetch_controller();
+        if (fetch_record.request().done())
+            continue;
+        if (controller && controller->state() != Fetch::Infrastructure::FetchController::State::Ongoing)
+            continue;
+        visitor.visit(fetch_record);
+    }
 }
 
 void EnvironmentSettingsObject::discard_environment()
@@ -104,7 +134,7 @@ void EnvironmentSettingsObject::remove_owned_worker_agent(WorkerAgentParent& wor
 
 void EnvironmentSettingsObject::release_owned_worker_agents()
 {
-    auto owned_worker_agents = move(m_owned_worker_agents);
+    GC::RootVector owned_worker_agents { move(m_owned_worker_agents) };
     for (auto& worker_agent : owned_worker_agents)
         worker_agent->terminate();
 }
@@ -130,6 +160,11 @@ ModuleMap& EnvironmentSettingsObject::module_map()
 JS::Realm& EnvironmentSettingsObject::realm()
 {
     // An environment settings object's realm execution context's Realm component is the environment settings object's Realm.
+    return *realm_execution_context().realm;
+}
+
+JS::Realm const& EnvironmentSettingsObject::realm() const
+{
     return *realm_execution_context().realm;
 }
 
@@ -193,7 +228,7 @@ void clean_up_after_running_script(EnvironmentSettingsObject const& settings)
 
     // 3. If the JavaScript execution context stack is now empty, perform a microtask checkpoint. (If this runs scripts, these algorithms will be invoked reentrantly.)
     if (!vm.has_running_execution_context())
-        main_thread_event_loop().perform_a_microtask_checkpoint();
+        current_event_loop().perform_a_microtask_checkpoint();
 }
 
 static JS::ExecutionContext* top_most_script_having_execution_context(JS::VM& vm)
@@ -217,8 +252,8 @@ void prepare_to_run_callback(EnvironmentSettingsObject& settings)
 
     // 1. Push settings onto the backup incumbent settings object stack.
     // NOTE: The spec doesn't say which event loop's stack to put this on. However, all the examples of the incumbent settings object use iframes and cross browsing context communication to demonstrate the concept.
-    //       This means that it must rely on some global state that can be accessed by all browsing contexts, which is the main thread event loop.
-    HTML::main_thread_event_loop().push_onto_backup_incumbent_realm_stack(settings);
+    //       This means that it must rely on some global state that can be accessed by all browsing contexts, which is the event loop of their agent.
+    HTML::current_event_loop().push_onto_backup_incumbent_realm_stack(settings);
 
     // 2. Let context be the topmost script-having execution context.
     auto* context = top_most_script_having_execution_context(vm);
@@ -287,7 +322,7 @@ void clean_up_after_running_callback(EnvironmentSettingsObject const& settings)
     }
 
     // 3. Assert: the topmost entry of the backup incumbent realm stack is settings.
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
     VERIFY(&event_loop.top_of_backup_incumbent_realm_stack() == &settings);
 
     // 4. Remove settings from the backup incumbent realm stack.
@@ -328,13 +363,15 @@ bool is_scripting_disabled(EnvironmentSettingsObject const& settings)
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#module-type-allowed
-bool module_type_allowed(EnvironmentSettingsObject const&, Utf16View module_type)
+bool module_type_allowed(EnvironmentSettingsObject const& settings, Utf16View module_type)
 {
     // 1. If moduleType is not "javascript-or-wasm", "css", "json", or "text", then return false.
     if (module_type != "javascript-or-wasm"sv && module_type != "css"sv && module_type != "json"sv && module_type != "text"sv)
         return false;
 
-    // FIXME: 2. If moduleType is "css" and the CSSStyleSheet interface is not exposed in settings's realm, then return false.
+    // 2. If moduleType is "css" and the CSSStyleSheet interface is not exposed in settings's realm, then return false.
+    if (module_type == "css"sv && !Bindings::is_exposed(Bindings::InterfaceName::CSSStyleSheet, settings.realm()))
+        return false;
 
     // 3. Return true.
     return true;
@@ -372,10 +409,20 @@ JS::Realm& incumbent_realm()
     return incumbent_settings_object().realm();
 }
 
+GC::Ptr<EnvironmentSettingsObject> environment_settings_object_at(EnvironmentSettingsObjectAddress address)
+{
+    return current_event_loop().environment_settings_object_at(address);
+}
+
+GC::Ptr<EnvironmentSettingsObject> environment_settings_object_with_id(EnvironmentId const& id)
+{
+    return current_event_loop().environment_settings_object_with_id(id);
+}
+
 // https://html.spec.whatwg.org/multipage/webappapis.html#incumbent-settings-object
 EnvironmentSettingsObject& incumbent_settings_object()
 {
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
     auto& vm = event_loop.vm();
 
     // 1. Let context be the topmost script-having execution context.
@@ -414,10 +461,10 @@ Window& incumbent_window()
 EnvironmentSettingsObject& principal_realm_settings_object(JS::Realm& realm)
 {
     // A principal realm has a [[HostDefined]] field, which contains the principal realm's settings object.
-    if (realm.host_defined()->is_principal_host_defined())
+    auto& host_defined = Bindings::host_defined_of(realm);
+    if (host_defined.is_principal_host_defined())
         return Bindings::principal_host_defined_environment_settings_object(realm);
 
-    auto& host_defined = static_cast<Bindings::HostDefined&>(*realm.host_defined());
     return Bindings::principal_host_defined_environment_settings_object(*host_defined.principal_realm);
 }
 
@@ -425,14 +472,14 @@ EnvironmentSettingsObject& principal_realm_settings_object(JS::Realm& realm)
 EnvironmentSettingsObject& current_settings_object()
 {
     // Then, the current settings object is the environment settings object of the current realm.
-    return principal_realm_settings_object(*Bindings::main_thread_vm().current_realm());
+    return principal_realm_settings_object(*JS::VM::the().current_realm());
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#current-global-object
 JS::Object& current_global_object()
 {
     // Similarly, the current global object is the global object of the current realm.
-    return Bindings::main_thread_vm().current_realm()->global_object();
+    return JS::VM::the().current_realm()->global_object();
 }
 
 Window& current_window()
@@ -605,7 +652,7 @@ WindowOrWorkerGlobalScopeMixin& relevant_window_or_worker_global_scope(Window co
 // https://html.spec.whatwg.org/multipage/webappapis.html#concept-entry-realm
 JS::Realm& entry_realm()
 {
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
     auto& vm = event_loop.vm();
 
     // With this in hand, we define the entry execution context to be the most recently pushed item in the JavaScript execution context stack that is a realm execution context.
@@ -659,11 +706,15 @@ bool is_secure_context(Environment const& environment)
             return true;
     }
 
-    // 2. If the result of Is url potentially trustworthy? given environment's top-level creation URL is "Potentially Trustworthy", then return true.
+    // 2. If environment's top-level creation URL's scheme is "data", then return false.
+    if (environment.top_level_creation_url.value().scheme() == "data"sv)
+        return false;
+
+    // 3. If the result of Is url potentially trustworthy? given environment's top-level creation URL is "Potentially Trustworthy", then return true.
     if (SecureContexts::is_url_potentially_trustworthy(environment.top_level_creation_url.value()) == SecureContexts::Trustworthiness::PotentiallyTrustworthy)
         return true;
 
-    // 3. Return false.
+    // 4. Return false.
     return false;
 }
 
@@ -678,13 +729,18 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
 {
     auto serialized_global = [this]() -> SerializedGlobal {
         bool relevant_settings_object_is_secure_context = is_secure_context(*this);
+        auto relevant_settings_object_policy_container = policy_container()->serialize();
         auto& global = global_object();
         if (auto const* window = window_from_global_object(global)) {
+            auto navigable = window->navigable();
             return SerializedWindow {
                 .associated_document {
                     .url = window->associated_document().url(),
+                    .site_for_cookies = window->associated_document().site_for_cookies(),
                     .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
-                }
+                    .relevant_settings_object_policy_container = move(relevant_settings_object_policy_container),
+                },
+                .navigable_is_top_level = navigable && navigable->is_top_level_traversable(),
             };
         }
         VERIFY(Bindings::worker_global_scope_from_global_object(global));
@@ -692,7 +748,9 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         auto const* dedicated_worker_global_scope = as_if<DedicatedWorkerGlobalScope>(worker_global_scope);
         auto supported_animation_frame_provider = dedicated_worker_global_scope && dedicated_worker_global_scope->is_supported();
         return SerializedWorkerGlobalScope {
+            .site_for_cookies = worker_global_scope->site_for_cookies(),
             .relevant_settings_object_is_secure_context = relevant_settings_object_is_secure_context,
+            .relevant_settings_object_policy_container = move(relevant_settings_object_policy_container),
             .is_supported_animation_frame_provider = supported_animation_frame_provider,
         };
     }();
@@ -707,7 +765,9 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
         .has_cross_site_ancestor = has_cross_site_ancestor(),
         .policy_container = policy_container()->serialize(),
         .cross_origin_isolated_capability = cross_origin_isolated_capability(),
+        .prohibits_mixed_security_contexts = MixedContent::does_settings_prohibit_mixed_security_contexts(*this),
         .agent_cluster_id = agent_cluster_id(),
+        .agent_cluster_cross_origin_isolation_mode = agent_cluster_cross_origin_isolation_mode(),
         .time_origin = this->time_origin(),
         .global = move(serialized_global),
     };
@@ -716,7 +776,7 @@ SerializedEnvironmentSettingsObject EnvironmentSettingsObject::serialize()
 GC::Ref<StorageAPI::StorageManager> EnvironmentSettingsObject::storage_manager()
 {
     if (!m_storage_manager)
-        m_storage_manager = StorageAPI::StorageManager::create(*this);
+        m_storage_manager = StorageAPI::StorageManager::create(realm());
     return *m_storage_manager;
 }
 
@@ -733,11 +793,8 @@ GC::Ref<ServiceWorker::ServiceWorkerRegistration> EnvironmentSettingsObject::get
     // 1. Let objectMap be environment’s service worker registration object map.
     auto& object_map = this->m_service_worker_registration_object_map;
 
-    // FIXME: File spec issue asking if this should be keyed on the registration's scope url only or on the url and the storage key
-    auto const key = ServiceWorker::RegistrationKey { registration.storage_key(), registration.scope_url().serialize(URL::ExcludeFragment::Yes).to_byte_string() };
-
     // 2. If objectMap[registration] does not exist, then:
-    if (!object_map.contains(key)) {
+    if (!object_map.contains(&registration)) {
         // 1. Let registrationObject be a new ServiceWorkerRegistration in environment’s Realm.
         // 2. Set registrationObject’s service worker registration to registration.
         // 3. Set registrationObject’s installing attribute to null.
@@ -758,11 +815,11 @@ GC::Ref<ServiceWorker::ServiceWorkerRegistration> EnvironmentSettingsObject::get
             registration_object->set_active(get_service_worker_object(registration.active_worker()));
 
         // 9. Set objectMap[registration] to registrationObject.
-        object_map.set(key, registration_object);
+        object_map.set(&registration, registration_object);
     }
 
     // 3. Return objectMap[registration].
-    return *object_map.get(key);
+    return *object_map.get(&registration);
 }
 
 GC::Ref<ServiceWorker::ServiceWorker> EnvironmentSettingsObject::get_service_worker_object(ServiceWorker::ServiceWorkerRecord* service_worker)

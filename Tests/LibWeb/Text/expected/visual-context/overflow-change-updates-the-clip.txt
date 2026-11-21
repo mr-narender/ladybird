@@ -1,0 +1,7 @@
+PASS: div overflow becomes clip (work + checks)
+PASS: div overflow becomes visible (work + checks)
+PASS: outer svg before overflow changes (work + checks)
+PASS: outer svg overflow becomes visible (work + checks)
+PASS: outer svg overflow becomes hidden (work + checks)
+PASS: nested svg overflow attribute becomes visible (work + checks)
+PASS: nested svg overflow becomes hidden (work + checks)

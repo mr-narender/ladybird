@@ -8,7 +8,7 @@
 
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibGC/Weak.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/ScalingMode.h>
@@ -31,10 +31,15 @@ public:
     public:
         virtual GC::Ptr<DecodedImageData> decoded_image_data() const = 0;
         virtual void decoded_image_data_did_update() = 0;
+        // Whether the client may paint the image data, so that its pixels may be needed for the next paint.
+        virtual bool decoded_image_data_may_be_rendered() const { return true; }
 
     protected:
         void register_with_decoded_image_data_if_needed();
         void unregister_with_decoded_image_data_if_needed();
+
+    private:
+        GC::Weak<DecodedImageData> m_registered_image_data;
     };
 
     virtual ~DecodedImageData();
@@ -43,10 +48,6 @@ public:
     void set_is_cors_cross_origin(bool value) { m_is_cors_cross_origin = value; }
 
     virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&) const = 0;
-    // An SVG used as an image resolves `prefers-color-scheme` from the used `color-scheme` of the
-    // element referencing it, so the scheme is part of what is being asked for rather than a
-    // property of the page.
-    virtual Optional<Compositing::DisplayListResource> record_display_list(Gfx::IntSize, CSS::PreferredColorScheme, Compositing::DisplayListResourceStorage&) const;
 
     virtual Optional<Gfx::DecodedImageFrame> default_frame(Gfx::IntSize = {}) const = 0;
     virtual Optional<Gfx::DecodedImageFrame> current_frame(Gfx::IntSize = {}) const = 0;
@@ -61,6 +62,7 @@ public:
     virtual Optional<Gfx::Color> color_if_single_pixel_bitmap() const { return {}; }
 
     bool has_clients() const { return !m_clients.is_empty(); }
+    bool has_clients_that_may_render() const;
 
 protected:
     DecodedImageData();

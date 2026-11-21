@@ -33,16 +33,6 @@ ErrorOr<void> Thread::set_priority(int priority)
     return {};
 }
 
-ErrorOr<int> Thread::get_priority() const
-{
-    sched_param scheduling_parameters {};
-    int policy;
-    int result = pthread_getschedparam(m_tid, &policy, &scheduling_parameters);
-    if (result != 0)
-        return Error::from_errno(result);
-    return scheduling_parameters.sched_priority;
-}
-
 ByteString Thread::thread_name() const { return m_thread_name; }
 
 pthread_t Thread::tid() const { return m_tid; }
@@ -64,6 +54,11 @@ bool Threading::Thread::has_exited() const
 }
 
 void Thread::start()
+{
+    MUST(try_start());
+}
+
+ErrorOr<void> Thread::try_start()
 {
     VERIFY(!is_started());
 
@@ -121,7 +116,13 @@ void Thread::start()
 
     pthread_attr_destroy(&attr);
 
-    VERIFY(rc == 0);
+    if (rc != 0) {
+        // NB: The thread would have adopted this reference.
+        unref();
+        m_state = Threading::ThreadState::Startable;
+        return Error::from_errno(rc);
+    }
+    return {};
 }
 
 void Thread::detach()

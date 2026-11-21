@@ -9,67 +9,15 @@
 
 #include "StyleValueList.h"
 #include <LibGC/RootVector.h>
-#include <LibWeb/CSS/CSSTransformComponent.h>
-#include <LibWeb/CSS/CSSTransformValue.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 
 namespace Web::CSS {
 
-ValueComparingNonnullRefPtr<StyleValue const> StyleValueList::absolutized(ComputationContext const& computation_context) const
-{
-    auto values = this->values();
-    for (size_t i = 0; i < values.size(); ++i) {
-        auto absolutized_value = values[i]->absolutized(computation_context);
-        if (absolutized_value != values[i]) {
-            StyleValueVector result;
-            result.ensure_capacity(values.size());
-            for (size_t j = 0; j < i; ++j)
-                result.append(values[j]);
-            result.append(move(absolutized_value));
-            for (size_t j = i + 1; j < values.size(); ++j)
-                result.append(values[j]->absolutized(computation_context));
-            return StyleValueList::create(move(result), separator(), collapsible());
-        }
-    }
-    return *this;
-}
-
 void StyleValueList::set_style_sheet(StyleSheetState* style_sheet)
 {
     for (auto& value : values())
         const_cast<StyleValue&>(*value).set_style_sheet(style_sheet);
-}
-
-// https://drafts.css-houdini.org/css-typed-om-1/#reify-a-transform-list
-static GC::Ptr<CSSStyleValue> reify_a_transform_list(ReadonlySpan<ValueComparingNonnullRefPtr<StyleValue const>> values)
-{
-    GC::RootVector<GC::Ref<CSSTransformComponent>> transform_components;
-    for (auto const& transform : values) {
-        auto reified_transform = transform->as_transformation().reify_a_transform_function();
-
-        if (!reified_transform)
-            return nullptr;
-
-        // NB: Not all transform functions are reifiable, in which case we give up reifying as a transform list.
-        transform_components.append(reified_transform.as_nonnull());
-    }
-    return CSSTransformValue::create(move(transform_components));
-}
-
-GC::Ref<CSSStyleValue> StyleValueList::reify(Utf16FlyString const& associated_property) const
-{
-    auto values = this->values();
-
-    // NB: <transform-list> is a StyleValueList that contains TransformStyleValues. If that's what we are, follow the
-    //     steps for reifying that.
-    if (all_of(values, [](auto const& it) { return it->is_transformation(); })) {
-        if (auto transform_list = reify_a_transform_list(values))
-            return transform_list.as_nonnull();
-    }
-
-    // NB: Otherwise, there isn't an equivalent CSSStyleValue for StyleValueList, so just use the default.
-    return default_reify(associated_property);
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#subdivide-into-iterations

@@ -22,6 +22,7 @@ namespace AttributeNames {
     __ENUMERATE_HTML_ATTRIBUTE(alink, "alink")                                                     \
     __ENUMERATE_HTML_ATTRIBUTE(allow, "allow")                                                     \
     __ENUMERATE_HTML_ATTRIBUTE(allowfullscreen, "allowfullscreen")                                 \
+    __ENUMERATE_HTML_ATTRIBUTE(alpha, "alpha")                                                     \
     __ENUMERATE_HTML_ATTRIBUTE(alt, "alt")                                                         \
     __ENUMERATE_HTML_ATTRIBUTE(archive, "archive")                                                 \
     __ENUMERATE_HTML_ATTRIBUTE(as, "as")                                                           \
@@ -35,6 +36,7 @@ namespace AttributeNames {
     __ENUMERATE_HTML_ATTRIBUTE(background, "background")                                           \
     __ENUMERATE_HTML_ATTRIBUTE(behavior, "behavior")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(bgcolor, "bgcolor")                                                 \
+    __ENUMERATE_HTML_ATTRIBUTE(blocking, "blocking")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(border, "border")                                                   \
     __ENUMERATE_HTML_ATTRIBUTE(bordercolor, "bordercolor")                                         \
     __ENUMERATE_HTML_ATTRIBUTE(bottommargin, "bottommargin")                                       \
@@ -53,6 +55,7 @@ namespace AttributeNames {
     __ENUMERATE_HTML_ATTRIBUTE(codebase, "codebase")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(codetype, "codetype")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(color, "color")                                                     \
+    __ENUMERATE_HTML_ATTRIBUTE(colorspace, "colorspace")                                           \
     __ENUMERATE_HTML_ATTRIBUTE(cols, "cols")                                                       \
     __ENUMERATE_HTML_ATTRIBUTE(colspan, "colspan")                                                 \
     __ENUMERATE_HTML_ATTRIBUTE(command, "command")                                                 \
@@ -75,6 +78,7 @@ namespace AttributeNames {
     __ENUMERATE_HTML_ATTRIBUTE(direction, "direction")                                             \
     __ENUMERATE_HTML_ATTRIBUTE(dirname, "dirname")                                                 \
     __ENUMERATE_HTML_ATTRIBUTE(disabled, "disabled")                                               \
+    __ENUMERATE_HTML_ATTRIBUTE(disablepictureinpicture, "disablepictureinpicture")                 \
     __ENUMERATE_HTML_ATTRIBUTE(download, "download")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(draggable, "draggable")                                             \
     __ENUMERATE_HTML_ATTRIBUTE(enctype, "enctype")                                                 \
@@ -242,6 +246,7 @@ namespace AttributeNames {
     __ENUMERATE_HTML_ATTRIBUTE(onseeking, "onseeking")                                             \
     __ENUMERATE_HTML_ATTRIBUTE(onselect, "onselect")                                               \
     __ENUMERATE_HTML_ATTRIBUTE(onselectionchange, "onselectionchange")                             \
+    __ENUMERATE_HTML_ATTRIBUTE(onselectstart, "onselectstart")                                     \
     __ENUMERATE_HTML_ATTRIBUTE(onslotchange, "onslotchange")                                       \
     __ENUMERATE_HTML_ATTRIBUTE(onstalled, "onstalled")                                             \
     __ENUMERATE_HTML_ATTRIBUTE(onstorage, "onstorage")                                             \

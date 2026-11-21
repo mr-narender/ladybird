@@ -9,6 +9,7 @@
 #if defined(AK_OS_MACOS)
 
 #    include <AK/Array.h>
+#    include <AK/Base64.h>
 #    include <AK/ByteString.h>
 #    include <AK/Function.h>
 #    include <AK/Vector.h>
@@ -21,6 +22,7 @@
 #    include <LibCore/System.h>
 #    include <LibSandbox/Sandbox.h>
 #    include <LibTest/TestCase.h>
+#    include <Security/Security.h>
 #    include <errno.h>
 #    include <fcntl.h>
 #    include <libproc.h>
@@ -161,6 +163,50 @@ TEST_CASE(sandboxed_process_can_do_ordinary_work)
     }),
         Outcome::Allowed);
 }
+
+TEST_CASE(sandboxed_process_can_create_nonblocking_pipes)
+{
+    EXPECT_EQ(run_sandboxed([] {
+        auto result = Core::System::pipe2(O_CLOEXEC | O_NONBLOCK);
+        if (result.is_error())
+            return false;
+        auto fds = result.release_value();
+        for (auto fd : fds) {
+            if ((fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0 || (fcntl(fd, F_GETFL) & O_NONBLOCK) == 0)
+                return false;
+        }
+        char byte = 0;
+        bool success = write(fds[1], "x", 1) == 1 && read(fds[0], &byte, 1) == 1 && byte == 'x';
+        close(fds[0]);
+        close(fds[1]);
+        return success;
+    }),
+        Outcome::Allowed);
+}
+
+#    if defined(SYS_pipe2)
+TEST_CASE(sandboxed_process_can_use_native_pipe2)
+{
+    if (__builtin_available(macOS 27.0, *)) {
+        Function<bool()> create_pipe = [] {
+            int fds[2];
+            if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0)
+                return false;
+            for (auto fd : fds) {
+                if ((fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0 || (fcntl(fd, F_GETFL) & O_NONBLOCK) == 0)
+                    return false;
+            }
+            char byte = 0;
+            bool success = write(fds[1], "x", 1) == 1 && read(fds[0], &byte, 1) == 1 && byte == 'x';
+            close(fds[0]);
+            close(fds[1]);
+            return success;
+        };
+        EXPECT_EQ(run_sandboxed(create_pipe), Outcome::Allowed);
+        EXPECT_EQ(run_sandboxed({ .network_access = Sandbox::NetworkAccess::Allowed }, create_pipe), Outcome::Allowed);
+    }
+}
+#    endif
 
 // The helpers raise their main thread's QoS before the sandbox is applied, but every thread they create afterwards,
 // including the IPC IO threads, gets its QoS class through pthread_create() attributes. Both calls run on a new
@@ -862,6 +908,30 @@ TEST_CASE(sandboxed_process_uses_iosurfaces_only_when_granted)
     EXPECT_EQ(run_sandboxed({ .paths = paths, .system_services = Sandbox::SystemService::IOSurface }, [] { return can_create_iosurface(); }), Outcome::Allowed);
 }
 
+TEST_CASE(sandboxed_process_without_allowed_executables_cannot_use_spawn_syscall)
+{
+    // NB: Invalid arguments cannot spawn a process. Returning at all means the syscall was allowed, even if a
+    //     higher-level sandbox check would refuse to execute a program.
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    EXPECT_EQ(run_sandboxed([] {
+        (void)syscall(SYS_posix_spawn, nullptr, nullptr, nullptr, nullptr, nullptr);
+        return true;
+    }),
+        Outcome::Denied);
+#    pragma clang diagnostic pop
+}
+
+TEST_CASE(sandboxed_process_without_allowed_executables_cannot_use_wait_syscall)
+{
+    // NB: This child has no children to reap. Returning at all means the syscall was allowed.
+    EXPECT_EQ(run_sandboxed([] {
+        (void)wait4(-1, nullptr, WNOHANG, nullptr);
+        return true;
+    }),
+        Outcome::Denied);
+}
+
 TEST_CASE(sandboxed_process_spawns_only_allowed_executables_and_cannot_fork)
 {
     Fixture fixture;
@@ -877,7 +947,7 @@ TEST_CASE(sandboxed_process_spawns_only_allowed_executables_and_cannot_fork)
         if (posix_spawn(&pid, executable.characters(), nullptr, nullptr, arguments, nullptr) != 0)
             return false;
         int status = 0;
-        return waitpid(pid, &status, 0) == pid;
+        return waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }),
         Outcome::Allowed);
 
@@ -952,6 +1022,49 @@ TEST_CASE(sandboxed_process_with_network_connects_only_to_network_hosts)
 
     close(local_listener);
     close(listener);
+}
+
+static bool can_verify_certificates()
+{
+    // A self-signed test CA, valid from 2020 to 2050. Use a fixed verification date and explicit anchors so the test
+    // does not depend on the system's trust store, the current date or network access.
+    auto certificate_bytes = MUST(decode_base64("MIIBODCB4KADAgECAgEBMAoGCCqGSM49BAMCMBsxGTAXBgNVBAMMEEFJQSBUZXN0IFJvb3QgQ0EwIBcNMjAwMTAxMDAwMDAwWhgPMjA1MDAxMDEwMDAwMDBaMBsxGTAXBgNVBAMMEEFJQSBUZXN0IFJvb3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQvFaFCRjw2v74zuhfRNy6CQSj16eQo3DvL5UjoJo6Ic+jlA/En7yPQWBTdksQFW/3mxWqeoSShdsEzEVEkC84toxMwETAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIFcoD2A6nwl2nz8sgjQUl1h/vEmP2ou36HfWDjHNrUDBAiBuf54FrlwV+CbAPcABgP5ktbYmt7Ho0zaKWSuDSI/EeA=="sv));
+    auto data = CFDataCreate(nullptr, certificate_bytes.data(), certificate_bytes.size());
+    auto certificate = SecCertificateCreateWithData(nullptr, data);
+    CFRelease(data);
+    VERIFY(certificate);
+    auto policy = SecPolicyCreateBasicX509();
+    SecTrustRef trust = nullptr;
+    VERIFY(SecTrustCreateWithCertificates(certificate, policy, &trust) == errSecSuccess);
+    CFRelease(policy);
+    void const* certificates[] = { certificate };
+    auto anchors = CFArrayCreate(nullptr, certificates, 1, &kCFTypeArrayCallBacks);
+    CFRelease(certificate);
+    VERIFY(SecTrustSetAnchorCertificates(trust, anchors) == errSecSuccess);
+    CFRelease(anchors);
+    VERIFY(SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess);
+    VERIFY(SecTrustSetNetworkFetchAllowed(trust, false) == errSecSuccess);
+    auto date = CFDateCreate(nullptr, 757382400); // 2025-01-01.
+    VERIFY(SecTrustSetVerifyDate(trust, date) == errSecSuccess);
+    CFRelease(date);
+    auto trusted = SecTrustEvaluateWithError(trust, nullptr);
+
+    // The same certificate must be rejected when it is no longer a trusted anchor.
+    anchors = CFArrayCreate(nullptr, nullptr, 0, &kCFTypeArrayCallBacks);
+    VERIFY(SecTrustSetAnchorCertificates(trust, anchors) == errSecSuccess);
+    CFRelease(anchors);
+    auto untrusted = SecTrustEvaluateWithError(trust, nullptr);
+    CFRelease(trust);
+    return trusted && !untrusted;
+}
+
+TEST_CASE(sandboxed_process_with_network_verifies_certificates)
+{
+    Vector<Sandbox::SeatbeltPath> paths;
+    MUST(Sandbox::add_seatbelt_path_if_exists(paths, MUST(Core::System::current_executable_path()), Sandbox::SeatbeltPath::Access::ReadOnly));
+
+    EXPECT_EQ(run_sandboxed({ .paths = paths }, [] { return can_verify_certificates(); }), Outcome::Denied);
+    EXPECT_EQ(run_sandboxed({ .paths = paths, .network_access = Sandbox::NetworkAccess::Allowed }, [] { return can_verify_certificates(); }), Outcome::Allowed);
 }
 
 TEST_CASE(sandboxed_process_maps_jit_memory_only_when_granted)

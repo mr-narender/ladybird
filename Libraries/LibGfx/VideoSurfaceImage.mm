@@ -4,33 +4,18 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Checked.h>
 #include <AK/Optional.h>
 #include <AK/ScopeGuard.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/ColorSpace.h>
-#include <LibGfx/MetalContext.h>
-#include <LibGfx/SkiaBackendContext.h>
 #include <LibGfx/VideoSurfaceImage.h>
 #include <LibGfx/YUVData.h>
-
-#include <core/SkColorSpace.h>
-#include <core/SkYUVAInfo.h>
-#include <gpu/ganesh/GrBackendSurface.h>
-#include <gpu/ganesh/GrDirectContext.h>
-#include <gpu/ganesh/GrYUVABackendTextures.h>
-#include <gpu/ganesh/SkImageGanesh.h>
-#include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
-#include <gpu/ganesh/mtl/GrMtlTypes.h>
-#include <ports/SkCFObject.h>
+#include <LibMediaCodecs/Limits.h>
 
 #include <CoreVideo/CoreVideo.h>
 
 namespace Gfx {
 
-namespace {
-
-// The formats a platform decoder hands back hold luma alone in the first plane and the two chroma components
-// interleaved in the second.
 Optional<u8> biplanar_bit_depth_for_pixel_format(u32 pixel_format)
 {
     switch (pixel_format) {
@@ -45,49 +30,49 @@ Optional<u8> biplanar_bit_depth_for_pixel_format(u32 pixel_format)
     }
 }
 
-}
-
-sk_sp<SkImage> sk_image_from_video_surface(Core::IOSurfaceHandle const& io_surface, Media::CodingIndependentCodePoints cicp, SkiaBackendContext& skia_backend_context)
+ErrorOr<void> validate_biplanar_video_surface(Core::IOSurfaceHandle const& io_surface)
 {
-    auto* gr_context = skia_backend_context.sk_context();
-    if (!gr_context)
-        return nullptr;
-
     auto bit_depth = biplanar_bit_depth_for_pixel_format(io_surface.pixel_format());
     if (!bit_depth.has_value() || io_surface.plane_count() != 2)
-        return nullptr;
+        return Error::from_string_literal("Video surface is not in a supported bi-planar format");
 
-    Array plane_formats { MetalTextureFormat::R8, MetalTextureFormat::RG8 };
-    // Samples deeper than 8 bits sit in the high bits of each 16-bit component, so they read as full range unexpanded.
-    if (*bit_depth > 8)
-        plane_formats = { MetalTextureFormat::R16, MetalTextureFormat::RG16 };
-    GrBackendTexture plane_textures[SkYUVAInfo::kMaxPlanes];
-    for (size_t plane = 0; plane < plane_formats.size(); plane++) {
-        auto metal_texture = skia_backend_context.metal_context().create_texture_from_iosurface(io_surface, plane_formats[plane], plane);
-        if (!metal_texture)
-            return nullptr;
+    auto width = io_surface.plane_width(0);
+    auto height = io_surface.plane_height(0);
+    if (width == 0 || height == 0 || width > Media::MAX_VIDEO_FRAME_DIMENSION || height > Media::MAX_VIDEO_FRAME_DIMENSION)
+        return Error::from_string_literal("Video surface has an unsupported size");
 
-        // The backend texture retains the Metal texture, so it outlives this handle to it.
-        GrMtlTextureInfo texture_info;
-        texture_info.fTexture = sk_ret_cfp(metal_texture->texture());
-        plane_textures[plane] = GrBackendTextures::MakeMtl(
-            static_cast<int>(metal_texture->width()), static_cast<int>(metal_texture->height()),
-            skgpu::Mipmapped::kNo, texture_info);
-    }
-
-    SkYUVAInfo yuva_info {
-        SkISize::Make(static_cast<int>(io_surface.plane_width(0)), static_cast<int>(io_surface.plane_height(0))),
-        SkYUVAInfo::PlaneConfig::kY_UV,
-        SkYUVAInfo::Subsampling::k420,
-        skia_yuv_color_space(cicp),
+    size_t bytes_per_sample = *bit_depth > 8 ? 2 : 1;
+    auto chroma_width = (width + 1) / 2;
+    auto chroma_height = (height + 1) / 2;
+    struct PlaneExtent {
+        size_t width;
+        size_t height;
+        size_t row_byte_count;
+    };
+    Array<PlaneExtent, 2> required_extents {
+        PlaneExtent { width, height, width * bytes_per_sample },
+        PlaneExtent { chroma_width, chroma_height, chroma_width * 2 * bytes_per_sample },
     };
 
-    auto color_space = ColorSpace {};
-    if (auto color_space_result = ColorSpace::from_cicp(cicp); !color_space_result.is_error())
-        color_space = color_space_result.release_value();
+    auto const* base = static_cast<u8 const*>(io_surface.data());
+    for (size_t plane = 0; plane < required_extents.size(); plane++) {
+        auto const& required = required_extents[plane];
+        auto plane_height = io_surface.plane_height(plane);
+        auto stride = io_surface.bytes_per_row_of_plane(plane);
+        if (io_surface.plane_width(plane) < required.width || plane_height < required.height || stride < required.row_byte_count)
+            return Error::from_string_literal("Video surface plane is smaller than its format requires");
 
-    GrYUVABackendTextures yuva_textures { yuva_info, plane_textures, kTopLeft_GrSurfaceOrigin };
-    return SkImages::TextureFromYUVATextures(gr_context, yuva_textures, color_space.color_space<sk_sp<SkColorSpace>>());
+        auto const* plane_base = static_cast<u8 const*>(io_surface.data_of_plane(plane));
+        if (plane_base < base)
+            return Error::from_string_literal("Video surface plane starts outside the surface");
+        Checked<size_t> plane_byte_count = stride;
+        plane_byte_count *= plane_height;
+        Checked<size_t> plane_end = static_cast<size_t>(plane_base - base);
+        plane_end += plane_byte_count;
+        if (plane_end.has_overflow() || plane_end.value() > io_surface.alloc_size())
+            return Error::from_string_literal("Video surface plane extends past the surface");
+    }
+    return {};
 }
 
 ErrorOr<NonnullRefPtr<Bitmap>> bitmap_from_video_surface(Core::IOSurfaceHandle const& io_surface, Media::CodingIndependentCodePoints cicp)

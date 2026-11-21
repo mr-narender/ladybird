@@ -35,8 +35,7 @@ Parser::ParseContextStorage::ParseContextStorage(Parser& parser, ParseContextMod
         }
         if (direct_property_context.has_value())
             value_contexts.append({ .kind = ValueParserFFI::FfiValueParsingContextKind::Property, .value = to_underlying(*direct_property_context), .secondary_value = 0, .name = {} });
-        context.value_contexts = value_contexts.data();
-        context.value_context_count = value_contexts.size();
+        context.value_contexts = value_contexts.span();
     }
 
     if (parser.m_document) {
@@ -56,12 +55,9 @@ Parser::ParseContextStorage::ParseContextStorage(Parser& parser, ParseContextMod
         .contains_attr_tainted_values = false,
         .is_ua_style_sheet = mode == ParseContextMode::Syntax && parser.m_is_ua_style_sheet == IsUAStyleSheet::Yes,
         .value_contexts = context.value_contexts,
-        .value_context_count = context.value_context_count,
         .declared_namespaces = mode == ParseContextMode::Syntax ? parser.m_declared_namespaces.handle() : nullptr,
-        .document_url = document_url.bytes().data(),
-        .document_url_length = document_url.bytes().size(),
-        .document_base_url = document_base_url.bytes().data(),
-        .document_base_url_length = document_base_url.bytes().size(),
+        .document_url = document_url.bytes(),
+        .document_base_url = document_base_url.bytes(),
         .length_resolution_context = length_resolution_context.has_value() ? &*length_resolution_context : nullptr,
         .random_function_index = &parser.m_random_function_index,
     };
@@ -70,20 +66,6 @@ Parser::ParseContextStorage::ParseContextStorage(Parser& parser, ParseContextMod
 Parser::ParseContextStorage Parser::make_parse_context(ParseContextMode mode, Optional<PropertyID> direct_property_context)
 {
     return ParseContextStorage { *this, mode, direct_property_context };
-}
-
-Parser::ParseErrorOr<void> Parser::collect_arbitrary_substitution_function_presence(Utf16View source, SubstitutionFunctionsPresence& presence)
-{
-    u8 rust_presence = 0;
-    if (!ValueParserFFI::rust_collect_arbitrary_substitution_function_presence_from_source(ffi_utf16_view(source), &rust_presence))
-        return Parser::ParseError::SyntaxError;
-    presence.attr |= rust_presence & (1 << 0);
-    presence.dashed_function |= rust_presence & (1 << 1);
-    presence.env |= rust_presence & (1 << 2);
-    presence.if_ |= rust_presence & (1 << 3);
-    presence.inherit |= rust_presence & (1 << 4);
-    presence.var |= rust_presence & (1 << 5);
-    return {};
 }
 
 Optional<RustSyntaxHandle> parse_as_syntax(Utf16View source, LimitSingleComponentIdentToCustomIdent limit_single_component_ident_to_custom_ident)

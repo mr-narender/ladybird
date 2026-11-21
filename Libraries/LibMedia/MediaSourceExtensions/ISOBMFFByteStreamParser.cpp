@@ -366,6 +366,9 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> ISOBMFFByteStreamParser::parse_me
                     return Media::DecoderError::corrupted("A sample is not contained by any Media Data box"sv);
 
                 TRY(skip_to(sample.data_position));
+                // AD-HOC: Skip samples that contain no data, as they are invalid for any codec we support.
+                if (sample.data_size == 0)
+                    return {};
                 auto data = TRY(streamer.read_bytes(sample.data_size));
                 segment.position += sample.data_size;
 
@@ -376,7 +379,7 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> ISOBMFFByteStreamParser::parse_me
                 auto& active_description = m_active_sample_descriptions.ensure(sample.track_id);
                 auto current_sample_description = ActiveSampleDescription { track_entry, sample.sample_description_index };
                 if (active_description != current_sample_description)
-                    new_codec_configuration = MUST(sample_entry.codec_initialization_data.clone());
+                    new_codec_configuration = DECODER_TRY_ALLOC(sample_entry.codec_initialization_data.clone());
                 active_description = move(current_sample_description);
 
                 result.coded_frames.append({

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <style id="registrations">
     .declarer { --registered: 12px; }
     .reference { width: var(--registered); }
@@ -11,14 +12,6 @@
 <div class="declarer"></div>
 <div class="reference"></div>
 <script>
-    function printRegistrationCounters(label, environmentVersion, graphCounters) {
-        const counters = internals.getStyleInvalidationCounters();
-        const currentGraphCounters = internals.styleEngineCounters();
-        println(`${label} recomputations: ${counters.elementStyleRecomputations}`);
-        println(`${label} environment deltas: ${currentGraphCounters.environmentDeltas - graphCounters.environmentDeltas}`);
-        println(`${label} environment version unchanged: ${counters.styleEnvironmentVersion === environmentVersion}`);
-    }
-
     test(() => {
         const sheet = document.getElementById("registrations").sheet;
         // The first CSSOM edit recompiles shared contents into a private stylesheet. Insert and remove
@@ -26,18 +19,15 @@
         sheet.insertRule(":not(*) {}", 0);
         sheet.deleteRule(0);
 
-        internals.updateStyle();
-        let environmentVersion = internals.getStyleInvalidationCounters().styleEnvironmentVersion;
-        let graphCounters = internals.styleEngineCounters();
-        internals.resetStyleInvalidationCounters();
+        const registration = styleWork(() => {
+            document.getElementById("registrations").sheet.insertRule(
+                "@property --registered { syntax: '<length>'; inherits: false; initial-value: 0px; }"
+            );
+            document.getElementById("registrations").sheet.insertRule(":not(*) { color: red; }");
+        });
 
-        document.getElementById("registrations").sheet.insertRule(
-            "@property --registered { syntax: '<length>'; inherits: false; initial-value: 0px; }"
-        );
-        document.getElementById("registrations").sheet.insertRule(":not(*) { color: red; }");
-        internals.updateStyle();
-
-        printRegistrationCounters("@property", environmentVersion, graphCounters);
+        // The registration restyles only the declarer and the reference.
+        println(`@property restyled: [${registration.restyled().map(shortStyleName).join(", ")}], passes: ${registration.passes().join(" | ") || "(no pass)"}`);
         println(`unrelated registered initial value: ${getComputedStyle(unrelated).getPropertyValue("--registered")}`);
 
         document.querySelector(".reference").remove();
@@ -48,20 +38,20 @@
         apiReference.style.width = "var(--api-registered)";
         document.body.appendChild(apiReference);
         internals.updateStyle();
-        environmentVersion = internals.getStyleInvalidationCounters().styleEnvironmentVersion;
-        graphCounters = internals.styleEngineCounters();
-        internals.resetStyleInvalidationCounters();
 
-        CSS.registerProperty({
-            name: "--api-registered",
-            syntax: "<length>",
-            inherits: false,
-            initialValue: "0px",
+        const apiRegistration = styleWork(() => {
+            CSS.registerProperty({
+                name: "--api-registered",
+                syntax: "<length>",
+                inherits: false,
+                initialValue: "0px",
+            });
+            document.getElementById("registrations").sheet.insertRule(":not(*) { color: green; }");
         });
-        document.getElementById("registrations").sheet.insertRule(":not(*) { color: green; }");
-        internals.updateStyle();
 
-        printRegistrationCounters("CSS.registerProperty()", environmentVersion, graphCounters);
+        // This registration restyles only the API declarer and reference.
+        println(`CSS.registerProperty() restyled: [${apiRegistration.restyled().map(shortStyleName).join(", ")}], passes: ${apiRegistration.passes().join(" | ") || "(no pass)"}`);
+
         println(`unrelated API initial value: ${getComputedStyle(unrelated).getPropertyValue("--api-registered")}`);
     });
 </script>

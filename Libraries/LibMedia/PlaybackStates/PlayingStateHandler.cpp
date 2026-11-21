@@ -50,7 +50,7 @@ void PlayingStateHandler::update_unticked_end_of_stream_timer()
             continue;
         if (is_terminal(track_data.sink_status))
             continue;
-        auto verified_end_time = manager().verified_end_time_for_track(track_data.track);
+        auto verified_end_time = manager().verified_end_time_for_source(track_data.demuxer);
         if (!verified_end_time.has_value() || *verified_end_time <= latest_verified_end_time)
             continue;
         latest_verified_end_time = *verified_end_time;
@@ -59,7 +59,7 @@ void PlayingStateHandler::update_unticked_end_of_stream_timer()
         for (auto const& track_data : manager().m_audio_track_datas) {
             if (!track_data.enabled)
                 continue;
-            auto verified_end_time = manager().verified_end_time_for_track(track_data.track);
+            auto verified_end_time = manager().verified_end_time_for_source(track_data.demuxer);
             if (!verified_end_time.has_value() || *verified_end_time <= latest_verified_end_time)
                 continue;
             latest_verified_end_time = *verified_end_time;
@@ -74,13 +74,13 @@ void PlayingStateHandler::update_unticked_end_of_stream_timer()
     }
 
     if (m_unticked_end_of_stream_timer == nullptr) {
-        m_unticked_end_of_stream_timer = Core::Timer::create_single_shot(0, [&manager = manager()] {
+        m_unticked_end_of_stream_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [&manager = manager()] {
             manager.update_pipeline_state();
         });
     }
 
     auto delay_seconds = (latest_verified_end_time - now).to_seconds_f64() / playback_rate;
-    m_unticked_end_of_stream_timer->restart(max(1, AK::clamp_to<int>(AK::ceil(delay_seconds * 1'000.0))));
+    m_unticked_end_of_stream_timer->restart(AK::Duration::from_seconds_f64(delay_seconds));
 }
 
 }

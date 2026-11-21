@@ -5,69 +5,41 @@
  */
 
 #include <AK/Random.h>
+#include <AK/StringBuilder.h>
 #include <AK/Utf16StringBuilder.h>
+#include <AK/Utf8View.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibTextCodec/Encoder.h>
 #include <LibWeb/FileAPI/File.h>
 #include <LibWeb/HTML/FormControlInfrastructure.h>
 #include <LibWeb/HTML/FormDataEvent.h>
 #include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLDataListElement.h>
+#include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
 
-static WebIDL::ExceptionOr<XHR::FormDataEntry> create_entry_with_scalar_name(JS::Realm& realm, Utf16String entry_name, Variant<GC::Ref<FileAPI::Blob>, Utf16String> const& value, Optional<Utf16String> const& filename)
-{
-    auto entry_value = TRY(value.visit(
-        // 2. If value is a string, then set value to the result of converting value into a scalar value string.
-        [&](Utf16String const& string) -> WebIDL::ExceptionOr<XHR::FormDataEntry::Value> {
-            return TRY_OR_THROW_OOM(realm.vm(), Infra::convert_to_scalar_value_string(string.utf16_view()));
-        },
-        // 3. Otherwise:
-        [&](GC::Ref<FileAPI::Blob> blob) -> WebIDL::ExceptionOr<XHR::FormDataEntry::Value> {
-            // 1. If value is not a File object, then set value to a new File object, representing the same bytes, whose
-            //    name attribute value is "blob".
-            if (!is<FileAPI::File>(*blob)) {
-                FileAPI::FilePropertyBag options {};
-                options.type = blob->type();
+extern "C" {
 
-                blob = TRY(FileAPI::File::construct_impl({ { blob } }, "blob"_utf16, move(options)));
-            }
-
-            // 2. If filename is given, then set value to a new File object, representing the same bytes, whose name
-            //    attribute is filename.
-            if (filename.has_value()) {
-                FileAPI::FilePropertyBag options {};
-                options.type = blob->type();
-                options.last_modified = as<FileAPI::File>(*blob).last_modified();
-
-                blob = TRY(FileAPI::File::construct_impl({ { blob } }, filename.value(), move(options)));
-            }
-
-            return GC::Ref { as<FileAPI::File>(*blob) };
-        }));
-
-    // 4. Return an entry whose name is name and whose value is value.
-    return XHR::FormDataEntry {
-        .name = move(entry_name),
-        .value = move(entry_value),
-    };
+// Defined in Bindings/Rust/src/xhr/exports.rs.
+XHR::FormDataEntryABI web_html_create_an_entry(JSVM*, FlatPtr name, FileAPI::Blob* blob, FlatPtr string);
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#create-an-entry
-WebIDL::ExceptionOr<XHR::FormDataEntry> create_entry(JS::Realm& realm, Utf16View name, Variant<GC::Ref<FileAPI::Blob>, Utf16String> const& value, Optional<Utf16String> const& filename)
+XHR::FormDataEntry create_entry(Utf16View name, Variant<GC::Ref<FileAPI::Blob>, Utf16String> const& value)
 {
-    // 1. Set name to the result of converting name into a scalar value string.
-    auto entry_name = TRY_OR_THROW_OOM(realm.vm(), Infra::convert_to_scalar_value_string(name));
-    return create_entry_with_scalar_name(realm, move(entry_name), value, filename);
+    auto* blob = value.visit([](GC::Ref<FileAPI::Blob> blob) { return blob.ptr(); }, [](Utf16String const&) -> FileAPI::Blob* { return nullptr; });
+    auto string = value.visit([](GC::Ref<FileAPI::Blob>) { return Utf16String {}; }, [](Utf16String const& string) { return string; });
+    return XHR::form_data_entry_from_abi(web_html_create_an_entry(JS::HostABI::vm_to_abi(JS::VM::the()), Utf16String::from_utf16(name).into_raw(), blob, move(string).into_raw()));
 }
 
 // https://html.spec.whatwg.org/multipage/custom-elements.html#face-entry-construction
-static WebIDL::ExceptionOr<void> construct_face_entry(JS::Realm& realm, GC::Ref<HTMLElement const> form_associated_custom_element, GC::ConservativeVector<XHR::FormDataEntry>& entry_list)
+static void construct_face_entry(GC::Ref<HTMLElement const> form_associated_custom_element, GC::RootVector<XHR::FormDataEntry>& entry_list)
 {
     // 1. If element's submission value is a list of entries, then append each item of element's submission value to
     //    entry list, and return.
@@ -76,18 +48,18 @@ static WebIDL::ExceptionOr<void> construct_face_entry(JS::Realm& realm, GC::Ref<
     //       content attribute value, they can be strings based on the name content attribute value, or they
     //       can be unrelated to the name content attribute.
     auto const& submission_value = form_associated_custom_element->face_submission_value();
-    if (auto const* form_data_entries = submission_value.get_pointer<GC::ConservativeVector<XHR::FormDataEntry>>()) {
+    if (auto const* form_data_entries = submission_value.get_pointer<GC::RootVector<XHR::FormDataEntry>>()) {
         entry_list.extend(*form_data_entries);
-        return {};
+        return;
     }
 
     // 2. If the element does not have a name attribute specified, or its name attribute's value is the empty string, then return.
     if (!form_associated_custom_element->name().has_value() || form_associated_custom_element->name()->is_empty())
-        return {};
+        return;
 
     // 3. If the element's submission value is not null, create an entry with the name attribute value and the submission value, and append it to entry list.
     if (submission_value.has<Empty>())
-        return {};
+        return;
 
     auto name = form_associated_custom_element->name().value();
     auto entry_submission_value = submission_value.visit(
@@ -102,13 +74,12 @@ static WebIDL::ExceptionOr<void> construct_face_entry(JS::Realm& realm, GC::Ref<
             VERIFY_NOT_REACHED();
         });
 
-    auto entry = TRY(create_entry(realm, name.view(), entry_submission_value));
+    auto entry = create_entry(name.view(), entry_submission_value);
     entry_list.append(entry);
-    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-the-form-data-set
-WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> construct_entry_list(JS::Realm& realm, HTMLFormElement& form, GC::Ptr<HTMLElement> submitter, Optional<Utf16String> encoding)
+Optional<GC::RootVector<XHR::FormDataEntry>> construct_entry_list(HTMLFormElement& form, GC::Ptr<HTMLElement> submitter, Optional<Utf16String> encoding)
 {
     // 1. If form's constructing entry list is true, then return null.
     if (form.constructing_entry_list())
@@ -121,7 +92,7 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
     auto controls = form.get_submittable_elements();
 
     // 4. Let entry list be a new empty entry list.
-    GC::ConservativeVector<XHR::FormDataEntry> entry_list;
+    GC::RootVector<XHR::FormDataEntry> entry_list;
 
     // 5. For each element field in controls, in tree order:
     for (auto const& control : controls) {
@@ -166,10 +137,10 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
             auto [x, y] = input_element->selected_coordinate();
 
             // 6. Create an entry with namex and x, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, name_x.utf16_view(), Utf16String::number(x))));
+            entry_list.append(create_entry(name_x.utf16_view(), Utf16String::number(x)));
 
             // 7. Create an entry with namey and y, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, name_y.utf16_view(), Utf16String::number(y))));
+            entry_list.append(create_entry(name_y.utf16_view(), Utf16String::number(y)));
 
             // 8. Continue.
             continue;
@@ -177,7 +148,7 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
 
         // 3. If the field is a form-associated custom element, then perform the entry construction algorithm given field and entry list, then continue.
         if (control_as_form_associated_element.form_associated_element_to_html_element().is_form_associated_custom_element()) {
-            TRY(construct_face_entry(realm, control_as_form_associated_element.form_associated_element_to_html_element(), entry_list));
+            construct_face_entry(control_as_form_associated_element.form_associated_element_to_html_element(), entry_list);
             continue;
         }
 
@@ -192,7 +163,7 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
         if (auto* select_element = as_if<HTMLSelectElement>(*control)) {
             for (auto const& option_element : select_element->list_of_options()) {
                 if (option_element->selected() && !option_element->disabled()) {
-                    entry_list.append(TRY(create_entry(realm, name.view(), option_element->value())));
+                    entry_list.append(create_entry(name.view(), option_element->value()));
                 }
             }
         }
@@ -205,22 +176,20 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
 
             // 2. Create an entry with name and value, and append it to entry list.
             auto checkbox_or_radio_element_name = checkbox_or_radio_element->name();
-            entry_list.append(TRY(create_entry(realm, checkbox_or_radio_element_name->view(), value)));
+            entry_list.append(create_entry(checkbox_or_radio_element_name->view(), value));
         }
         // 8. Otherwise, if the field element is an input element whose type attribute is in the File Upload state, then:
         else if (auto* file_element = as_if<HTMLInputElement>(*control); file_element && file_element->type_state() == HTMLInputElement::TypeAttributeState::FileUpload) {
             // 1. If there are no selected files, then create an entry with name and a new File object with an empty name, application/octet-stream as type, and an empty body, and append it to entry list.
             if (file_element->files()->length() == 0) {
-                Bindings::FilePropertyBag options {};
-                options.type = "application/octet-stream"_utf16;
-                auto file = TRY(FileAPI::File::construct_impl({}, Utf16String {}, options));
-                entry_list.append(TRY(create_entry(realm, name.view(), Variant<GC::Ref<FileAPI::Blob>, Utf16String> { GC::Ref<FileAPI::Blob> { file } })));
+                auto file = FileAPI::File::create({}, {}, "application/octet-stream"_utf16);
+                entry_list.append(create_entry(name.view(), Variant<GC::Ref<FileAPI::Blob>, Utf16String> { GC::Ref<FileAPI::Blob> { file } }));
             }
             // 2. Otherwise, for each file in selected files, create an entry with name and a File object representing the file, and append it to entry list.
             else {
                 for (size_t i = 0; i < file_element->files()->length(); i++) {
                     auto file = GC::Ref { *file_element->files()->item(i) };
-                    entry_list.append(TRY(create_entry(realm, name.view(), Variant<GC::Ref<FileAPI::Blob>, Utf16String> { GC::Ref<FileAPI::Blob> { file } })));
+                    entry_list.append(create_entry(name.view(), Variant<GC::Ref<FileAPI::Blob>, Utf16String> { GC::Ref<FileAPI::Blob> { file } }));
                 }
             }
         }
@@ -230,11 +199,11 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
             auto charset = encoding.value_or("UTF-8"_utf16);
 
             // 2. Create an entry with name and charset, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, name.view(), charset)));
+            entry_list.append(create_entry(name.view(), charset));
         }
         // 10. Otherwise, create an entry with name and the value of the field element, and append it to entry list.
         else {
-            entry_list.append(TRY(create_entry(realm, name.view(), control_as_form_associated_element.form_value())));
+            entry_list.append(create_entry(name.view(), control_as_form_associated_element.form_value()));
         }
 
         // 11. If the element has a dirname attribute, that attribute's value is not the empty string, and the element is an auto-directionality form-associated element:
@@ -246,7 +215,7 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
             Utf16String dir = control->directionality() == DOM::Element::Directionality::Ltr ? "ltr"_utf16 : "rtl"_utf16;
 
             // 3. Create an entry with dirname and dir, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, dirname.utf16_view(), dir)));
+            entry_list.append(create_entry(dirname.utf16_view(), dir));
         }
     }
     // 6. Let form data be a new FormData object associated with entry list.
@@ -291,35 +260,54 @@ ErrorOr<Utf16String> normalize_line_breaks(Utf16View value)
     return builder.to_string();
 }
 
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart/form-data-encoding-algorithm
-ErrorOr<SerializedFormData> serialize_to_multipart_form_data(GC::ConservativeVector<XHR::FormDataEntry> const& entry_list)
+// https://encoding.spec.whatwg.org/#encode
+ErrorOr<ByteBuffer> encode(Utf16View input, StringView encoding)
 {
-    auto escape_line_feed_carriage_return_double_quote = [](Utf16View value) -> ErrorOr<Utf16String> {
-        Utf16StringBuilder builder { value.length_in_code_units() };
+    // 1. Let encoder be the result of getting an encoder from encoding.
+    auto encoder = TextCodec::encoder_for(encoding);
+    VERIFY(encoder.has_value());
+
+    // 2. Process a queue with encoder, ioQueue, output, and "html".
+    auto input_utf8 = TRY(input.to_utf8());
+    StringBuilder output;
+    TRY(encoder->process(Utf8View { input_utf8 }, [&](ReadonlyBytes bytes) { return output.try_append(bytes); }, [&](u32 code_point) { return output.try_appendff("&#{};", code_point); }));
+
+    // 3. Return output.
+    return output.to_byte_buffer();
+}
+
+// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart/form-data-encoding-algorithm
+ErrorOr<SerializedFormData> serialize_to_multipart_form_data(GC::RootVector<XHR::FormDataEntry> const& entry_list, StringView encoding)
+{
+    // For field names and filenames for file fields, the result of the encoding in the previous bullet point must be
+    // escaped by replacing any 0x0A (LF) bytes with the byte sequence `%0A`, 0x0D (CR) with `%0D` and 0x22 (") with `%22`.
+    // The user agent must not perform any other escapes.
+    auto escape_line_feed_carriage_return_double_quote = [](ReadonlyBytes value) -> ErrorOr<ByteBuffer> {
+        StringBuilder builder { value.size() };
         size_t chunk_start = 0;
-        for (size_t i = 0; i < value.length_in_code_units(); ++i) {
-            auto code_unit = value.code_unit_at(i);
-            if (code_unit != '\r' && code_unit != '\n' && code_unit != '"')
+        for (size_t i = 0; i < value.size(); ++i) {
+            auto byte = value[i];
+            if (byte != '\r' && byte != '\n' && byte != '"')
                 continue;
 
-            builder.append(value.substring_view(chunk_start, i - chunk_start));
-            switch (code_unit) {
+            TRY(builder.try_append(value.slice(chunk_start, i - chunk_start)));
+            switch (byte) {
             case '\r':
-                builder.append("%0D"_utf16);
+                TRY(builder.try_append("%0D"sv));
                 break;
             case '\n':
-                builder.append("%0A"_utf16);
+                TRY(builder.try_append("%0A"sv));
                 break;
             case '"':
-                builder.append("%22"_utf16);
+                TRY(builder.try_append("%22"sv));
                 break;
             default:
                 VERIFY_NOT_REACHED();
             }
             chunk_start = i + 1;
         }
-        builder.append(value.substring_view(chunk_start));
-        return builder.to_string();
+        TRY(builder.try_append(value.slice(chunk_start)));
+        return builder.to_byte_buffer();
     };
 
     // The boundary used by the user agent in generating the return value of this algorithm is the multipart/form-data boundary string.
@@ -332,17 +320,22 @@ ErrorOr<SerializedFormData> serialize_to_multipart_form_data(GC::ConservativeVec
 
         // Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
         auto normalized_name = TRY(normalize_line_breaks(entry.name.utf16_view()));
-        // For field names replace any 0x0A (LF) bytes with the byte sequence `%0A`, 0x0D (CR) with `%0D` and 0x22 (") with `%22`
-        auto escaped_name = TRY(escape_line_feed_carriage_return_double_quote(normalized_name.utf16_view()));
-        auto escaped_name_utf8 = TRY(escaped_name.utf16_view().to_utf8());
+        // Field names, field values for non-file fields, and filenames for file fields, in the generated multipart/form-data
+        // resource must be set to the result of encoding the corresponding entry's name or value with encoding, converted to a byte sequence.
+        auto encoded_name = TRY(encode(normalized_name.utf16_view(), encoding));
+        auto escaped_name = TRY(escape_line_feed_carriage_return_double_quote(encoded_name));
+        TRY(builder.try_append("Content-Disposition: form-data; name=\""sv));
+        TRY(builder.try_append(escaped_name));
+        TRY(builder.try_append('"'));
 
         TRY(entry.value.visit(
             [&](GC::Ref<FileAPI::File> file) -> ErrorOr<void> {
-                // For filenames replace any 0x0A (LF) bytes with the byte sequence `%0A`, 0x0D (CR) with `%0D` and 0x22 (") with `%22`
-                auto escaped_filename = TRY(escape_line_feed_carriage_return_double_quote(file->name().utf16_view()));
-                auto escaped_filename_utf8 = TRY(escaped_filename.utf16_view().to_utf8());
-                // Add a `Content-Disposition` header with a `name` set to entry's name and `filename` set to entry's filename.
-                TRY(builder.try_append(TRY(String::formatted("Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n", escaped_name_utf8, escaped_filename_utf8))));
+                auto file_name = file->name();
+                auto encoded_filename = TRY(encode(file_name.utf16_view(), encoding));
+                auto escaped_filename = TRY(escape_line_feed_carriage_return_double_quote(encoded_filename));
+                TRY(builder.try_append("; filename=\""sv));
+                TRY(builder.try_append(escaped_filename));
+                TRY(builder.try_append("\"\r\n"sv));
                 // The parts of the generated multipart/form-data resource that correspond to file fields must have a `Content-Type` header specified.
                 // RFC7578: If the contents of a file are to be sent, the file data SHOULD be labeled with an appropriate media type, if known, or
                 //          "application/octet-stream".
@@ -359,9 +352,9 @@ ErrorOr<SerializedFormData> serialize_to_multipart_form_data(GC::ConservativeVec
             [&](Utf16String const& string) -> ErrorOr<void> {
                 // Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
                 auto normalized_value = TRY(normalize_line_breaks(string.utf16_view()));
-                // Add a `Content-Disposition` header with a `name` set to entry's name.
-                TRY(builder.try_append(TRY(String::formatted("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", escaped_name_utf8))));
-                TRY(builder.try_append(TRY(String::formatted("{}\r\n", TRY(normalized_value.utf16_view().to_utf8())))));
+                TRY(builder.try_append("\r\n\r\n"sv));
+                TRY(builder.try_append(TRY(encode(normalized_value.utf16_view(), encoding))));
+                TRY(builder.try_append("\r\n"sv));
                 return {};
             }));
     }

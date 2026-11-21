@@ -44,8 +44,8 @@ TEST_CASE(visit_const)
 
     the_value.visit(
         [&](ByteString const&) { correct = true; },
-        [&](auto&) {},
-        [&](auto const&) {});
+        [&](auto&) { },
+        [&](auto const&) { });
 
     EXPECT(correct);
 
@@ -53,7 +53,7 @@ TEST_CASE(visit_const)
     auto the_value_but_not_const = the_value;
     the_value_but_not_const.visit(
         [&](ByteString const&) { correct = true; },
-        [&](auto&) {});
+        [&](auto&) { });
 
     EXPECT(correct);
 
@@ -101,6 +101,8 @@ TEST_CASE(move_moves)
     public:
         NoCopy() = default;
     };
+    static_assert(!IsCopyConstructible<Variant<NoCopy, int>>);
+    static_assert(!IsCopyAssignable<Variant<NoCopy, int>>);
 
     Variant<NoCopy, int> first_variant { 42 };
     // Should not fail to compile
@@ -227,6 +229,8 @@ struct HoldsFloat {
 
 TEST_CASE(copy_assign)
 {
+    static_assert(IsTriviallyCopyable<Variant<HoldsInt, HoldsFloat>>);
+
     {
         Variant<int, ByteString, float> the_value { 42.0f };
 

@@ -78,7 +78,7 @@ void HTMLDialogElement::queue_a_dialog_toggle_event_task(Utf16FlyString old_stat
     }
 
     // 2. Queue an element task given the DOM manipulation task source and element to run the following steps:
-    auto task_id = queue_an_element_task(Task::Source::DOMManipulation, [this, old_state, new_state = move(new_state), source]() {
+    auto task_id = queue_an_element_task(Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this, old_state, move(new_state), source), [](auto& self, auto& old_state, auto& new_state, auto& source) {
         // 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
         //    oldState, the newState attribute initialized to newState, and the source attribute initialized to source.
         ToggleEventInit event_init {};
@@ -86,11 +86,11 @@ void HTMLDialogElement::queue_a_dialog_toggle_event_task(Utf16FlyString old_stat
         event_init.new_state = move(new_state);
         event_init.source = source;
 
-        dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+        self.dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(self))));
 
         // 2. Set element's dialog toggle task tracker to null.
-        m_dialog_toggle_task_tracker = {};
-    });
+        self.m_dialog_toggle_task_tracker = {};
+    }));
 
     // 3. Set element's dialog toggle task tracker to a struct with task set to the just-queued task and old state set to oldState.
     m_dialog_toggle_task_tracker = ToggleTaskTracker {
@@ -136,7 +136,7 @@ WebIDL::ExceptionOr<void> HTMLDialogElement::show()
     m_previously_focused_element = document().focused_area();
 
     // 8. Let document be this's node document.
-    auto document = m_document;
+    GC::Ptr<DOM::Document> document = m_document;
 
     // 9. Let hideUntil be the result of running topmost popover ancestor given this, document's showing hint popover
     //    list, null, and false.
@@ -388,10 +388,45 @@ void HTMLDialogElement::close_the_dialog(Optional<Utf16String> result, GC::Ptr<D
 
     // 13. Queue an element task on the user interaction task source given the subject element to fire an event named
     //     close at subject.
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this] {
-        auto close_event = DOM::Event::create(HTML::EventNames::close, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
-        dispatch_event(close_event);
-    });
+    queue_an_element_task(HTML::Task::Source::UserInteraction, GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        auto close_event = DOM::Event::create(HTML::EventNames::close, HighResolutionTime::current_high_resolution_time(relevant_global_object(self)));
+        self.dispatch_event(close_event);
+    }));
+}
+
+enum class ClosedByState : u8 {
+    Any,
+    CloseRequest,
+    None,
+};
+
+// https://html.spec.whatwg.org/multipage/interactive-elements.html#computed-closed-by-state
+static ClosedByState computed_closed_by_state(HTMLDialogElement const& dialog)
+{
+    auto closedby = dialog.attribute(AttributeNames::closedby);
+    Optional<ClosedByState> state;
+    if (closedby.has_value()) {
+        if (closedby->equals_ignoring_ascii_case(u"any"sv))
+            state = ClosedByState::Any;
+        else if (closedby->equals_ignoring_ascii_case(u"closerequest"sv))
+            state = ClosedByState::CloseRequest;
+        else if (closedby->equals_ignoring_ascii_case(u"none"sv))
+            state = ClosedByState::None;
+    }
+
+    // 1. If the state of dialog's closedby attribute is Auto:
+    // NB: The missing value default and the invalid value default are both the Auto state.
+    if (!state.has_value()) {
+        // 1. If dialog's is modal is true, then return Close Request.
+        if (dialog.is_modal())
+            return ClosedByState::CloseRequest;
+
+        // 2. Return None.
+        return ClosedByState::None;
+    }
+
+    // 2. Return the state of dialog's closedby attribute.
+    return *state;
 }
 
 // https://html.spec.whatwg.org/multipage/interactive-elements.html#set-the-dialog-close-watcher
@@ -408,34 +443,33 @@ void HTMLDialogElement::set_close_watcher()
     //    - cancelAction given canPreventClose being to return the result of firing an event named cancel at dialog,
     //      with the cancelable attribute initialized to canPreventClose.
     auto cancel_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this](JS::VM& vm) {
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM& vm) {
             auto* event = Bindings::event_from_callback_argument(vm);
             VERIFY(event);
             bool can_prevent_close = event->cancelable();
-            auto should_continue = dispatch_event(DOM::Event::create(HTML::EventNames::cancel, { .cancelable = can_prevent_close }, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+            auto should_continue = self.dispatch_event(DOM::Event::create(HTML::EventNames::cancel, { .cancelable = can_prevent_close }, HighResolutionTime::current_high_resolution_time(relevant_global_object(self))));
             if (!should_continue)
                 event->prevent_default();
             return JS::js_undefined();
-        },
+        }),
         0, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto cancel_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*cancel_callback_function, HTML::relevant_realm(*this));
     //    - closeAction being to close the dialog given dialog, dialog's request close return value, and dialog's
     //      request close source element.
     auto close_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this](JS::VM&) {
-            close_the_dialog(m_request_close_return_value, m_request_close_source_element);
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+            self.close_the_dialog(self.m_request_close_return_value, self.m_request_close_source_element);
 
             return JS::js_undefined();
-        },
+        }),
         0, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto close_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*close_callback_function, HTML::relevant_realm(*this));
     //    - getEnabledState being to return true if dialog's enable close watcher for request close is true or dialog's
     //      computed closed-by state is not None; otherwise false.
-    auto get_enabled_state = GC::create_function(GC::Heap::the(), [dialog = this] {
-        if (dialog->m_enable_close_watcher_for_request_close)
+    auto get_enabled_state = GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& dialog) {
+        if (dialog.m_enable_close_watcher_for_request_close)
             return true;
-        // FIXME: dialog's computed closed-by state is not None
-        return false;
+        return computed_closed_by_state(dialog) != ClosedByState::None;
     });
 
     m_close_watcher = CloseWatcher::establish(*document().window(), move(get_enabled_state));
@@ -486,10 +520,15 @@ void HTMLDialogElement::run_dialog_focusing_steps()
         return;
 
     // 2. Let control be null
-    GC::Ptr<Element> control = nullptr;
+    GC::Ptr<DOM::Node> control = nullptr;
 
-    // FIXME: 3. If subject has the autofocus attribute, then set control to subject.
-    // FIXME: 4. If control is null, then set control to the focus delegate of subject.
+    // 3. If subject has the autofocus attribute, then set control to subject.
+    if (has_attribute(AttributeNames::autofocus))
+        control = this;
+
+    // 4. If control is null, then set control to the focus delegate of subject.
+    if (!control)
+        control = focus_delegate(*this);
 
     // 5. If control is null, then set control to subject.
     if (!control)
@@ -499,12 +538,24 @@ void HTMLDialogElement::run_dialog_focusing_steps()
     run_focusing_steps(control);
 
     // 7. Let topDocument be control's node navigable's top-level traversable's active document.
+    // NB: A focus event handler can move control into a document without a navigable.
+    auto navigable = control->navigable();
+    if (!navigable)
+        return;
+    auto* top_level_traversable = as_if<LocalNavigable>(*navigable->top_level_traversable());
+    if (!top_level_traversable)
+        return;
+    auto top_document = top_level_traversable->active_document();
+
     // 8. If control's node document's origin is not the same as the origin of topDocument, then return.
-    if (!control->document().origin().is_same_origin(*control->navigable()->top_level_traversable()->active_document_origin()))
+    if (!top_document || !control->document().origin().is_same_origin(top_document->origin()))
         return;
 
-    // FIXME: 9. Empty topDocument's autofocus candidates.
-    // FIXME: 10. Set topDocument's autofocus processed flag to true.
+    // 9. Empty topDocument's autofocus candidates.
+    top_document->autofocus_candidates().clear();
+
+    // 10. Set topDocument's autofocus processed flag to true.
+    top_document->set_autofocus_processed_flag(true);
 }
 
 void HTMLDialogElement::set_is_modal(bool is_modal)
@@ -631,9 +682,7 @@ void HTMLDialogElement::light_dismiss_open_dialogs(UIEvents::PointerEvent const&
             return;
 
         // 6. If topmostDialog's computed closed-by state is not Any, then return.
-        // FIXME: This should use the "computed closed-by state" algorithm.
-        auto closedby = topmost_dialog->attribute(AttributeNames::closedby);
-        if (!closedby.has_value() || !closedby.value().equals_ignoring_ascii_case(u"any"sv))
+        if (computed_closed_by_state(*topmost_dialog) != ClosedByState::Any)
             return;
 
         // 7. Assert: topmostDialog's close watcher is not null.

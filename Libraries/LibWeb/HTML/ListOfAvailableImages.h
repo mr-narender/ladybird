@@ -8,6 +8,7 @@
 
 #include <AK/HashMap.h>
 #include <AK/Utf16String.h>
+#include <LibGC/Function.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -58,6 +59,7 @@ public:
     void remove(Key const&);
     void prune_to_limits(size_t external_memory_limit, size_t count_limit);
     [[nodiscard]] Entry* get(Key const&);
+    size_t size() const { return m_images.size(); }
 
     void visit_edges(JS::Cell::Visitor& visitor) override;
 
@@ -66,6 +68,8 @@ private:
 };
 
 }
+
+GC_UNTRACED_CAPTURE(Web::HTML::ListOfAvailableImages::Key);
 
 namespace AK {
 

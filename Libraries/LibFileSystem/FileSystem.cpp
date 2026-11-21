@@ -22,7 +22,14 @@
 #    if !defined(AK_OS_IOS) && defined(AK_OS_BSD_GENERIC)
 #        include <sys/disk.h>
 #    elif defined(AK_OS_LINUX)
+#        include <fcntl.h>
 #        include <linux/fs.h>
+#        include <sys/syscall.h>
+#        include <unistd.h>
+#    endif
+#    if defined(AK_OS_MACOS)
+#        include <copyfile.h>
+#        include <stdio.h>
 #    endif
 #endif
 
@@ -189,22 +196,6 @@ bool is_link(int fd)
     return S_ISLNK(st.st_mode);
 }
 
-static ErrorOr<ByteString> get_duplicate_file_name(StringView path)
-{
-    int duplicate_count = 0;
-    LexicalPath lexical_path(path);
-    auto parent_path = LexicalPath::canonicalized_path(lexical_path.dirname());
-    auto basename = lexical_path.basename();
-    auto current_name = LexicalPath::join(parent_path, basename).string();
-
-    while (exists(current_name)) {
-        ++duplicate_count;
-        current_name = LexicalPath::join(parent_path, ByteString::formatted("{} ({})", basename, duplicate_count)).string();
-    }
-
-    return current_name;
-}
-
 ErrorOr<void> copy_file(StringView destination_path, StringView source_path, struct stat const& source_stat, Core::File& source, PreserveMode preserve_mode)
 {
     auto destination_or_error = Core::File::open(destination_path, Core::File::OpenMode::Write, 0666);
@@ -220,13 +211,12 @@ ErrorOr<void> copy_file(StringView destination_path, StringView source_path, str
     if (source_stat.st_size > 0)
         TRY(destination->truncate(source_stat.st_size));
 
+    Array<u8, 64 * KiB> buffer;
     while (true) {
-        auto bytes_read = TRY(source.read_until_eof());
-
-        if (bytes_read.is_empty())
+        auto bytes = TRY(source.read_some(buffer));
+        if (bytes.is_empty())
             break;
-
-        TRY(destination->write_until_depleted(bytes_read));
+        TRY(destination->write_until_depleted(bytes));
     }
 
     auto my_umask = umask(0);
@@ -259,81 +249,6 @@ ErrorOr<void> copy_file(StringView destination_path, StringView source_path, str
     return {};
 }
 
-ErrorOr<void> copy_directory(StringView destination_path, StringView source_path, struct stat const& source_stat, LinkMode link, PreserveMode preserve_mode)
-{
-    TRY(Core::System::mkdir(destination_path, 0755));
-
-    auto source_rp = TRY(real_path(source_path));
-    source_rp = ByteString::formatted("{}/", source_rp);
-
-    auto destination_rp = TRY(real_path(destination_path));
-    destination_rp = ByteString::formatted("{}/", destination_rp);
-
-    if (!destination_rp.is_empty() && destination_rp.starts_with(source_rp))
-        return Error::from_errno(EINVAL);
-
-    Core::DirIterator di(source_path, Core::DirIterator::SkipParentAndBaseDir);
-    if (di.has_error())
-        return di.error();
-
-    while (di.has_next()) {
-        auto filename = di.next_path();
-        TRY(copy_file_or_directory(
-            ByteString::formatted("{}/{}", destination_path, filename),
-            ByteString::formatted("{}/{}", source_path, filename),
-            RecursionMode::Allowed, link, AddDuplicateFileMarker::Yes, preserve_mode));
-    }
-
-    auto my_umask = umask(0);
-    umask(my_umask);
-
-    TRY(Core::System::chmod(destination_path, source_stat.st_mode & ~my_umask));
-
-    if (has_flag(preserve_mode, PreserveMode::Ownership))
-        TRY(Core::System::chown(destination_path, source_stat.st_uid, source_stat.st_gid));
-
-    if (has_flag(preserve_mode, PreserveMode::Timestamps)) {
-        struct timespec times[2] = {
-#    if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
-            source_stat.st_atimespec,
-            source_stat.st_mtimespec,
-#    else
-            source_stat.st_atim,
-            source_stat.st_mtim,
-#    endif
-        };
-        TRY(Core::System::utimensat(AT_FDCWD, destination_path, times, 0));
-    }
-
-    return {};
-}
-
-ErrorOr<void> copy_file_or_directory(StringView destination_path, StringView source_path, RecursionMode recursion_mode, LinkMode link_mode, AddDuplicateFileMarker add_duplicate_file_marker, PreserveMode preserve_mode)
-{
-    ByteString final_destination_path;
-    if (add_duplicate_file_marker == AddDuplicateFileMarker::Yes)
-        final_destination_path = TRY(get_duplicate_file_name(destination_path));
-    else
-        final_destination_path = destination_path;
-
-    auto source = TRY(Core::File::open(source_path, Core::File::OpenMode::Read));
-
-    auto source_stat = TRY(Core::System::fstat(source->fd()));
-
-    if (is_directory(source_path)) {
-        if (recursion_mode == RecursionMode::Disallowed) {
-            return Error::from_errno(EISDIR);
-        }
-
-        return copy_directory(final_destination_path, source_path, source_stat, link_mode, preserve_mode);
-    }
-
-    if (link_mode == LinkMode::Allowed)
-        return TRY(Core::System::link(source_path, final_destination_path));
-
-    return copy_file(final_destination_path, source_path, source_stat, *source, preserve_mode);
-}
-
 ErrorOr<void> move_file(StringView destination_path, StringView source_path, PreserveMode preserve_mode)
 {
     auto maybe_error = Core::System::rename(source_path, destination_path);
@@ -352,32 +267,70 @@ ErrorOr<void> move_file(StringView destination_path, StringView source_path, Pre
     return Core::System::unlink(source_path);
 }
 
-bool can_delete_or_move(StringView path)
+// Copies the file, with its permissions and, where the platform can, its extended attributes, to a destination that
+// fails with EEXIST if a file is already there. The destination is private to the user until the copy is complete.
+static ErrorOr<void> copy_to_new_file(StringView destination_path, StringView source_path)
 {
-    VERIFY(!path.is_empty());
-    auto directory = LexicalPath::dirname(path);
-    auto directory_has_write_access = !Core::System::access(directory, W_OK).is_error();
-    if (!directory_has_write_access)
-        return false;
+    auto source = TRY(Core::File::open(source_path, Core::File::OpenMode::Read));
+    auto source_stat = TRY(Core::System::fstat(source->fd()));
+    auto destination = TRY(Core::File::open(destination_path, Core::File::OpenMode::Write | Core::File::OpenMode::MustBeNew, 0600));
 
-    auto stat_or_empty = [](StringView path) {
-        auto stat_or_error = Core::System::stat(path);
-        if (stat_or_error.is_error()) {
-            struct stat stat {};
-            return stat;
+    auto result = [&]() -> ErrorOr<void> {
+#    if defined(AK_OS_MACOS)
+        if (::fcopyfile(source->fd(), destination->fd(), nullptr, COPYFILE_DATA | COPYFILE_XATTR) < 0)
+            return Error::from_syscall("fcopyfile"sv, errno);
+#    else
+        Array<u8, 64 * KiB> buffer;
+        while (true) {
+            auto bytes = TRY(source->read_some(buffer));
+            if (bytes.is_empty())
+                break;
+            TRY(destination->write_until_depleted(bytes));
         }
-        return stat_or_error.release_value();
-    };
+#    endif
+        return Core::System::fchmod(destination->fd(), source_stat.st_mode & 07777);
+    }();
 
-    auto directory_stat = stat_or_empty(directory);
-    bool is_directory_sticky = (directory_stat.st_mode & S_ISVTX) != 0;
-    if (!is_directory_sticky)
-        return true;
-
-    // Directory is sticky, only the file owner, directory owner, and root can modify (rename, remove) it.
-    auto user_id = geteuid();
-    return user_id == 0 || directory_stat.st_uid == user_id || stat_or_empty(path).st_uid == user_id;
+    // NB: A failed copy removes the file it created, but not another that has taken its place since.
+    if (result.is_error()) {
+        auto created = Core::System::fstat(destination->fd());
+        auto at_destination = Core::System::lstat(destination_path);
+        if (!created.is_error() && !at_destination.is_error()
+            && created.value().st_dev == at_destination.value().st_dev && created.value().st_ino == at_destination.value().st_ino)
+            (void)Core::System::unlink(destination_path);
+    }
+    return result;
 }
+
+ErrorOr<void> rename_without_replacing(StringView destination_path, StringView source_path)
+{
+    ByteString source { source_path };
+    ByteString destination { destination_path };
+#    if defined(AK_OS_MACOS)
+    if (::renamex_np(source.characters(), destination.characters(), RENAME_EXCL) == 0)
+        return {};
+    if (errno != ENOTSUP)
+        return Error::from_syscall("renamex_np"sv, errno);
+#    elif defined(AK_OS_LINUX) && defined(SYS_renameat2)
+    if (::syscall(SYS_renameat2, AT_FDCWD, source.characters(), AT_FDCWD, destination.characters(), RENAME_NOREPLACE) == 0)
+        return {};
+    if (errno != EINVAL && errno != ENOSYS)
+        return Error::from_syscall("renameat2"sv, errno);
+#    endif
+
+    // NB: Linking fails when the destination exists, and is left for file systems that cannot rename without replacing.
+    //     One that cannot link either gets a copy in a destination file created only if none exists.
+    if (auto result = Core::System::link(source_path, destination_path); result.is_error()) {
+        if (result.error().is_errno() && result.error().code() == EEXIST)
+            return result.release_error();
+        TRY(copy_to_new_file(destination_path, source_path));
+    }
+
+    // NB: The file is at its destination now, and a source left behind is only an extra copy of it.
+    (void)Core::System::unlink(source_path);
+    return {};
+}
+
 #endif // !AK_OS_WINDOWS
 
 #ifdef AK_OS_WINDOWS
@@ -391,6 +344,18 @@ ErrorOr<void> move_file(StringView destination_path, StringView source_path, Pre
     if (!MoveFileExW(wide_source_path.data(), wide_destination_path.data(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
         return Error::from_windows_error();
     return {};
+}
+
+ErrorOr<void> rename_without_replacing(StringView destination_path, StringView source_path)
+{
+    auto wide_source_path = TRY(to_wide_string(source_path));
+    auto wide_destination_path = TRY(to_wide_string(destination_path));
+    if (MoveFileExW(wide_source_path.data(), wide_destination_path.data(), 0))
+        return {};
+    auto error = GetLastError();
+    if (error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS)
+        return Error::from_errno(EEXIST);
+    return Error::from_windows_error(error);
 }
 #endif
 
@@ -415,12 +380,6 @@ ErrorOr<void> remove(StringView path, RecursionMode mode)
 ErrorOr<off_t> size_from_stat(StringView path)
 {
     auto st = TRY(stat_path(path));
-    return st.st_size;
-}
-
-ErrorOr<off_t> size_from_fstat(int fd)
-{
-    auto st = TRY(stat_fd(fd));
     return st.st_size;
 }
 

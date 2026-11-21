@@ -25,14 +25,14 @@ class SVGFilterElement final
 public:
     virtual ~SVGFilterElement() override = default;
 
-    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
+    virtual bool is_svg_filter_element() const final { return true; }
 
     // Hands every supported child primitive to the Rust primitive list behind `sink` as attribute
     // facts, with the frame an feImage draws for the list to retain.
-    void push_primitives(void* sink);
+    void push_primitives(void* sink, Gfx::IntSize dest_size);
 
-    GC::Ref<SVGAnimatedEnumeration> filter_units() const;
-    GC::Ref<SVGAnimatedEnumeration> primitive_units() const;
+    GC::Ref<SVGAnimatedEnumeration> filter_units();
+    GC::Ref<SVGAnimatedEnumeration> primitive_units();
 
     // https://drafts.csswg.org/filter-effects-1#dom-svgfilterelement-x
     REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::percentage(-10));
@@ -49,9 +49,13 @@ public:
 private:
     SVGFilterElement(DOM::Document&, DOM::QualifiedName);
     virtual void visit_edges(Cell::Visitor&) override;
-
-    Optional<SVGUnits> m_filter_units {};
-    Optional<SVGUnits> m_primitive_units {};
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGFilterElement>() const { return is_svg_filter_element(); }
 
 }

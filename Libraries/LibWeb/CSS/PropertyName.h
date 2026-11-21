@@ -24,15 +24,11 @@ inline bool is_a_custom_property_name_string(Utf16View string)
         && string.code_unit_at(1) == '-';
 }
 
-// https://drafts.css-houdini.org/css-typed-om-1/#valid-css-property
-inline bool is_a_valid_css_property(Utf16FlyString const& string)
+// The same check, on UTF-8 text: A name longer than its two dashes in code units is longer in bytes too, and the other
+// way round.
+inline bool is_a_custom_property_name_string(StringView string)
 {
-    if (is_a_custom_property_name_string(string))
-        return true;
-    if (!string.is_ascii())
-        return false;
-    auto string_data = string.to_utf16_string();
-    return property_id_from_string(string_data.ascii_view()).has_value();
+    return string.length() > 2 && string[0] == '-' && string[1] == '-';
 }
 
 }

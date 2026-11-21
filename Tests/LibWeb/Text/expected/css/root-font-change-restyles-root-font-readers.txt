@@ -1,0 +1,3 @@
+before: remWidth=32px calcWidth=26px pxWidth=20px emWidth=32px substituted=64px registered=80px fontSizeChild=16px pseudo=48px
+after: remWidth=40px calcWidth=30px pxWidth=20px emWidth=32px substituted=80px registered=100px fontSizeChild=20px pseudo=60px
+restyled: [html, head, body, remWidth, calcWidth, pseudo, substituted, registered, fontSize, fontSizeChild]

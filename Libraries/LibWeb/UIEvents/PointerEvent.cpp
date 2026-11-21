@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Math.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/Bindings/PointerEvent.h>
 #include <LibWeb/HTML/EventNames.h>
@@ -41,9 +42,10 @@ double PointerEvent::client_y() const { return should_have_fractional_coordinate
 double PointerEvent::offset_x() const { return should_have_fractional_coordinates() ? m_offset_x : MouseEvent::offset_x(); }
 double PointerEvent::offset_y() const { return should_have_fractional_coordinates() ? m_offset_y : MouseEvent::offset_y(); }
 
-WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy> window_proxy, FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers)
+WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy> window_proxy, FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers, int detail)
 {
     PointerEventOptions event_options;
+    event_options.detail = detail;
     event_options.ctrl_key = modifiers & Mod_Ctrl;
     event_options.shift_key = modifiers & Mod_Shift;
     event_options.alt_key = modifiers & Mod_Alt;
@@ -53,8 +55,15 @@ WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_from_platform_ev
     event_options.client_x = client.x().to_double();
     event_options.client_y = client.y().to_double();
     event_options.view = window_proxy;
-    event_options.is_primary = true;
+    event_options.pointer_id = mouse_pointer_id;
     event_options.pointer_type = PointerTypes::Mouse;
+    // https://w3c.github.io/pointerevents/#click
+    // For these events, all PointerEvent specific attributes (defined in this spec) other than pointerId and
+    // pointerType MUST have their default values.
+    if (event_name != EventNames::click && event_name != EventNames::auxclick && event_name != EventNames::contextmenu) {
+        event_options.is_primary = true;
+        event_options.pressure = event_name != EventNames::pointerup && buttons ? ACTIVE_PRESSURE_DEFAULT_IN_ACTIVE_BUTTON_STATE : 0;
+    }
     if (movement.has_value()) {
         event_options.movement_x = movement.value().x().to_double();
         event_options.movement_y = movement.value().y().to_double();
@@ -69,9 +78,10 @@ WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_from_platform_ev
     return event;
 }
 
-WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy> window_proxy, Utf16FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers)
+WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy> window_proxy, Utf16FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers, int detail)
 {
     PointerEventOptions event_options;
+    event_options.detail = detail;
     event_options.ctrl_key = modifiers & Mod_Ctrl;
     event_options.shift_key = modifiers & Mod_Shift;
     event_options.alt_key = modifiers & Mod_Alt;
@@ -81,8 +91,15 @@ WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_from_platform_ev
     event_options.client_x = client.x().to_double();
     event_options.client_y = client.y().to_double();
     event_options.view = window_proxy;
-    event_options.is_primary = true;
+    event_options.pointer_id = mouse_pointer_id;
     event_options.pointer_type = PointerTypes::Mouse;
+    // https://w3c.github.io/pointerevents/#click
+    // For these events, all PointerEvent specific attributes (defined in this spec) other than pointerId and
+    // pointerType MUST have their default values.
+    if (event_name != EventNames::click && event_name != EventNames::auxclick && event_name != EventNames::contextmenu) {
+        event_options.is_primary = true;
+        event_options.pressure = event_name != EventNames::pointerup && buttons ? ACTIVE_PRESSURE_DEFAULT_IN_ACTIVE_BUTTON_STATE : 0;
+    }
     if (movement.has_value()) {
         event_options.movement_x = movement->x().to_double();
         event_options.movement_y = movement->y().to_double();
@@ -159,6 +176,172 @@ GC::Ref<PointerEvent> PointerEvent::create(
     return GC::Heap::the().allocate<PointerEvent>(type, move(options), page_x, page_y, offset_x, offset_y, time_stamp);
 }
 
+struct Tilt {
+    i32 tilt_x { 0 };
+    i32 tilt_y { 0 };
+};
+
+// https://w3c.github.io/pointerevents/#converting-between-tiltx-tilty-and-altitudeangle-azimuthangle
+// User agents MUST use the following algorithm for converting these values.
+static Tilt spherical2tilt(double altitude_angle, double azimuth_angle)
+{
+    constexpr auto pi = AK::Pi<double>;
+
+    double tilt_x_radians = 0;
+    double tilt_y_radians = 0;
+
+    if (altitude_angle == 0) {
+        // the pen is in the X-Y plane
+        if (azimuth_angle == 0 || azimuth_angle == 2 * pi) {
+            // pen is on positive X axis
+            tilt_x_radians = pi / 2;
+        }
+        if (azimuth_angle == pi / 2) {
+            // pen is on positive Y axis
+            tilt_y_radians = pi / 2;
+        }
+        if (azimuth_angle == pi) {
+            // pen is on negative X axis
+            tilt_x_radians = -pi / 2;
+        }
+        if (azimuth_angle == 3 * pi / 2) {
+            // pen is on negative Y axis
+            tilt_y_radians = -pi / 2;
+        }
+        if (azimuth_angle > 0 && azimuth_angle < pi / 2) {
+            tilt_x_radians = pi / 2;
+            tilt_y_radians = pi / 2;
+        }
+        if (azimuth_angle > pi / 2 && azimuth_angle < pi) {
+            tilt_x_radians = -pi / 2;
+            tilt_y_radians = pi / 2;
+        }
+        if (azimuth_angle > pi && azimuth_angle < 3 * pi / 2) {
+            tilt_x_radians = -pi / 2;
+            tilt_y_radians = -pi / 2;
+        }
+        if (azimuth_angle > 3 * pi / 2 && azimuth_angle < 2 * pi) {
+            tilt_x_radians = pi / 2;
+            tilt_y_radians = -pi / 2;
+        }
+    }
+
+    if (altitude_angle != 0) {
+        auto tan_altitude = AK::tan(altitude_angle);
+
+        tilt_x_radians = AK::atan(AK::cos(azimuth_angle) / tan_altitude);
+        tilt_y_radians = AK::atan(AK::sin(azimuth_angle) / tan_altitude);
+    }
+
+    // When the user agent calculates tiltX / tiltY from azimuthAngle / altitudeAngle it SHOULD round the final
+    // integer values using Math.round [ECMASCRIPT] rules.
+    auto round = [](double value) { return static_cast<i32>(AK::floor(value + 0.5)); };
+    return { round(AK::to_degrees(tilt_x_radians)), round(AK::to_degrees(tilt_y_radians)) };
+}
+
+struct SphericalAngles {
+    double altitude_angle { 0 };
+    double azimuth_angle { 0 };
+};
+
+// https://w3c.github.io/pointerevents/#converting-between-tiltx-tilty-and-altitudeangle-azimuthangle
+static SphericalAngles tilt2spherical(i32 tilt_x, i32 tilt_y)
+{
+    constexpr auto pi = AK::Pi<double>;
+
+    auto tilt_x_radians = AK::to_radians(static_cast<double>(tilt_x));
+    auto tilt_y_radians = AK::to_radians(static_cast<double>(tilt_y));
+
+    // calculate azimuth angle
+    double azimuth_angle = 0;
+
+    if (tilt_x == 0) {
+        if (tilt_y > 0)
+            azimuth_angle = pi / 2;
+        else if (tilt_y < 0)
+            azimuth_angle = 3 * pi / 2;
+    } else if (tilt_y == 0) {
+        if (tilt_x < 0)
+            azimuth_angle = pi;
+    } else if (AK::abs(tilt_x) == 90 || AK::abs(tilt_y) == 90) {
+        // not enough information to calculate azimuth
+        azimuth_angle = 0;
+    } else {
+        // Non-boundary case: neither tiltX nor tiltY is equal to 0 or +-90
+        auto tan_x = AK::tan(tilt_x_radians);
+        auto tan_y = AK::tan(tilt_y_radians);
+
+        azimuth_angle = AK::atan2(tan_y, tan_x);
+        if (azimuth_angle < 0)
+            azimuth_angle += 2 * pi;
+    }
+
+    // calculate altitude angle
+    double altitude_angle = 0;
+
+    if (AK::abs(tilt_x) == 90 || AK::abs(tilt_y) == 90) {
+        altitude_angle = 0;
+    } else if (tilt_x == 0) {
+        altitude_angle = pi / 2 - AK::fabs(tilt_y_radians);
+    } else if (tilt_y == 0) {
+        altitude_angle = pi / 2 - AK::fabs(tilt_x_radians);
+    } else {
+        // Non-boundary case: neither tiltX nor tiltY is equal to 0 or +-90
+        auto tan_x = AK::tan(tilt_x_radians);
+        auto tan_y = AK::tan(tilt_y_radians);
+        altitude_angle = AK::atan(1.0 / AK::sqrt(tan_x * tan_x + tan_y * tan_y));
+    }
+
+    return { altitude_angle, azimuth_angle };
+}
+
+static void initialize_orientation(PointerEventOptions& options, Bindings::PointerEventInit const& event_init)
+{
+    constexpr auto pi = AK::Pi<double>;
+
+    options.tilt_x = event_init.tilt_x.value_or(0);
+    options.tilt_y = event_init.tilt_y.value_or(0);
+    options.altitude_angle = event_init.altitude_angle.value_or(pi / 2);
+    options.azimuth_angle = event_init.azimuth_angle.value_or(0);
+
+    auto has_tilt = event_init.tilt_x.has_value() || event_init.tilt_y.has_value();
+    auto has_spherical_angles = event_init.altitude_angle.has_value() || event_init.azimuth_angle.has_value();
+
+    // NB: Only one representation can be derived from the other. When both or neither are supplied, the values are
+    //     used as given.
+    if (has_tilt == has_spherical_angles)
+        return;
+
+    if (has_tilt) {
+        // INTEROP: Other browsers reduce tilt values to [-90, 90] before converting them, without changing the
+        //          tiltX and tiltY attributes.
+        auto normalize_tilt = [](i32 tilt) {
+            auto normalized = tilt % 180;
+            if (normalized > 90)
+                normalized -= 180;
+            else if (normalized < -90)
+                normalized += 180;
+            return normalized;
+        };
+        auto spherical_angles = tilt2spherical(normalize_tilt(options.tilt_x), normalize_tilt(options.tilt_y));
+        options.altitude_angle = spherical_angles.altitude_angle;
+        options.azimuth_angle = spherical_angles.azimuth_angle;
+        return;
+    }
+
+    // INTEROP: Other browsers reduce azimuthAngle to [0, 2π] before converting it, without changing the
+    //          azimuthAngle attribute.
+    auto azimuth_angle = options.azimuth_angle;
+    if (azimuth_angle < 0 || azimuth_angle > 2 * pi) {
+        azimuth_angle = AK::fmod(azimuth_angle, 2 * pi);
+        if (azimuth_angle < 0)
+            azimuth_angle += 2 * pi;
+    }
+    auto tilt = spherical2tilt(options.altitude_angle, azimuth_angle);
+    options.tilt_x = tilt.tilt_x;
+    options.tilt_y = tilt.tilt_y;
+}
+
 WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_for_constructor(FlyString const& event_name, Bindings::PointerEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
 {
     PointerEventOptions options;
@@ -168,11 +351,8 @@ WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_for_constructor(
     options.height = event_init.height;
     options.pressure = event_init.pressure;
     options.tangential_pressure = event_init.tangential_pressure;
-    options.tilt_x = event_init.tilt_x.value_or(0);
-    options.tilt_y = event_init.tilt_y.value_or(0);
     options.twist = event_init.twist;
-    options.altitude_angle = event_init.altitude_angle.value_or(DEFAULT_ALTITUDE_ANGLE);
-    options.azimuth_angle = event_init.azimuth_angle.value_or(0);
+    initialize_orientation(options, event_init);
     options.pointer_type = event_init.pointer_type;
     options.is_primary = event_init.is_primary;
     options.persistent_device_id = event_init.persistent_device_id;
@@ -197,11 +377,8 @@ WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_for_constructor(
     options.height = event_init.height;
     options.pressure = event_init.pressure;
     options.tangential_pressure = event_init.tangential_pressure;
-    options.tilt_x = event_init.tilt_x.value_or(0);
-    options.tilt_y = event_init.tilt_y.value_or(0);
     options.twist = event_init.twist;
-    options.altitude_angle = event_init.altitude_angle.value_or(DEFAULT_ALTITUDE_ANGLE);
-    options.azimuth_angle = event_init.azimuth_angle.value_or(0);
+    initialize_orientation(options, event_init);
     options.pointer_type = event_init.pointer_type;
     options.is_primary = event_init.is_primary;
     options.persistent_device_id = event_init.persistent_device_id;
@@ -212,6 +389,21 @@ WebIDL::ExceptionOr<GC::Ref<PointerEvent>> PointerEvent::create_for_constructor(
     for (auto const& predicted_event : event_init.predicted_events)
         options.predicted_events.unchecked_append(*predicted_event);
     return create(Utf16FlyString::from_utf16(event_name.utf16_view()), move(options), event_init.client_x, event_init.client_y, event_init.client_x, event_init.client_y, time_stamp);
+}
+
+extern "C" {
+PointerEvent const* web_ui_events_pointer_event_from_event(DOM::Event const*);
+WebIDL::Long web_ui_events_pointer_event_pointer_id(PointerEvent const*);
+
+PointerEvent const* web_ui_events_pointer_event_from_event(DOM::Event const* event)
+{
+    return as_if<PointerEvent>(event);
+}
+
+WebIDL::Long web_ui_events_pointer_event_pointer_id(PointerEvent const* event)
+{
+    return event->pointer_id();
+}
 }
 
 }

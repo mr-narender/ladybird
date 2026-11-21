@@ -9,6 +9,7 @@
 #include <AK/FlyString.h>
 #include <AK/NumericLimits.h>
 #include <LibJS/Forward.h>
+#include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/BigIntObject.h>
@@ -27,13 +28,12 @@
 #include <LibWeb/Geometry/DOMMatrix.h>
 #include <LibWeb/Geometry/DOMMatrixReadOnly.h>
 #include <LibWeb/Geometry/DOMPointReadOnly.h>
-#include <LibWeb/Geometry/DOMQuad.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/Geometry/DOMRectReadOnly.h>
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
-#include <LibWeb/WebAssembly/Module.h>
 #include <LibWeb/WebIDL/DOMException.h>
+#include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWeb/WebIDL/QuotaExceededError.h>
 
 using Web::Crypto::HandleTag;
@@ -43,18 +43,14 @@ TEST_CASE(serializable_objects_round_trip_through_storage)
 {
     (void)test_realm();
     {
-        auto point = Web::Geometry::DOMPoint::create();
-        point->set_x(1.5);
-        point->set_y(-2.5);
-        point->set_z(3.25);
-        point->set_w(4.75);
+        auto point = Web::Geometry::DOMPoint::create(1.5, -2.5, 3.25, 4.75);
 
         auto value = MUST(storage_deserialize(storage_serialize(point)));
-        auto& decoded = unwrap_wrappable<Web::Geometry::DOMPoint>(value);
-        EXPECT_EQ(decoded.x(), 1.5);
-        EXPECT_EQ(decoded.y(), -2.5);
-        EXPECT_EQ(decoded.z(), 3.25);
-        EXPECT_EQ(decoded.w(), 4.75);
+        (void)unwrap_wrappable<Web::Geometry::DOMPoint>(value);
+        EXPECT_EQ(number_property(value, "x"sv), 1.5);
+        EXPECT_EQ(number_property(value, "y"sv), -2.5);
+        EXPECT_EQ(number_property(value, "z"sv), 3.25);
+        EXPECT_EQ(number_property(value, "w"sv), 4.75);
     }
 
     {
@@ -71,8 +67,7 @@ TEST_CASE(storage_round_trips_serializable_with_nested_sub_value_before_more_fie
 {
     (void)test_realm();
     // Nested sub-values must not trigger the outer full-consumption check.
-    auto point = Web::Geometry::DOMPoint::create();
-    point->set_x(7.0);
+    auto point = Web::Geometry::DOMPoint::create(7.0);
     auto point_body = serialized_object_body(point);
 
     Vector<u8> quad_body;
@@ -92,14 +87,13 @@ TEST_CASE(crypto_key_storage_record_round_trips)
     ReadonlyBytes handle { handle_bytes.data(), handle_bytes.size() };
 
     auto value = MUST(principal_storage_deserialize(crypto_key_secret_record(handle, handle.size())));
-    auto& key = unwrap_wrappable<Web::Crypto::CryptoKey>(value);
-    EXPECT_EQ(key.type(), Web::Crypto::KeyType::Secret);
-    EXPECT_EQ(key.extractable(), false);
-    EXPECT_EQ(key.algorithm_name(), "HKDF"_string);
-    EXPECT_EQ(key.internal_usages().size(), 1u);
-    EXPECT_EQ(key.internal_usages()[0], Web::Bindings::KeyUsage::DeriveKey);
-    EXPECT(key.handle().has<ByteBuffer>());
-    EXPECT_EQ(key.handle().get<ByteBuffer>().span(), handle);
+    expect_utf16_equals(string_property(value, "type"sv), "secret"_utf16);
+    EXPECT_EQ(property_of(value, "extractable"sv).as_bool(), false);
+    expect_utf16_equals(string_property(property_of(value, "algorithm"sv), "name"sv), "HKDF"_utf16);
+    auto usages = property_of(value, "usages"sv);
+    EXPECT_EQ(number_property(usages, "length"sv), 1.0);
+    expect_utf16_equals(MUST(usages.as_object().get(0u)).as_string().utf16_string(), "deriveKey"_utf16);
+    EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), crypto_key_secret_record(handle, handle.size()).data.span());
 }
 
 TEST_CASE(value_tag_primitives_round_trip)
@@ -167,7 +161,7 @@ TEST_CASE(value_tag_primitives_round_trip)
         value.append(big_integer.data(), big_integer.size());
         auto decoded = decode(value);
         EXPECT(decoded.is_bigint());
-        EXPECT_EQ(MUST(decoded.as_bigint().big_integer().to_base(10)), "123456789012345678901234567890"_string);
+        EXPECT_EQ(decoded.as_bigint().to_string(), "123456789012345678901234567890"_string);
     }
 }
 
@@ -194,7 +188,7 @@ TEST_CASE(value_tag_wrapper_objects_round_trip)
         Array<u8, 3> big_integer { 0x00, 0x03, 0xE7 }; // +999
         append_storage_leb128(value, big_integer.size());
         value.append(big_integer.data(), big_integer.size());
-        EXPECT_EQ(MUST(as<JS::BigIntObject>(decode(value).as_object()).bigint().big_integer().to_base(10)), "999"_string);
+        EXPECT_EQ(as<JS::BigIntObject>(decode(value).as_object()).bigint().to_string(), "999"_string);
     }
 }
 
@@ -228,9 +222,13 @@ TEST_CASE(value_tag_map_and_set_round_trip)
         append_little_endian_double(value, 2.0);
         auto& map = as<JS::Map>(MUST(storage_deserialize(storage_record_with_value(value))).as_object());
         EXPECT_EQ(map.map_size(), 1u);
-        auto entry = map.map_get(JS::Value(1.0));
-        EXPECT(entry.has_value());
-        EXPECT_EQ(entry.value().as_double(), 2.0);
+        Vector<double> entries;
+        MUST(map.for_each_entry([&](JS::Value key, JS::Value entry_value) -> JS::ThrowCompletionOr<void> {
+            entries.append(key.as_double());
+            entries.append(entry_value.as_double());
+            return {};
+        }));
+        EXPECT_EQ(entries, (Vector<double> { 1.0, 2.0 }));
     }
     {
         Vector<u8> value { to_underlying(ValueTag::SetObject) };
@@ -241,9 +239,12 @@ TEST_CASE(value_tag_map_and_set_round_trip)
         append_little_endian_double(value, 8.0);
         auto& set = as<JS::Set>(MUST(storage_deserialize(storage_record_with_value(value))).as_object());
         EXPECT_EQ(set.set_size(), 2u);
-        EXPECT(set.set_has(JS::Value(7.0)));
-        EXPECT(set.set_has(JS::Value(8.0)));
-        EXPECT(!set.set_has(JS::Value(9.0)));
+        Vector<double> values;
+        MUST(set.for_each_value([&](JS::Value element) -> JS::ThrowCompletionOr<void> {
+            values.append(element.as_double());
+            return {};
+        }));
+        EXPECT_EQ(values, (Vector<double> { 7.0, 8.0 }));
     }
 }
 
@@ -386,16 +387,18 @@ TEST_CASE(geometry_serializables_round_trip)
     append_little_endian_double(point_body, -4.5);
 
     {
-        auto& point = unwrap_wrappable<Web::Geometry::DOMPointReadOnly>(MUST(storage_deserialize(serializable_storage_record("DOMPointReadOnly"sv, 1, point_body))));
-        EXPECT_EQ(point.x(), 1.5);
-        EXPECT_EQ(point.y(), -2.5);
-        EXPECT_EQ(point.z(), 3.5);
-        EXPECT_EQ(point.w(), -4.5);
+        auto point = MUST(storage_deserialize(serializable_storage_record("DOMPointReadOnly"sv, 1, point_body)));
+        (void)unwrap_wrappable<Web::Geometry::DOMPointReadOnly>(point);
+        EXPECT_EQ(number_property(point, "x"sv), 1.5);
+        EXPECT_EQ(number_property(point, "y"sv), -2.5);
+        EXPECT_EQ(number_property(point, "z"sv), 3.5);
+        EXPECT_EQ(number_property(point, "w"sv), -4.5);
     }
     {
-        auto& point = unwrap_wrappable<Web::Geometry::DOMPoint>(MUST(storage_deserialize(serializable_storage_record("DOMPoint"sv, 1, point_body))));
-        EXPECT_EQ(point.x(), 1.5);
-        EXPECT_EQ(point.w(), -4.5);
+        auto point = MUST(storage_deserialize(serializable_storage_record("DOMPoint"sv, 1, point_body)));
+        (void)unwrap_wrappable<Web::Geometry::DOMPoint>(point);
+        EXPECT_EQ(number_property(point, "x"sv), 1.5);
+        EXPECT_EQ(number_property(point, "w"sv), -4.5);
     }
 
     Vector<u8> rect_body;
@@ -405,16 +408,18 @@ TEST_CASE(geometry_serializables_round_trip)
     append_little_endian_double(rect_body, 40.0);
 
     {
-        auto& rect = unwrap_wrappable<Web::Geometry::DOMRectReadOnly>(MUST(storage_deserialize(serializable_storage_record("DOMRectReadOnly"sv, 1, rect_body))));
-        EXPECT_EQ(rect.x(), 10.0);
-        EXPECT_EQ(rect.y(), 20.0);
-        EXPECT_EQ(rect.width(), 30.0);
-        EXPECT_EQ(rect.height(), 40.0);
+        auto rect = MUST(storage_deserialize(serializable_storage_record("DOMRectReadOnly"sv, 1, rect_body)));
+        (void)unwrap_wrappable<Web::Geometry::DOMRectReadOnly>(rect);
+        EXPECT_EQ(number_property(rect, "x"sv), 10.0);
+        EXPECT_EQ(number_property(rect, "y"sv), 20.0);
+        EXPECT_EQ(number_property(rect, "width"sv), 30.0);
+        EXPECT_EQ(number_property(rect, "height"sv), 40.0);
     }
     {
-        auto& rect = unwrap_wrappable<Web::Geometry::DOMRect>(MUST(storage_deserialize(serializable_storage_record("DOMRect"sv, 1, rect_body))));
-        EXPECT_EQ(rect.width(), 30.0);
-        EXPECT_EQ(rect.height(), 40.0);
+        auto rect = MUST(storage_deserialize(serializable_storage_record("DOMRect"sv, 1, rect_body)));
+        (void)unwrap_wrappable<Web::Geometry::DOMRect>(rect);
+        EXPECT_EQ(number_property(rect, "width"sv), 30.0);
+        EXPECT_EQ(number_property(rect, "height"sv), 40.0);
     }
 
     {
@@ -422,22 +427,22 @@ TEST_CASE(geometry_serializables_round_trip)
         body.append(1);
         for (double element : { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 })
             append_little_endian_double(body, element);
-        auto& matrix = unwrap_wrappable<Web::Geometry::DOMMatrixReadOnly>(MUST(storage_deserialize(serializable_storage_record("DOMMatrixReadOnly"sv, 1, body))));
-        EXPECT(matrix.is2d());
-        EXPECT_EQ(matrix.m11(), 1.0);
-        EXPECT_EQ(matrix.m22(), 4.0);
-        EXPECT_EQ(matrix.m42(), 6.0);
+        auto matrix = MUST(storage_deserialize(serializable_storage_record("DOMMatrixReadOnly"sv, 1, body)));
+        EXPECT(unwrap_wrappable<Web::Geometry::DOMMatrixReadOnly>(matrix).is2d());
+        EXPECT_EQ(number_property(matrix, "m11"sv), 1.0);
+        EXPECT_EQ(number_property(matrix, "m22"sv), 4.0);
+        EXPECT_EQ(number_property(matrix, "m42"sv), 6.0);
     }
     {
         Vector<u8> body;
         body.append(0);
         for (int i = 1; i <= 16; ++i)
             append_little_endian_double(body, static_cast<double>(i));
-        auto& matrix = unwrap_wrappable<Web::Geometry::DOMMatrix>(MUST(storage_deserialize(serializable_storage_record("DOMMatrix"sv, 1, body))));
-        EXPECT(!matrix.is2d());
-        EXPECT_EQ(matrix.m11(), 1.0);
-        EXPECT_EQ(matrix.m22(), 6.0);
-        EXPECT_EQ(matrix.m44(), 16.0);
+        auto matrix = MUST(storage_deserialize(serializable_storage_record("DOMMatrix"sv, 1, body)));
+        EXPECT(!unwrap_wrappable<Web::Geometry::DOMMatrix>(matrix).is2d());
+        EXPECT_EQ(number_property(matrix, "m11"sv), 1.0);
+        EXPECT_EQ(number_property(matrix, "m22"sv), 6.0);
+        EXPECT_EQ(number_property(matrix, "m44"sv), 16.0);
     }
     {
         Vector<u8> body;
@@ -449,10 +454,10 @@ TEST_CASE(geometry_serializables_round_trip)
             append_little_endian_double(nested_point, (k * 4) + 4.0);
             frozen_serializable_value(body, "DOMPoint"sv, 1, nested_point);
         }
-        auto& quad = unwrap_wrappable<Web::Geometry::DOMQuad>(MUST(storage_deserialize(serializable_storage_record("DOMQuad"sv, 1, body))));
-        EXPECT_EQ(quad.p1()->x(), 1.0);
-        EXPECT_EQ(quad.p2()->x(), 5.0);
-        EXPECT_EQ(quad.p4()->w(), 16.0);
+        auto quad = MUST(storage_deserialize(serializable_storage_record("DOMQuad"sv, 1, body)));
+        EXPECT_EQ(number_property(property_of(quad, "p1"sv), "x"sv), 1.0);
+        EXPECT_EQ(number_property(property_of(quad, "p2"sv), "x"sv), 5.0);
+        EXPECT_EQ(number_property(property_of(quad, "p4"sv), "w"sv), 16.0);
     }
 }
 
@@ -527,7 +532,7 @@ TEST_CASE(image_serializables_round_trip)
         auto& image = unwrap_wrappable<Web::HTML::ImageData>(MUST(storage_deserialize(frozen_image_data_record({ pixels.data(), pixels.size() }, 1, 1, "srgb"sv))));
         EXPECT_EQ(image.width(), 1u);
         EXPECT_EQ(image.height(), 1u);
-        EXPECT(image.data() != nullptr);
+        EXPECT(image.pixels() != nullptr);
     }
 
     {
@@ -535,17 +540,49 @@ TEST_CASE(image_serializables_round_trip)
         auto& bitmap = unwrap_wrappable<Web::HTML::ImageBitmap>(MUST(storage_deserialize(image_bitmap_record(2, 2, 8, "BGRA8888"sv, "premultiplied"sv, { pixels.data(), pixels.size() }))));
         EXPECT_EQ(bitmap.width(), 2u);
         EXPECT_EQ(bitmap.height(), 2u);
+        EXPECT(bitmap.frame()->color_space().data().has<Empty>());
+    }
+
+    {
+        Array<u8, 16> pixels {};
+        Array<u8, 3> display_p3 { 1, 12, 13 }; // CICP, SMPTE432 primaries, sRGB transfer characteristics
+        auto& bitmap = unwrap_wrappable<Web::HTML::ImageBitmap>(MUST(storage_deserialize(image_bitmap_record(2, 2, 8, "BGRA8888"sv, "premultiplied"sv, { pixels.data(), pixels.size() }, { display_p3.data(), display_p3.size() }))));
+        EXPECT_EQ(bitmap.width(), 2u);
+        EXPECT_EQ(bitmap.height(), 2u);
+        auto const& color_space = bitmap.frame()->color_space().data();
+        EXPECT(color_space.has<Gfx::ColorSpace::CICP>());
+        EXPECT_EQ(color_space.get<Gfx::ColorSpace::CICP>().color_primaries, Media::ColorPrimaries::SMPTE432);
+        EXPECT_EQ(color_space.get<Gfx::ColorSpace::CICP>().transfer_characteristics, Media::TransferCharacteristics::SRGB);
     }
 }
 
-TEST_CASE(webassembly_module_decodes_from_frozen_bytes)
+TEST_CASE(image_data_over_a_shrunk_resizable_buffer_has_no_pixels)
 {
-    auto value = MUST(principal_storage_deserialize(webassembly_module_storage_record(s_minimal_webassembly_module_bytes.span())));
-    auto module = GC::Ref { unwrap_wrappable<Web::WebAssembly::Module>(value) };
+    auto& realm = test_realm();
+    auto& vm = realm.vm();
 
-    auto compiled_module = module->compiled_module();
-    EXPECT(compiled_module->module->import_section().imports().is_empty());
-    EXPECT(compiled_module->module->export_section().entries().is_empty());
+    // An ImageData whose data views all of a resizable buffer, which script can shrink after it arrives.
+    Array<u8, 8> pixels { 1, 2, 3, 4, 5, 6, 7, 8 };
+    Vector<u8> body;
+    append_array_buffer_view_value(body, "Uint8ClampedArray"sv, BackingBuffer::Resizable, { pixels.data(), pixels.size() }, static_cast<u32>(pixels.size()), 0, static_cast<u32>(pixels.size()));
+    append_storage_signed_leb128(body, 2);
+    append_storage_signed_leb128(body, 1);
+    append_storage_string(body, "srgb"sv);
+    auto value = MUST(storage_deserialize(serializable_storage_record("ImageData"sv, 1, body)));
+    auto& image = unwrap_wrappable<Web::HTML::ImageData>(value);
+    EXPECT(image.pixels() != nullptr);
+    EXPECT(!image.bitmap().is_error());
+
+    auto data = MUST(value.as_object().get("data"_utf16_fly_string));
+    auto& buffer = *as<JS::TypedArrayBase>(data.as_object()).viewed_array_buffer();
+    EXPECT(!buffer.is_fixed_length());
+    MUST(JS::call(vm, MUST(buffer.get(vm.names.resize)), JS::Value { &buffer }, JS::Value(4)));
+
+    // The data no longer has room for the pixels, so they are not read: putImageData() and createImageBitmap() see
+    // no pixels, and WebGL uploads none.
+    EXPECT(!image.is_detached());
+    EXPECT_EQ(image.pixels(), nullptr);
+    EXPECT(image.bitmap().is_error());
 }
 
 TEST_CASE(crypto_key_algorithm_variants_decode_from_frozen_bytes)
@@ -553,14 +590,48 @@ TEST_CASE(crypto_key_algorithm_variants_decode_from_frozen_bytes)
     for (auto const& golden : crypto_algorithm_goldens()) {
         auto record = crypto_key_full_record(golden.type, golden.usage, golden.algorithm, golden.handle);
         auto value = MUST(principal_storage_deserialize(record));
-        auto& key = unwrap_wrappable<Web::Crypto::CryptoKey>(value);
-
         if (golden.tag == KeyAlgorithmTag::EcKeyAlgorithm) {
-            auto const& algorithm = key.ec_algorithm();
-            expect_utf16_equals(algorithm.name(), "ECDSA"_utf16);
-            expect_utf16_equals(algorithm.named_curve(), "P-256"_utf16);
+            auto algorithm = property_of(value, "algorithm"sv);
+            expect_utf16_equals(string_property(algorithm, "name"sv), "ECDSA"_utf16);
+            expect_utf16_equals(string_property(algorithm, "namedCurve"sv), "P-256"_utf16);
         }
     }
+}
+
+TEST_CASE(crypto_key_with_an_invalid_ec_point_is_a_data_clone_error)
+{
+    Array<u8, 32> zero {};
+    auto record = crypto_key_full_record("public"sv, "verify"sv, alg_ec_key_algorithm("ECDSA"sv, "P-256"sv), handle_ec_public_key(zero, zero));
+    auto& realm = principal_test_realm();
+    auto result = Web::WebIDL::throw_dom_exception_if_needed(realm.vm(), realm, [&] {
+        return principal_storage_deserialize(record);
+    });
+    EXPECT(result.is_error());
+    if (result.is_error())
+        EXPECT_EQ(unwrap_wrappable<Web::WebIDL::DOMException>(result.error_value()).name(), "DataCloneError"_utf16);
+}
+
+TEST_CASE(crypto_key_with_an_ml_dsa_seed_that_does_not_match_its_public_key_is_a_data_clone_error)
+{
+    auto key = mldsa_44_key();
+    auto other_key = mldsa_44_key(0xff);
+    auto record = crypto_key_full_record("private"sv, "sign"sv, alg_key_algorithm("ML-DSA-44"sv), handle_triple_buffer(6, key.seed, other_key.public_key, key.expanded_key));
+    auto& realm = principal_test_realm();
+    auto result = Web::WebIDL::throw_dom_exception_if_needed(realm.vm(), realm, [&] {
+        return principal_storage_deserialize(record);
+    });
+    EXPECT(result.is_error());
+    if (result.is_error())
+        EXPECT_EQ(unwrap_wrappable<Web::WebIDL::DOMException>(result.error_value()).name(), "DataCloneError"_utf16);
+}
+
+TEST_CASE(crypto_key_with_an_ml_kem_public_key_that_fails_the_encapsulation_key_check_decodes)
+{
+    Array<u8, 800> public_key;
+    public_key.fill(0xff);
+    auto record = crypto_key_full_record("public"sv, "encapsulateBits"sv, alg_key_algorithm("ML-KEM-512"sv), handle_single_buffer(7, public_key));
+    auto value = MUST(principal_storage_deserialize(record));
+    EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), record.data.span());
 }
 
 TEST_CASE(crypto_key_handle_variants_decode_from_frozen_bytes)
@@ -568,43 +639,25 @@ TEST_CASE(crypto_key_handle_variants_decode_from_frozen_bytes)
     for (auto const& golden : crypto_handle_goldens()) {
         auto record = crypto_key_full_record(golden.type, golden.usage, golden.algorithm, golden.handle);
         auto value = MUST(principal_storage_deserialize(record));
-        auto& key = unwrap_wrappable<Web::Crypto::CryptoKey>(value);
+        EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), record.data.span());
+    }
+}
 
-        switch (golden.tag) {
-        case HandleTag::ByteBuffer:
-            EXPECT(key.handle().has<ByteBuffer>());
-            break;
-        case HandleTag::RSAPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::RSAPublicKey>());
-            break;
-        case HandleTag::RSAPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::RSAPrivateKey>());
-            break;
-        case HandleTag::ECPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::ECPublicKey>());
-            break;
-        case HandleTag::ECPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::ECPrivateKey>());
-            break;
-        case HandleTag::MLDSAPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLDSAPublicKey>());
-            break;
-        case HandleTag::MLDSAPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLDSAPrivateKey>());
-            break;
-        case HandleTag::MLKEMPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLKEMPublicKey>());
-            break;
-        case HandleTag::MLKEMPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLKEMPrivateKey>());
-            break;
-        case HandleTag::OKPPublicKey:
-            EXPECT(key.handle().has<Web::Crypto::OKPPublicKey>());
-            break;
-        case HandleTag::OKPPrivateKey:
-            EXPECT(key.handle().has<Web::Crypto::OKPPrivateKey>());
-            break;
-        }
+TEST_CASE(crypto_key_ec_private_key_stored_without_its_public_key_or_with_its_parameters_decodes)
+{
+    auto x = p256_base_point_x();
+    auto y = p256_base_point_y();
+    auto d = p256_private_value_one();
+    Vector<int> p256 { 1, 2, 840, 10045, 3, 1, 7 };
+    auto algorithm = alg_ec_key_algorithm("ECDSA"sv, "P-256"sv);
+    auto expected = crypto_key_full_record("private"sv, "sign"sv, algorithm, handle_ec_private_key(d, {}, Array<ReadonlyBytes, 2> { x, y }));
+
+    // A stored EC private key may have its curve's parameters and may not have its public key. It is stored again with
+    // its public key and without parameters.
+    for (auto const& handle : { handle_ec_private_key(d, {}, {}), handle_ec_private_key(d, p256, {}), handle_ec_private_key(d, p256, Array<ReadonlyBytes, 2> { x, y }) }) {
+        auto record = crypto_key_full_record("private"sv, "sign"sv, algorithm, handle);
+        auto value = MUST(principal_storage_deserialize(record));
+        EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), expected.data.span());
     }
 }
 

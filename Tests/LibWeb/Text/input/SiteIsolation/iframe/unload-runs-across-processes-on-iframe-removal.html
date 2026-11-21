@@ -5,30 +5,29 @@
     // processes before removing the canonical subtree.
     promiseTest(async () => {
         const httpServer = httpTestServer();
-        const runId = crypto.randomUUID();
 
         const grandchildUrl = new URL(
-            await httpServer.createEcho("GET", `/oop-unload-grandchild-${runId}`, {
+            await httpServer.createEcho("GET", "/oop-unload-grandchild", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
-                    addEventListener("unload", () => { document.cookie = "unloadPing=1; path=/"; });
-                    document.cookie = "loaded=1; path=/";
+                    addEventListener("unload", () => { document.cookie = "unloadPing=1; path=/; SameSite=None; Secure"; });
+                    document.cookie = "loaded=1; path=/; SameSite=None; Secure";
                 <\/script>`,
             })
         );
         grandchildUrl.hostname = uniqueLocalhostHostname("oop-unload-grandchild");
 
         const childUrl = new URL(
-            await httpServer.createEcho("GET", `/oop-unload-child-${runId}`, {
+            await httpServer.createEcho("GET", "/oop-unload-child", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
                     addEventListener("unload", () => {
                         const grandchildUnloaded = internals.hasCookieForURL(${JSON.stringify(grandchildUrl.href)}, "unloadPing", "1");
-                        document.cookie = "unloadOrder=" + (grandchildUnloaded ? "grandchild-first" : "child-first") + "; path=/";
+                        document.cookie = "unloadOrder=" + (grandchildUnloaded ? "grandchild-first" : "child-first") + "; path=/; SameSite=None; Secure";
                     });
-                    document.cookie = "loaded=1; path=/";
+                    document.cookie = "loaded=1; path=/; SameSite=None; Secure";
                 <\/script><iframe src="${grandchildUrl}"></iframe>`,
             })
         );

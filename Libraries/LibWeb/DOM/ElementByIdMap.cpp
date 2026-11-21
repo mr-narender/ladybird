@@ -13,8 +13,12 @@ void ElementByIdMap::add(Utf16FlyString const& element_id, Element& element)
     auto& entry = m_map.ensure(element_id, [] { return MapEntry {}; });
 
     for (auto const& existing : entry.elements) {
-        if (existing.ptr().ptr() == &element)
+        if (existing.ptr().ptr() == &element) {
+            // NB: Re-registering after a move can change which duplicate is first.
+            if (entry.elements.size() > 1)
+                entry.cached_first_element = {};
             return;
+        }
     }
 
     entry.elements.append(element);
@@ -89,6 +93,14 @@ void ElementByIdMap::for_each_element_with_id(Utf16View element_id, Node const& 
             callback(const_cast<Element&>(el));
         return TraversalDecision::Continue;
     });
+}
+
+ReadonlySpan<GC::Weak<Element>> ElementByIdMap::elements_with_id(Utf16FlyString const& element_id) const
+{
+    auto maybe_entry = m_map.get(element_id);
+    if (!maybe_entry.has_value())
+        return {};
+    return maybe_entry->elements.span();
 }
 
 }

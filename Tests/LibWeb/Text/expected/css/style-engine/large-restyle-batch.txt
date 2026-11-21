@@ -1,0 +1,3 @@
+passes: PARTIAL
+every item changed: true
+restyled besides the items: []

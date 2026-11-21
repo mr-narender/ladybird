@@ -1,0 +1,5 @@
+passes: PARTIAL
+changed: [target, item]
+restyled but unchanged: []
+item color: rgb(0, 128, 0)
+after delete: rgb(0, 0, 0)

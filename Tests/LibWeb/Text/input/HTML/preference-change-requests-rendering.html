@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    asyncTest(async done => {
+        internals.setManualRenderingOpportunities(true);
+        internals.setPreferredColorScheme("light");
+        internals.updateStyle();
+        const query = matchMedia("(prefers-color-scheme: dark)");
+        const changed = new Promise(resolve => query.onchange = resolve);
+        internals.beginRenderingTrace();
+        internals.setPreferredColorScheme("dark");
+        const requests = internals.takeRenderingTrace().split("\n").filter(line => line.startsWith("request"));
+        println(`rendering requests of the preference change: [${requests.join(", ")}]`);
+        internals.injectRenderingOpportunity(performance.now());
+        await changed;
+        println(`media query changed: ${query.matches}`);
+        query.onchange = null;
+        internals.setManualRenderingOpportunities(false);
+        internals.setPreferredColorScheme("auto");
+        done();
+    });
+</script>

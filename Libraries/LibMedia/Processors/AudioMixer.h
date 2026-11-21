@@ -11,15 +11,15 @@
 #include <AK/Mutex.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefPtr.h>
-#include <LibMedia/Audio/Forward.h>
-#include <LibMedia/Audio/SampleSpecification.h>
-#include <LibMedia/AudioBlock.h>
+#include <LibAudio/Forward.h>
+#include <LibAudio/SampleSpecification.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
 #include <LibMedia/SynchronizedWakeHandler.h>
+#include <LibMediaCodecs/AudioBlock.h>
 
 namespace Media {
 
@@ -51,9 +51,11 @@ private:
         AudioBlock current_block;
         i64 next_frame { 0 };
         PipelineStatus last_status { PipelineStatus::Pending };
+        PipelineCheckpoint last_checkpoint { 0 };
     };
 
     bool any_input_is_suspended_while_locked();
+    PipelineCheckpoint oldest_input_checkpoint_while_locked() const;
     void drop_buffered_data_while_locked();
     PipelineStatus mix_into_output_block_while_locked();
     void dispatch_wake();

@@ -11,9 +11,11 @@
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/HTMLFormElement.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
@@ -47,6 +49,12 @@
 #include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/html/html_form_element.rs.
+void web_html_form_element_submittable_elements(JSObject* form, void* elements, void (*on_element)(void*, DOM::Element*));
+}
 
 GC_DEFINE_ALLOCATOR(HTMLFormElement);
 
@@ -203,7 +211,7 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
     auto encoding = TRY_OR_THROW_OOM(vm, pick_an_encoding());
 
     // 7. Let entry list be the result of constructing the entry list with form, submitter, and encoding.
-    auto entry_list_or_null = TRY(construct_entry_list(relevant_realm(*this), *this, submitter, encoding));
+    auto entry_list_or_null = construct_entry_list(*this, submitter, encoding);
 
     // 8. Assert: entry list is not null.
     VERIFY(entry_list_or_null.has_value());
@@ -335,21 +343,21 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
 
     if (scheme.is_one_of("http"sv, "https"sv)) {
         if (method == MethodAttributeState::GET)
-            TRY_OR_THROW_OOM(vm, mutate_action_url(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement));
+            TRY_OR_THROW_OOM(vm, mutate_action_url(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement, submitter));
         else
-            TRY_OR_THROW_OOM(vm, submit_as_entity_body(parsed_action.release_value(), move(entry_list), encoding_type, move(encoding), *target_navigable, history_handling, options.user_involvement));
+            TRY_OR_THROW_OOM(vm, submit_as_entity_body(parsed_action.release_value(), move(entry_list), encoding_type, move(encoding), *target_navigable, history_handling, options.user_involvement, submitter));
     } else if (scheme.is_one_of("ftp"sv, "javascript"sv)) {
-        get_action_url(parsed_action.release_value(), move(entry_list), *target_navigable, history_handling, options.user_involvement);
+        get_action_url(parsed_action.release_value(), move(entry_list), *target_navigable, history_handling, options.user_involvement, submitter);
     } else if (scheme.is_one_of("data"sv, "file"sv)) {
         if (method == MethodAttributeState::GET)
-            TRY_OR_THROW_OOM(vm, mutate_action_url(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement));
+            TRY_OR_THROW_OOM(vm, mutate_action_url(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement, submitter));
         else
-            get_action_url(parsed_action.release_value(), move(entry_list), *target_navigable, history_handling, options.user_involvement);
+            get_action_url(parsed_action.release_value(), move(entry_list), *target_navigable, history_handling, options.user_involvement, submitter);
     } else if (scheme == "mailto"sv) {
         if (method == MethodAttributeState::GET)
-            TRY_OR_THROW_OOM(vm, mail_with_headers(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement));
+            TRY_OR_THROW_OOM(vm, mail_with_headers(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement, submitter));
         else
-            TRY_OR_THROW_OOM(vm, mail_as_body(parsed_action.release_value(), move(entry_list), encoding_type, move(encoding), *target_navigable, history_handling, options.user_involvement));
+            TRY_OR_THROW_OOM(vm, mail_as_body(parsed_action.release_value(), move(entry_list), encoding_type, move(encoding), *target_navigable, history_handling, options.user_involvement, submitter));
     } else {
         dbgln("Failed to submit form: Unknown scheme: {}", scheme);
         return {};
@@ -472,7 +480,7 @@ void HTMLFormElement::reposition_moved_associated_elements(Badge<FormAssociatedE
     if (moved_elements.size() == m_associated_elements_in_tree_order.size())
         return;
 
-    HashTable<HTMLElement const*> moved_element_set;
+    GC::RootHashTable<HTMLElement const*> moved_element_set;
     for (auto const& element : moved_elements)
         moved_element_set.set(element.ptr());
 
@@ -627,9 +635,9 @@ GC::Ref<HTMLFormControlsCollection> HTMLFormElement::elements() const
 {
     if (!m_elements) {
         auto& root = as<ParentNode>(const_cast<HTMLFormElement*>(this)->root());
-        m_elements = HTMLFormControlsCollection::create(root, DOM::HTMLCollection::Scope::Descendants, const_cast<HTMLFormElement&>(*this), [this](Element const& element) {
-            return is_form_control(element, *this);
-        });
+        m_elements = HTMLFormControlsCollection::create(root, DOM::HTMLCollection::Scope::Descendants, const_cast<HTMLFormElement&>(*this), GC::create_function(heap(), GC::captures(*this), [](HTMLFormElement const& form, Element const& element) {
+            return is_form_control(element, form);
+        }));
     }
     return *m_elements;
 }
@@ -729,9 +737,9 @@ WebIDL::ExceptionOr<bool> HTMLFormElement::report_validity()
 }
 
 // https://html.spec.whatwg.org/multipage/forms.html#category-submit
-Vector<GC::Ref<DOM::Element>> HTMLFormElement::get_submittable_elements()
+GC::RootVector<GC::Ref<DOM::Element>> HTMLFormElement::get_submittable_elements()
 {
-    Vector<GC::Ref<DOM::Element>> submittable_elements;
+    GC::RootVector<GC::Ref<DOM::Element>> submittable_elements;
 
     for (auto const& element : m_associated_elements_in_tree_order) {
         if (element->is_submittable())
@@ -845,7 +853,7 @@ ErrorOr<Utf16String> HTMLFormElement::pick_an_encoding() const
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#convert-to-a-list-of-name-value-pairs
-static ErrorOr<Vector<DOMURL::QueryParam>> convert_to_list_of_name_value_pairs(GC::ConservativeVector<XHR::FormDataEntry> const& entry_list)
+static ErrorOr<Vector<DOMURL::QueryParam>> convert_to_list_of_name_value_pairs(GC::RootVector<XHR::FormDataEntry> const& entry_list)
 {
     // 1. Let list be an empty list of name-value pairs.
     Vector<DOMURL::QueryParam> list;
@@ -906,7 +914,7 @@ static ErrorOr<Utf16String> plain_text_encode(Vector<DOMURL::QueryParam> const& 
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-mutate-action
-ErrorOr<void> HTMLFormElement::mutate_action_url(URL::URL parsed_action, GC::ConservativeVector<XHR::FormDataEntry> entry_list, Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement)
+ErrorOr<void> HTMLFormElement::mutate_action_url(URL::URL parsed_action, GC::RootVector<XHR::FormDataEntry> entry_list, Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ref<HTMLElement> submitter)
 {
     // 1. Let pairs be the result of converting to a list of name-value pairs with entry list.
     auto pairs = TRY(convert_to_list_of_name_value_pairs(entry_list));
@@ -918,12 +926,12 @@ ErrorOr<void> HTMLFormElement::mutate_action_url(URL::URL parsed_action, GC::Con
     parsed_action.set_query(query);
 
     // 4. Plan to navigate to parsed action.
-    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement);
+    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement, submitter);
     return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-body
-ErrorOr<void> HTMLFormElement::submit_as_entity_body(URL::URL parsed_action, GC::ConservativeVector<XHR::FormDataEntry> entry_list, EncodingTypeAttributeState encoding_type, [[maybe_unused]] Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement)
+ErrorOr<void> HTMLFormElement::submit_as_entity_body(URL::URL parsed_action, GC::RootVector<XHR::FormDataEntry> entry_list, EncodingTypeAttributeState encoding_type, Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ref<HTMLElement> submitter)
 {
     // 1. Assert: method is POST.
 
@@ -952,7 +960,7 @@ ErrorOr<void> HTMLFormElement::submit_as_entity_body(URL::URL parsed_action, GC:
     case EncodingTypeAttributeState::FormData: {
         // -> multipart/form-data
         // 1. Let body be the result of running the multipart/form-data encoding algorithm with entry list and encoding.
-        auto body_and_mime_type = TRY(serialize_to_multipart_form_data(entry_list));
+        auto body_and_mime_type = TRY(serialize_to_multipart_form_data(entry_list, form_encoding_label_for_byte_serialization(encoding)));
         body = move(body_and_mime_type.serialized_data);
 
         // 2. Let mimeType be the isomorphic encoding of the concatenation of "multipart/form-data; boundary=" and the multipart/form-data
@@ -968,10 +976,9 @@ ErrorOr<void> HTMLFormElement::submit_as_entity_body(URL::URL parsed_action, GC:
 
         // 2. Let body be the result of running the text/plain encoding algorithm with pairs.
         auto serialized_body = TRY(plain_text_encode(pairs));
-        auto serialized_body_utf8 = serialized_body.to_utf8();
-        body = TRY(ByteBuffer::copy(serialized_body_utf8.bytes()));
 
-        // FIXME: 3. Set body to the result of encoding body using encoding.
+        // 3. Set body to the result of encoding body using encoding.
+        body = TRY(encode(serialized_body.utf16_view(), form_encoding_label_for_byte_serialization(encoding)));
 
         // 4. Let mimeType be `text/plain`.
         mime_type = POSTResource::RequestContentType::TextPlain;
@@ -982,20 +989,20 @@ ErrorOr<void> HTMLFormElement::submit_as_entity_body(URL::URL parsed_action, GC:
     }
 
     // 3. Plan to navigate to parsed action given a POST resource whose request body is body and request content-type is mimeType.
-    plan_to_navigate_to(parsed_action, POSTResource { .request_body = move(body), .request_content_type = mime_type, .request_content_type_directives = move(mime_type_directives) }, move(entry_list), target_navigable, history_handling, user_involvement);
+    plan_to_navigate_to(parsed_action, POSTResource { .request_body = move(body), .request_content_type = mime_type, .request_content_type_directives = move(mime_type_directives) }, move(entry_list), target_navigable, history_handling, user_involvement, submitter);
     return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-get-action
-void HTMLFormElement::get_action_url(URL::URL parsed_action, GC::ConservativeVector<XHR::FormDataEntry> entry_list, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement)
+void HTMLFormElement::get_action_url(URL::URL parsed_action, GC::RootVector<XHR::FormDataEntry> entry_list, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ref<HTMLElement> submitter)
 {
     // 1. Plan to navigate to parsed action.
     // Spec Note: entry list is discarded.
-    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement);
+    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement, submitter);
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-mailto-headers
-ErrorOr<void> HTMLFormElement::mail_with_headers(URL::URL parsed_action, GC::ConservativeVector<XHR::FormDataEntry> entry_list, [[maybe_unused]] Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement)
+ErrorOr<void> HTMLFormElement::mail_with_headers(URL::URL parsed_action, GC::RootVector<XHR::FormDataEntry> entry_list, [[maybe_unused]] Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ref<HTMLElement> submitter)
 {
     // 1. Let pairs be the result of converting to a list of name-value pairs with entry list.
     auto pairs = TRY(convert_to_list_of_name_value_pairs(entry_list));
@@ -1010,11 +1017,11 @@ ErrorOr<void> HTMLFormElement::mail_with_headers(URL::URL parsed_action, GC::Con
     parsed_action.set_query(headers);
 
     // 5. Plan to navigate to parsed action.
-    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement);
+    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement, submitter);
     return {};
 }
 
-ErrorOr<void> HTMLFormElement::mail_as_body(URL::URL parsed_action, GC::ConservativeVector<XHR::FormDataEntry> entry_list, EncodingTypeAttributeState encoding_type, [[maybe_unused]] Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement)
+ErrorOr<void> HTMLFormElement::mail_as_body(URL::URL parsed_action, GC::RootVector<XHR::FormDataEntry> entry_list, EncodingTypeAttributeState encoding_type, [[maybe_unused]] Utf16String encoding, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ref<HTMLElement> submitter)
 {
     // 1. Let pairs be the result of converting to a list of name-value pairs with entry list.
     auto pairs = TRY(convert_to_list_of_name_value_pairs(entry_list));
@@ -1062,12 +1069,12 @@ ErrorOr<void> HTMLFormElement::mail_as_body(URL::URL parsed_action, GC::Conserva
     parsed_action.set_query(query_builder.string_view());
 
     // 7. Plan to navigate to parsed action.
-    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement);
+    plan_to_navigate_to(move(parsed_action), Empty {}, move(entry_list), target_navigable, history_handling, user_involvement, submitter);
     return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#plan-to-navigate
-void HTMLFormElement::plan_to_navigate_to(URL::URL url, DocumentResource post_resource, GC::ConservativeVector<XHR::FormDataEntry> entry_list, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement)
+void HTMLFormElement::plan_to_navigate_to(URL::URL url, DocumentResource post_resource, GC::RootVector<XHR::FormDataEntry> entry_list, GC::Ref<Navigable> target_navigable, NavigationHistoryBehavior history_handling, UserNavigationInvolvement user_involvement, GC::Ref<HTMLElement> submitter)
 {
     // 1. Let referrerPolicy be the empty string.
     ReferrerPolicy::ReferrerPolicy referrer_policy = ReferrerPolicy::ReferrerPolicy::EmptyString;
@@ -1084,15 +1091,15 @@ void HTMLFormElement::plan_to_navigate_to(URL::URL url, DocumentResource post_re
     }
 
     // 4. Queue an element task on the DOM manipulation task source given the form element and the following steps:
-    // NOTE: `this`, `actual_resource` and `target_navigable` are protected by GC::HeapFunction.
-    queue_an_element_task(Task::Source::DOMManipulation, [this, url, post_resource, entry_list = move(entry_list), target_navigable, history_handling, referrer_policy, user_involvement]() {
+    queue_an_element_task(Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this, url, post_resource, move(static_cast<Vector<XHR::FormDataEntry>&>(entry_list)), target_navigable, history_handling, referrer_policy, user_involvement, submitter), [](auto& self, auto& url, auto& post_resource, auto& entry_list, auto& target_navigable, auto& history_handling, auto& referrer_policy, auto& user_involvement, auto& submitter) {
         // 1. Set the form's planned navigation to null.
-        m_planned_navigation = {};
+        self.m_planned_navigation = {};
 
         // 2. Navigate targetNavigable to url using the form element's node document, with historyHandling set to historyHandling,
-        //    referrerPolicy set to referrerPolicy, documentResource set to postResource, and formDataEntryList set to entry list.
-        MUST(target_navigable->navigate({ .url = url, .source_document = this->document(), .document_resource = post_resource, .response = nullptr, .exceptions_enabled = false, .history_handling = history_handling, .form_data_entry_list = move(entry_list), .referrer_policy = referrer_policy, .user_involvement = user_involvement }));
-    });
+        //    userInvolvement set to userInvolvement, sourceElement set to submitter, referrerPolicy set to referrerPolicy,
+        //    documentResource set to postResource, and formDataEntryList set to entry list.
+        MUST(target_navigable->navigate({ .url = url, .source_document = self.document(), .document_resource = post_resource, .response = nullptr, .exceptions_enabled = false, .history_handling = history_handling, .form_data_entry_list = GC::RootVector<XHR::FormDataEntry> { move(entry_list) }, .referrer_policy = referrer_policy, .user_involvement = user_involvement, .source_element = submitter }));
+    }));
 
     // 5. Set the form's planned navigation to the just-queued task.
     m_planned_navigation = HTML::main_thread_event_loop().task_queue().last_added_task();
@@ -1225,14 +1232,14 @@ Variant<Empty, GC::Ref<DOM::Node>, GC::Ref<RadioNodeList>> HTMLFormElement::name
     // 1. Let candidates be a live RadioNodeList object containing all the listed elements, whose form owner is the form
     //    element, that have either an id attribute or a name attribute equal to name, with the exception of input
     //    elements whose type attribute is in the Image Button state, in tree order.
-    auto filter = [this, name](DOM::Node const& node) -> bool {
+    auto filter = [](HTMLFormElement const& form, Utf16FlyString const& name, DOM::Node const& node) -> bool {
         auto const* element = as_if<DOM::Element>(node);
         if (!element)
             return false;
 
         // Form controls are defined as listed elements, with the exception of input elements in the Image Button state,
         // whose form owner is the form element.
-        if (!is_form_control(*element, *this))
+        if (!is_form_control(*element, form))
             return false;
 
         return name == element->id() || name == element->name();
@@ -1241,12 +1248,12 @@ Variant<Empty, GC::Ref<DOM::Node>, GC::Ref<RadioNodeList>> HTMLFormElement::name
     // 2. If candidates is empty, let candidates be a live RadioNodeList object containing all the img elements,
     //    whose form owner is the form element, that have either an id attribute or a name attribute equal to name,
     //    in tree order.
-    auto image_filter = [this, name](DOM::Node const& node) -> bool {
+    auto image_filter = [](HTMLFormElement const& form, Utf16FlyString const& name, DOM::Node const& node) -> bool {
         auto const* element = as_if<HTMLImageElement>(node);
         if (!element)
             return false;
 
-        if (element->form() != this)
+        if (element->form() != &form)
             return false;
 
         return name == element->id() || name == element->name();
@@ -1261,7 +1268,7 @@ Variant<Empty, GC::Ref<DOM::Node>, GC::Ref<RadioNodeList>> HTMLFormElement::name
         first_candidate = nullptr;
         candidate_count = 0;
         for (auto const& element : m_associated_elements_in_tree_order) {
-            if (!candidate_filter(*element))
+            if (!candidate_filter(*this, name, *element))
                 continue;
             if (!first_candidate)
                 first_candidate = element;
@@ -1285,8 +1292,8 @@ Variant<Empty, GC::Ref<DOM::Node>, GC::Ref<RadioNodeList>> HTMLFormElement::name
     // 4. If candidates contains more than one node, return candidates.
     if (candidate_count > 1) {
         if (candidates_are_images)
-            return RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, move(image_filter));
-        return RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, move(filter), DOM::LiveNodeList::Kind::FormControls);
+            return RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, GC::create_function(heap(), GC::captures(*this, name), image_filter));
+        return RadioNodeList::create(root, DOM::LiveNodeList::Scope::Descendants, GC::create_function(heap(), GC::captures(*this, name), filter), DOM::LiveNodeList::Kind::FormControls);
     }
 
     // 5. Otherwise, candidates contains exactly one node. Add a mapping from name to the node in candidates in the form
@@ -1385,6 +1392,13 @@ size_t HTMLFormElement::number_of_fields_blocking_implicit_submission() const
     };
 
     return count;
+}
+
+void web_html_form_element_submittable_elements(JSObject* form, void* elements, void (*on_element)(void*, DOM::Element*))
+{
+    auto& form_element = as<HTMLFormElement>(*Bindings::wrappable_impl_from(JS::HostABI::object_from_abi(form)));
+    for (auto& element : form_element.get_submittable_elements())
+        on_element(elements, element.ptr());
 }
 
 }

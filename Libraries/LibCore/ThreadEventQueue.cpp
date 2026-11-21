@@ -7,6 +7,7 @@
 #include <AK/Mutex.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Once.h>
+#include <AK/ScopeGuard.h>
 #include <AK/Vector.h>
 #include <LibCore/EventLoopImplementation.h>
 #include <LibCore/EventReceiver.h>
@@ -25,8 +26,9 @@ struct ThreadEventQueue::Private {
         AK_MAKE_DEFAULT_MOVABLE(QueuedEvent);
 
     public:
-        QueuedEvent(RefPtr<EventReceiver> const& receiver, Event::Type event_type)
+        QueuedEvent(RefPtr<EventReceiver> const& receiver, Event::Type event_type, u64 timer_generation = 0)
             : receiver(receiver)
+            , timer_generation(timer_generation)
             , event_type(event_type)
         {
         }
@@ -40,12 +42,15 @@ struct ThreadEventQueue::Private {
         ~QueuedEvent() = default;
 
         WeakPtr<EventReceiver> receiver;
+        u64 timer_generation { 0 };
         Function<void()> m_invokee;
         u8 event_type { Event::Type::Invalid };
     };
 
     Mutex mutex;
     Vector<QueuedEvent> queued_events;
+    // Only the queue's own thread reads and writes this.
+    size_t processing_depth { 0 };
 };
 
 static pthread_key_t s_current_thread_event_queue_key;
@@ -78,6 +83,15 @@ ThreadEventQueue& ThreadEventQueue::current()
     return *ptr;
 }
 
+void ThreadEventQueue::destroy_current()
+{
+    // An event's receiver may post another event as it is freed, which makes the thread a new queue.
+    while (auto* queue = current_or_null()) {
+        pthread_setspecific(s_current_thread_event_queue_key, nullptr);
+        delete queue;
+    }
+}
+
 ThreadEventQueue::ThreadEventQueue()
     : m_private(make<Private>())
 {
@@ -90,6 +104,15 @@ void ThreadEventQueue::post_event(Core::EventReceiver* receiver, Core::Event::Ty
     {
         MutexLocker lock(m_private->mutex);
         m_private->queued_events.empend(receiver, event_type);
+    }
+    Core::EventLoopManager::the().did_post_event();
+}
+
+void ThreadEventQueue::post_timer_event(Core::EventReceiver* receiver, u64 timer_generation)
+{
+    {
+        MutexLocker lock(m_private->mutex);
+        m_private->queued_events.empend(receiver, Event::Type::Timer, timer_generation);
     }
     Core::EventLoopManager::the().did_post_event();
 }
@@ -111,11 +134,14 @@ size_t ThreadEventQueue::process()
         events = move(m_private->queued_events);
     }
 
+    ++m_private->processing_depth;
+    ScopeGuard leave = [this] { --m_private->processing_depth; };
+
     for (auto& queued_event : events) {
         if (auto receiver = queued_event.receiver.strong_ref()) {
             switch (queued_event.event_type) {
             case Event::Type::Timer: {
-                TimerEvent timer_event;
+                TimerEvent timer_event { queued_event.timer_generation };
                 receiver->dispatch_event(timer_event);
                 break;
             }
@@ -137,6 +163,11 @@ size_t ThreadEventQueue::process()
     }
 
     return events.size();
+}
+
+bool ThreadEventQueue::is_processing_nested() const
+{
+    return m_private->processing_depth > 1;
 }
 
 bool ThreadEventQueue::has_pending_events() const

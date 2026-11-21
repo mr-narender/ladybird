@@ -5,13 +5,12 @@
  */
 
 #include <AK/Assertions.h>
-#include <AK/Debug.h>
 #include <AK/Utf16String.h>
-#include <LibMedia/CodedFrame.h>
 #include <LibMedia/Containers/Matroska/Utilities.h>
-#include <LibMedia/DecoderError.h>
 #include <LibMedia/MediaStream.h>
 #include <LibMedia/SeekMode.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 #include "MatroskaDemuxer.h"
 
@@ -35,6 +34,7 @@ DecoderErrorOr<NonnullRefPtr<Demuxer>> MatroskaDemuxer::from_stream(NonnullRefPt
         return DecoderError::with_description(DecoderErrorCategory::UnrecognizedFormat, "Stream is not Matroska or WebM"sv);
 
     auto demuxer = make_ref_counted<MatroskaDemuxer>(stream, TRY(Reader::from_stream(stream->create_cursor())));
+    demuxer->m_earliest_possible_position = demuxer->m_reader.earliest_possible_position(stream->create_cursor());
     demuxer->start_buffered_scan_thread(TRY(Reader::from_stream(stream->create_cursor())));
     return demuxer;
 }
@@ -56,20 +56,16 @@ void MatroskaDemuxer::start_buffered_scan_thread(Reader&& scan_reader)
     auto scan_cursor = m_stream->create_cursor();
     scan_cursor->set_is_blocking(false);
 
-    Vector<Track> tracks;
-    tracks.extend(MUST(get_tracks_for_type(TrackType::Video)));
-    tracks.extend(MUST(get_tracks_for_type(TrackType::Audio)));
-
     DemuxerScanState initial_state;
     initial_state.duration = m_reader.duration().value_or(AK::Duration::zero());
     m_buffered_scan_thread = DemuxerScanThread<BufferedScanPayload>::start(m_stream, move(initial_state),
-        BufferedScanPayload { move(scan_reader), move(scan_cursor), move(tracks) },
-        [](MediaStream& stream, BufferedScanPayload& payload) {
-            auto byte_ranges = stream.available_byte_ranges();
-            HashMap<u64, BufferedRangesScan> scans_by_track_number;
+        BufferedScanPayload { move(scan_reader), move(scan_cursor) },
+        [](MediaStream::Availability const& availability, BufferedScanPayload& payload) {
+            auto const& byte_ranges = availability.byte_ranges;
+            Vector<BufferedRangesScan> scans;
             if (!byte_ranges.is_empty())
-                scans_by_track_number = payload.reader.buffered_time_ranges_by_track_number(payload.scan_cursor, byte_ranges);
-            return DemuxerScanState::create_from_track_scans(payload.tracks, move(scans_by_track_number), payload.reader.duration().value_or(AK::Duration::zero()), stream.closing_bytes_are_available());
+                scans = payload.reader.buffered_time_ranges_by_track(payload.scan_cursor, byte_ranges);
+            return DemuxerScanState::create_from_track_scans(move(scans), payload.reader.duration().value_or(AK::Duration::zero()), availability.closing_bytes_are_available());
         });
 }
 
@@ -158,13 +154,10 @@ DecoderErrorOr<DemuxerSeekResult> MatroskaDemuxer::seek_to_most_recent_keyframe(
 
     auto seeked_iterator = TRY(m_reader.seek_to_random_access_point(track_status.iterator, timestamp));
 
-    auto last_sample = track_status.iterator.last_timestamp();
-    if (has_flag(options, DemuxerSeekOptions::Force))
-        last_sample = {};
-    if (last_sample.has_value() && seeked_iterator.last_timestamp().has_value()) {
-        bool skip_seek = seeked_iterator.last_timestamp().value() <= last_sample.value() && last_sample.value() <= timestamp;
-        dbgln_if(MATROSKA_DEBUG, "The last available sample at {}ms is {}closer to target timestamp {}ms than the keyframe at {}ms, {}", last_sample->to_milliseconds(), skip_seek ? ""sv : "not "sv, timestamp.to_milliseconds(), seeked_iterator.last_timestamp()->to_milliseconds(), skip_seek ? "skipping seek"sv : "seeking"sv);
-        if (skip_seek)
+    if (!has_flag(options, DemuxerSeekOptions::Force) && track_status.last_keyframe_timestamp.has_value()) {
+        auto keyframe_iterator = seeked_iterator;
+        auto keyframe = keyframe_iterator.next_block();
+        if (!keyframe.is_error() && keyframe.value().timestamp() == track_status.last_keyframe_timestamp)
             return DemuxerSeekResult::KeptCurrentPosition;
     }
 
@@ -172,6 +165,7 @@ DecoderErrorOr<DemuxerSeekResult> MatroskaDemuxer::seek_to_most_recent_keyframe(
     track_status.block = {};
     track_status.frames = {};
     track_status.frame_index = 0;
+    track_status.last_keyframe_timestamp.clear();
     return DemuxerSeekResult::MovedPosition;
 }
 
@@ -183,6 +177,9 @@ DecoderErrorOr<CodedFrame> MatroskaDemuxer::get_next_sample_for_track(Track cons
         status.block = TRY(status.iterator.next_block());
         status.frames.clear();
         status.frame_index = 0;
+        // Treat the first frame as a random access point, since the file must begin with one to decode.
+        if (status.block->only_keyframes() || !status.last_keyframe_timestamp.has_value())
+            status.last_keyframe_timestamp = status.block->timestamp();
     }
     if (status.frames.is_empty()) {
         status.frames = TRY(status.iterator.get_frames(status.block.value()));
@@ -203,8 +200,9 @@ DecoderErrorOr<CodedFrame> MatroskaDemuxer::get_next_sample_for_track(Track cons
     auto duration = status.block->duration().value_or(AK::Duration::zero());
     auto flags = status.block->only_keyframes() ? FrameFlags::Keyframe : FrameFlags::None;
 
-    return CodedFrame(codec_id, timestamp, timestamp, duration, flags,
-        move(status.frames[status.frame_index++]), move(codec_configuration));
+    CodedFrame frame { codec_id, timestamp, timestamp, duration, flags, move(status.frames[status.frame_index++]), move(codec_configuration) };
+    frame.set_maximum_scene_luminance(status.block->maximum_scene_luminance());
+    return frame;
 }
 
 DecoderErrorOr<AK::Duration> MatroskaDemuxer::total_duration()
@@ -218,9 +216,12 @@ DemuxerScanState const& MatroskaDemuxer::scan_state() const
     return m_buffered_scan_thread->main_thread_state();
 }
 
-void MatroskaDemuxer::set_scan_state_change_handler(Function<void()> handler)
+void MatroskaDemuxer::set_scan_state_change_handler(ScanStateChangeHandler handler)
 {
-    m_buffered_scan_thread->set_change_handler(move(handler));
+    m_buffered_scan_thread->set_change_handler([handler = move(handler)] {
+        if (handler)
+            handler(TimeRanges {});
+    });
 }
 
 DecoderErrorOr<AK::Duration> MatroskaDemuxer::duration_of_track(Track const&)

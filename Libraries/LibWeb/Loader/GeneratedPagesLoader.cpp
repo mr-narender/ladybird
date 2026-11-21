@@ -24,9 +24,42 @@ ErrorOr<String> load_error_page(URL::URL const& url, StringView error_message)
     StringBuilder builder;
     SourceGenerator generator { builder, '%', '%' };
     generator.set("failed_url", escape_html_entities(url.to_byte_string()));
+    // NB: The page names the site it could not reach by its host, with the port when the URL has one, or by the whole URL
+    //     when it has no host.
+    auto host = url.host().has_value() ? url.serialized_host() : StringView {};
+    ByteString failed_host = host.is_empty() ? url.to_byte_string() : ByteString { host };
+    if (!host.is_empty() && url.port().has_value())
+        failed_host = ByteString::formatted("{}:{}", failed_host, *url.port());
+    generator.set("failed_host", escape_html_entities(failed_host));
     generator.set("error_message", escape_html_entities(error_message));
     generator.append(template_file->data());
     return TRY(String::from_utf8(generator.as_string_view()));
+}
+
+// NB: Percent-encodes each path segment byte by byte, so names with characters like '#', '?' or '%', or names that are
+//     not valid UTF-8, still link to the right file.
+static String file_url_for_path(LexicalPath const& path)
+{
+    StringBuilder builder;
+    builder.append("file://"sv);
+    for (auto part : path.parts_view()) {
+        builder.append('/');
+        for (auto byte : part.bytes()) {
+            if (byte < 0x80 && !URL::code_point_is_in_percent_encode_set(byte, URL::PercentEncodeSet::Component))
+                builder.append(static_cast<char>(byte));
+            else
+                builder.appendff("%{:02X}", byte);
+        }
+    }
+    if (path.parts_view().is_empty())
+        builder.append('/');
+    return builder.to_string_without_validation();
+}
+
+// NB: File names are not necessarily valid UTF-8, so decode them leniently before showing them.
+static String display_name(StringView name)
+{
+    return String::from_utf8_with_replacement_character(name, String::WithBOMHandling::No);
 }
 
 ErrorOr<String> load_file_directory_page(URL::URL const& url)
@@ -52,7 +85,7 @@ ErrorOr<String> load_file_directory_page(URL::URL const& url)
 
             contents.append("<tr>"sv);
             contents.appendff("<td><span class=\"{}\"></span></td>", is_directory ? "folder" : "file");
-            contents.appendff("<td><a href=\"file://{}\">{}</a></td><td>&nbsp;</td>", path, name);
+            contents.appendff("<td><a href=\"{}\">{}</a></td><td>&nbsp;</td>", escape_html_entities(file_url_for_path(path)), escape_html_entities(display_name(name)));
             contents.appendff("<td>{:10}</td><td>&nbsp;</td>", is_directory ? "-"_string : human_readable_size(st.st_size));
             contents.appendff("<td>{}</td>", AK::UnixDateTime::from_seconds_since_epoch(st.st_mtime).to_byte_string());
             contents.append("</tr>\n"sv);
@@ -65,9 +98,9 @@ ErrorOr<String> load_file_directory_page(URL::URL const& url)
     auto template_file = TRY(Core::Resource::load_from_uri("resource://ladybird/templates/directory.html"sv));
     StringBuilder builder;
     SourceGenerator generator { builder, '%', '%' };
-    generator.set("path", escape_html_entities(lexical_path.string()));
-    generator.set("parent_url", TRY(String::formatted("file://{}", escape_html_entities(lexical_path.parent().string()))));
-    generator.set("contents", contents.to_byte_string());
+    generator.set("path", escape_html_entities(display_name(lexical_path.string())));
+    generator.set("parent_url", escape_html_entities(file_url_for_path(lexical_path.parent())));
+    generator.set("contents", contents.to_string_without_validation());
     generator.append(template_file->data());
     return TRY(String::from_utf8(generator.as_string_view()));
 }

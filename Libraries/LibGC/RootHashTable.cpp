@@ -18,12 +18,25 @@ RootHashTableBase::RootHashTableBase()
 RootHashTableBase::RootHashTableBase(Heap& heap)
     : m_heap(&heap)
 {
+    ASSERT(m_heap->is_on_owner_thread());
     m_heap->did_create_root_hash_table({}, *this);
 }
 
 RootHashTableBase::~RootHashTableBase()
 {
+    ASSERT(m_heap->is_on_owner_thread());
     m_heap->did_destroy_root_hash_table({}, *this);
+}
+
+void RootHashTableBase::assign_heap(Heap* heap)
+{
+    if (m_heap == heap)
+        return;
+
+    m_heap = heap;
+
+    // NOTE: IntrusiveList will remove this RootHashTable from the old heap it was part of.
+    m_heap->did_create_root_hash_table({}, *this);
 }
 
 }

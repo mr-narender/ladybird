@@ -7,73 +7,88 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/ByteString.h>
+#include <AK/HashMap.h>
 #include <AK/HashTable.h>
+#include <AK/Utf16String.h>
 #include <LibCore/EventReceiver.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibGC/Function.h>
 #include <LibHTTP/HeaderList.h>
-#include <LibRequests/CameFromCache.h>
+#include <LibRequests/CacheState.h>
 #include <LibRequests/Forward.h>
+#include <LibRequests/NetworkError.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibURL/URL.h>
+#include <LibWeb/Fetch/Engine/Ids.h>
 #include <LibWeb/Forward.h>
 #include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
-#include <LibWebCommon/Loader/SiteCompatibility.h>
 
 namespace Web {
 
+// Each agent has a loader of its own, which holds its connections to the RequestServer and its requests, and only its
+// thread can use it. The static settings are the process's.
 class WEB_API ResourceLoader : public Core::EventReceiver {
     C_OBJECT_ABSTRACT(ResourceLoader)
 
 public:
-    static void initialize(GC::Heap&, NonnullRefPtr<Requests::RequestClient>);
+    static void initialize(GC::Heap&);
     static bool is_initialized();
+
+    // Forgets the loader of this agent, once its requests are stopped.
+    static void shut_down();
     static ResourceLoader& the();
 
-    void set_client(NonnullRefPtr<Requests::RequestClient>);
+    static void set_proxy_autoconfig_url(URL::URL);
+    static Optional<URL::URL> const& proxy_autoconfig_url();
 
-    using OnHeadersReceived = GC::Function<void(Requests::Request*, HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, Requests::CameFromCache came_from_cache)>;
-    using OnDataReceived = GC::Function<void(Requests::ResponseData data)>;
+    // Route requests through their top-level site's client, falling back to the server with no site
+    // for requests without a site or without a client for that site.
+    void set_client(Optional<Utf16String> const& top_level_site, NonnullRefPtr<Requests::RequestClient>);
+
+    // A callback's transport is that of the RequestServer request the load started, or null for a load that started
+    // none.
+    using OnHeadersReceived = GC::Function<void(Fetch::Engine::NetworkTransportHandle*, HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Requests::CacheState cache_state)>;
+    using OnDataReceived = GC::Function<void(Fetch::Engine::NetworkTransportHandle*, Requests::ResponseData data)>;
     using OnCachedBodyAvailable = GC::Function<void(Core::ImmutableBytes data)>;
-    using OnComplete = GC::Function<void(bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message)>;
 
-    RefPtr<Requests::Request> load(LoadRequest&, GC::Root<OnHeadersReceived>, GC::Root<OnDataReceived>, GC::Root<OnCachedBodyAvailable>, GC::Root<OnComplete>, Requests::RequestClient::TransferLease = Requests::RequestClient::TransferLease::No);
+    // What RequestServer reported at the end of the request a load started.
+    struct NetworkRequestEnd {
+        Fetch::Engine::RequestId request_id;
+        u64 total_size { 0 };
+        Optional<Requests::NetworkError> network_error;
+    };
+    using OnComplete = GC::Function<void(bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message, Optional<NetworkRequestEnd> const& network_request_end)>;
 
-    RefPtr<Requests::RequestClient>& request_client() { return m_request_client; }
+    // A request keeps roots into the heap of the agent that made it.
+    void stop_all_requests();
 
-    void prefetch_dns(URL::URL const&, URL::URL const& source_url);
-    void preconnect(URL::URL const&, URL::URL const& source_url);
+    RefPtr<Fetch::Engine::NetworkTransportHandle> load(LoadRequest&, GC::Root<OnHeadersReceived>, GC::Root<OnDataReceived>, GC::Root<OnCachedBodyAvailable>, GC::Root<OnComplete>, Requests::RequestClient::TransferLease = Requests::RequestClient::TransferLease::No);
+
+    RefPtr<Requests::RequestClient> request_client_for(Optional<HTTP::NetworkIsolationKey> const&) const;
+    RefPtr<Requests::RequestClient> request_client_for_top_level_site(Optional<Utf16String> const&) const;
+
+    // Sites with clients, excluding the server with no site.
+    Vector<Utf16String> top_level_sites() const;
+    RefPtr<Requests::RequestClient> take_client_for_testing(Optional<Utf16String> const& top_level_site);
+
+    void prefetch_dns(GC::Ptr<DOM::Document>, URL::URL const&, URL::URL const& source_url);
+    void preconnect(GC::Ptr<DOM::Document>, URL::URL const&, URL::URL const& source_url);
 
     static bool is_known_hsts_host(Page&, String const& host);
 
-    String const& user_agent() const { return m_user_agent; }
-    String user_agent_for_url(URL::URL const& url) const { return m_site_compatibility_data.user_agent_for_url(url, m_user_agent); }
-    String user_agent_for_websocket_url(URL::URL const& url) const { return m_site_compatibility_data.user_agent_for_websocket_url(url, m_user_agent); }
-    void set_user_agent(String user_agent) { m_user_agent = move(user_agent); }
-    void set_site_compatibility_data(SiteCompatibilityData data) { m_site_compatibility_data = move(data); }
-    bool site_compatibility_exposes_experimental_interface(URL::URL const& url, StringView name) const { return m_site_compatibility_data.exposes_experimental_interface(url, name); }
-
-    String const& platform() const { return m_platform; }
-    void set_platform(String platform) { m_platform = move(platform); }
-
-    Vector<String> const& preferred_languages() const { return m_preferred_languages; }
-    void set_preferred_languages(Vector<String> preferred_languages)
-    {
-        m_preferred_languages = move(preferred_languages);
-        VERIFY(!m_preferred_languages.is_empty());
-    }
-
-    NavigatorCompatibilityMode navigator_compatibility_mode() { return m_navigator_compatibility_mode; }
-    void set_navigator_compatibility_mode(NavigatorCompatibilityMode mode) { m_navigator_compatibility_mode = mode; }
-
-    bool enable_global_privacy_control() const { return m_enable_global_privacy_control; }
-    void set_enable_global_privacy_control(bool enable) { m_enable_global_privacy_control = enable; }
+    // The engine the navigator claims to be. A process-wide setting, readable before the loader exists: the bindings
+    // consult it while they build a realm's global object.
+    static NavigatorCompatibilityMode navigator_compatibility_mode() { return s_navigator_compatibility_mode; }
+    static void set_navigator_compatibility_mode(NavigatorCompatibilityMode);
 
 private:
-    explicit ResourceLoader(GC::Heap&, NonnullRefPtr<Requests::RequestClient>);
+    explicit ResourceLoader(GC::Heap&);
+
+    RefPtr<Requests::RequestClient>& ensure_client_for(Optional<Utf16String> const& top_level_site);
 
     struct FileLoadResult {
         ReadonlyBytes data;
@@ -82,8 +97,8 @@ private:
     };
     template<typename FileHandler, typename ErrorHandler>
     void handle_file_load_request(LoadRequest& request, FileHandler on_file, ErrorHandler on_error);
-    template<typename ResourceHandler, typename ErrorHandler>
-    void handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error);
+    template<typename ResourceHandler>
+    void handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, GC::Ref<GC::Function<void(ByteString const&)>> on_error);
     template<typename ResourceHandler, typename ErrorHandler>
     void handle_resource_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error);
 
@@ -92,14 +107,10 @@ private:
 
     GC::Heap& m_heap;
     RefPtr<Requests::RequestClient> m_request_client;
+    HashMap<Utf16String, RefPtr<Requests::RequestClient>> m_site_request_clients;
     HashTable<NonnullRefPtr<Requests::Request>> m_active_requests;
 
-    String m_user_agent;
-    SiteCompatibilityData m_site_compatibility_data;
-    String m_platform;
-    Vector<String> m_preferred_languages = { "en"_string };
-    NavigatorCompatibilityMode m_navigator_compatibility_mode;
-    bool m_enable_global_privacy_control { false };
+    static Atomic<NavigatorCompatibilityMode, AK::MemoryOrder::memory_order_relaxed> s_navigator_compatibility_mode;
 };
 
 }
