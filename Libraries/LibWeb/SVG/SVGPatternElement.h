@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <AK/IntrusiveList.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGfx/Matrix4x4.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/SVG/AttributeParsing.h>
@@ -18,6 +20,8 @@
 #include <LibWeb/SVG/SVGURIReference.h>
 
 namespace Web::SVG {
+
+class SVGAnimatedTransformList;
 
 class SVGPatternElement
     : public SVGElement
@@ -32,6 +36,14 @@ public:
     virtual SVGFitToViewBox const* fit_to_view_box() const override { return this; }
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
+    virtual void inserted() override;
+    virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
+    virtual void finalize() override;
+
+    Optional<Utf16String> href_attribute_value() const;
+    // The id this pattern's href names, if any.
+    Optional<Utf16String> linked_id() const;
 
     SVGUnits pattern_units() const;
     SVGUnits pattern_content_units() const;
@@ -40,6 +52,10 @@ public:
     NumberPercentage pattern_y() const;
     NumberPercentage pattern_width() const;
     NumberPercentage pattern_height() const;
+
+    GC::Ref<SVGAnimatedEnumeration> pattern_units_for_bindings();
+    GC::Ref<SVGAnimatedEnumeration> pattern_content_units_for_bindings();
+    GC::Ref<SVGAnimatedTransformList> pattern_transform_for_bindings();
 
     // https://w3c.github.io/svgwg/svg2-draft/pservers.html#__svg__SVGPatternElement__x
     REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::number(0));
@@ -57,7 +73,7 @@ public:
 
     void push_paint_server_description(void* sink, Layout::Node const& target_layout_node) const;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override { return nullptr; }
+    virtual CSS::ElementBoxKind box_kind() const override { return CSS::ElementBoxKind::NoBox; }
 
 protected:
     SVGPatternElement(DOM::Document&, DOM::QualifiedName);
@@ -67,6 +83,10 @@ protected:
 
 private:
     virtual bool is_svg_pattern_element() const final { return true; }
+
+    void update_document_pattern_list_membership();
+
+    IntrusiveListNode<SVGPatternElement> m_list_node;
 
     GC::Ptr<SVGPatternElement const> linked_pattern(GC::RootHashTable<SVGPatternElement const*>& seen_patterns) const;
     GC::Ptr<SVGPatternElement const> pattern_content_element_impl(GC::RootHashTable<SVGPatternElement const*>& seen_patterns) const;
@@ -82,10 +102,14 @@ private:
     Optional<SVGUnits> m_pattern_units;
     Optional<SVGUnits> m_pattern_content_units;
     Optional<Gfx::AffineTransform> m_pattern_transform;
+    GC::Ptr<SVGAnimatedTransformList> m_pattern_transform_for_bindings;
     Optional<NumberPercentage> m_x;
     Optional<NumberPercentage> m_y;
     Optional<NumberPercentage> m_width;
     Optional<NumberPercentage> m_height;
+
+public:
+    using DocumentPatternElementList = IntrusiveList<&SVGPatternElement::m_list_node>;
 };
 
 }

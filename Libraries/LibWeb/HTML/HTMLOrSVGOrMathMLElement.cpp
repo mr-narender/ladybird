@@ -89,8 +89,13 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::focus(Bindings::FocusOptions const& 
     // OPTIMIZATION: Checking whether an element is focusable may update its style. WebKit and Blink
     // also return before that check when focus() is called on the already-focused element.
     if (auto navigable = element.document().navigable()) {
-        if (navigable->top_level_traversable()->currently_focused_area() == GC::Ptr<DOM::Node> { element })
+        if (navigable->top_level_traversable()->currently_focused_area() == GC::Ptr<DOM::Node> { element }) {
+            // NB: Step 3 still applies to an element that already has focus, since it doesn't depend on the focusing
+            //     steps having moved focus.
+            if (options.focus_visible.has_value())
+                element.document().request_focus_visibility_for_focused_element(*options.focus_visible);
             return;
+        }
     }
 
     // 2. Run the focusing steps for this.
@@ -98,9 +103,11 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::focus(Bindings::FocusOptions const& 
     //    "center".
     // NB: The scroll into view of step 4 is performed by the focus update steps, which scroll the newly focused
     //     element into  view for every way of focusing it.
-    run_focusing_steps(&element, nullptr, FocusTrigger::Script, options.prevent_scroll ? ScrollIntoView::No : ScrollIntoView::Yes);
-
-    // FIXME: 3. If options["focusVisible"] is true, or does not exist but in an implementation-defined way the user agent determines it would be best to do so, then indicate focus.
+    // 3. If options["focusVisible"] is true, or does not exist but in an implementation-defined way the user agent
+    //    determines it would be best to do so, then indicate focus.
+    // NB: The focusing steps record the option, and Element::should_indicate_focus() answers with it while the element
+    //     stays focused.
+    run_focusing_steps(&element, nullptr, FocusTrigger::Script, options.prevent_scroll ? ScrollIntoView::No : ScrollIntoView::Yes, options.focus_visible);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
@@ -158,11 +165,11 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::inserted()
 
     // 1. Let CSP list be element's shadow-including root's policy container's CSP list.
     // NB: A browsing-context connected element's shadow-including root is its node document.
-    auto csp_list = element.document().policy_container()->csp_list;
+    auto const& csp_list = element.document().policy_container()->csp_list;
 
     // 2. If CSP list contains a header-delivered Content Security Policy, and element has a
     //    nonce content attribute whose value is not the empty string, then:
-    if (csp_list->contains_header_delivered_policy() && element.has_attribute(HTML::AttributeNames::nonce)) {
+    if (csp_list.contains_header_delivered_policy() && element.has_attribute(HTML::AttributeNames::nonce)) {
         // 2.1. Let nonce be element's [[CryptographicNonce]].
         auto nonce = this->nonce();
 
@@ -174,7 +181,9 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::inserted()
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#the-autofocus-attribute
-    if (element.has_attribute(HTML::AttributeNames::autofocus)) {
+    // OPTIMIZATION: The subtree attribute name filter rules out the attribute for most elements without a lookup.
+    auto might_have_autofocus = (element.subtree_name_filter() & DOM::Element::name_filter_bit(HTML::AttributeNames::autofocus)) != 0;
+    if (might_have_autofocus && element.has_attribute(HTML::AttributeNames::autofocus)) {
         // When an element with the autofocus attribute specified is inserted into a document, run the following steps:
 
         // FIXME: 1. If the user has indicated (for example, by starting to type in a form control) that they do not
@@ -195,6 +204,13 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::inserted()
         // 5. If the allow focus steps given target return false, then return.
         if (!target.allow_focus())
             return;
+
+        // AD-HOC: Match Chromium, Firefox, and WebKit by excluding autofocus candidates with a cross-origin ancestor.
+        for (auto ancestor = target.navigable()->parent(); ancestor; ancestor = ancestor->parent()) {
+            auto ancestor_origin = ancestor->active_document_origin();
+            if (!ancestor_origin.has_value() || !target.origin().is_same_origin(*ancestor_origin))
+                return;
+        }
 
         // 6. Let topDocument be target's node navigable's top-level traversable's active document.
         // FIXME: The candidates of a top-level document hosted by another process are kept there. Only an element same

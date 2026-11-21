@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibMediaCodecs/Limits.h>
+
 #include "Streamer.h"
 
 namespace Media::ISOBMFF {
@@ -27,6 +29,8 @@ DecoderErrorOr<double> Streamer::read_fixed_point_16_16()
 
 DecoderErrorOr<String> Streamer::read_null_terminated_string(size_t maximum_size)
 {
+    if (maximum_size > MAX_METADATA_STRING_SIZE)
+        return DecoderError::corrupted("String is too large"sv);
     auto bytes = TRY(read_bytes(maximum_size));
     auto length = maximum_size;
     for (size_t i = 0; i < maximum_size; i++) {
@@ -35,10 +39,8 @@ DecoderErrorOr<String> Streamer::read_null_terminated_string(size_t maximum_size
             break;
         }
     }
-    auto string = String::from_utf8(StringView { bytes.data(), length });
-    if (string.is_error())
-        return DecoderError::format(DecoderErrorCategory::Invalid, "String is not valid UTF-8");
-    return string.release_value();
+    // Files in the wild hold names in legacy encodings, and a name is only metadata, so it must not fail the file.
+    return String::from_utf8_with_replacement_character(StringView { bytes.data(), length });
 }
 
 DecoderErrorOr<FixedArray<u8>> Streamer::read_bytes(size_t size)

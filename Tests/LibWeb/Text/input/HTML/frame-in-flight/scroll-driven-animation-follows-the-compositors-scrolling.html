@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="frame-in-flight.js"></script>
+<style>
+    @keyframes shrink {
+        from { height: 50px; }
+        to { height: 10px; }
+    }
+    #header {
+        height: 50px;
+        animation: shrink linear both;
+        animation-timeline: scroll(root);
+    }
+    #spacer {
+        height: 2000px;
+    }
+</style>
+<div id="header"></div>
+<div id="spacer"></div>
+<script>
+    // While a task runs, the render clock samples a scroll-driven animation where the compositor has scrolled the page
+    // to, past where the animation has an event a listener hears, which the main thread sends.
+    asyncTest(async done => {
+        header.addEventListener("animationend", () => {});
+        let maxScroll;
+        const result = await whileLaneAnimates(() => {
+            maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+            return header.getAnimations()[0];
+        }, frameTime => {
+            internals.injectClockTick(frameTime + 16, 1000);
+            const laneScrolled = internals.clockLaneState(document);
+            internals.injectClockTick(frameTime + 32, maxScroll);
+            const laneAtTheEnd = internals.clockLaneState(document);
+            return {
+                laneScrolled,
+                laneAtTheEnd,
+                presentedBy: internals.lastFramePresentedBy(document),
+                presented: internals.presentedBorderBox(header),
+            };
+        });
+        println(`render clock after a frame scrolled down: ${result.laneScrolled}`);
+        println(`render clock after a frame scrolled to where the animation ends: ${result.laneAtTheEnd}`);
+        println(`last frame presented by: ${result.presentedBy}`);
+        println(`the presented height is the animation's end: ${result.presented !== null && Math.abs(result.presented.height - 10) < 0.02}`);
+        println(`the page holds at the top: ${window.scrollY === 0 && header.getBoundingClientRect().height === 50}`);
+        done();
+    });
+</script>

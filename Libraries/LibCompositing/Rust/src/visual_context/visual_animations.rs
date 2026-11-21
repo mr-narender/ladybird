@@ -6,11 +6,13 @@
 
 //! The compositor animations a visual context tree carries, and the trees derived by sampling them.
 
-use std::rc::Rc;
-
-use super::{EffectNodeData, EffectNodeIndex, EffectsData, SpatialData, SpatialNodeIndex, VisualContextTree};
+use super::{
+    ClipBehavior, ClipNodeIndex, ContextRef, EffectNodeData, EffectNodeIndex, EffectsData, SpatialData,
+    SpatialNodeIndex, VisualContextTree, WorldTransforms,
+};
 use crate::host::{FfiVisualAnimationSummary, FfiVisualAnimationTargetKind, FfiVisualAnimationTransformOperationKind};
 use crate::visual_animation::{VisualAnimation, VisualAnimationSample, VisualAnimationValue};
+use libgfx_rust::FloatPoint;
 
 /// What a frame scheduler needs to bound the content the running animations move: the nodes of the
 /// animations whose swept area is bounded, sorted by how the bound is computed, and whether every
@@ -35,13 +37,17 @@ impl VisualContextTree {
     }
 
     pub fn set_visual_animations(&mut self, animations: Vec<VisualAnimation>) {
-        self.visual_animations = Rc::from(animations);
+        self.visual_animations = std::sync::Arc::from(animations);
     }
 
     pub fn clear_visual_animations(&mut self) {
         if self.has_visual_animations() {
-            self.visual_animations = Rc::from(Vec::new());
+            self.visual_animations = std::sync::Arc::from(Vec::new());
         }
+    }
+
+    pub fn shared_visual_animations(&self) -> std::sync::Arc<[VisualAnimation]> {
+        self.visual_animations.clone()
     }
 
     fn effects_mut(&mut self, node_index: u32) -> Option<&mut EffectsData> {
@@ -101,6 +107,36 @@ impl VisualContextTree {
             .any(|animation| animation.is_active_at(sample_time_ns))
     }
 
+    /// Whether `screen_point` lies in the bounds of a node that a transform animation running at `sample_time_ns`
+    /// moves, through the values the nodes hold: those of this tree sampled at that time, where a frame shows it.
+    pub fn running_transform_animation_covers_point(
+        &self,
+        sample_time_ns: i64,
+        screen_point: FloatPoint,
+        scroll_offsets: &[FloatPoint],
+    ) -> bool {
+        let world = std::cell::OnceCell::new();
+        self.visual_animations.iter().any(|animation| {
+            animation.target_kind == FfiVisualAnimationTargetKind::Transform
+                && animation.is_active_at(sample_time_ns)
+                && animation.node_indices.iter().any(|&node_index| {
+                    let Some(SpatialData::Transform(transform)) =
+                        self.spatial_nodes.get(node_index as usize).map(|node| &node.data)
+                    else {
+                        return false;
+                    };
+                    let context = ContextRef {
+                        spatial: SpatialNodeIndex(node_index),
+                        clip: ClipNodeIndex::NONE,
+                        effect: EffectNodeIndex::NONE,
+                    };
+                    let world = world.get_or_init(|| WorldTransforms::new(self, scroll_offsets, None));
+                    self.transform_point_for_hit_test(world, context, screen_point, ClipBehavior::Ignore)
+                        .is_some_and(|local_point| transform.bounds.contains_point(local_point))
+                })
+        })
+    }
+
     pub fn visual_animations_target_valid_nodes(&self) -> bool {
         self.visual_animations
             .iter()
@@ -147,7 +183,7 @@ impl VisualContextTree {
             all_running_animations_are_bounded: true,
         };
         for animation in self.visual_animations.iter() {
-            if animation.iteration_count.is_finite() {
+            if animation.is_finite() {
                 if animation.has_finished_at(sample_time_ns) {
                     extents.has_finished_animation = true;
                     continue;
@@ -190,6 +226,7 @@ fn only_rotates_in_the_plane(keyframe: &crate::visual_animation::VisualAnimation
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::animation_timing::{AnimationEffectTiming, TimeValue};
     use crate::easing::Easing;
     use crate::visual_animation::{VisualAnimationKeyframe, VisualAnimationTransformOperation};
     use crate::visual_context::{
@@ -206,11 +243,13 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: libgfx_rust::FloatRect::default(),
         }
     }
 
     fn opacity_effect() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode: CompositingAndBlendingOperator::Normal,
             filter: None,
@@ -249,14 +288,20 @@ mod tests {
             VisualAnimation {
                 target_kind: FfiVisualAnimationTargetKind::Transform,
                 node_indices: vec![spatial.0],
-                iteration_duration_ms: 1000.0,
+                timing: AnimationEffectTiming {
+                    iteration_duration: TimeValue::milliseconds(1000.0),
+                    ..VisualAnimation::default().timing
+                },
                 keyframes: vec![keyframe(0.0, translate_x(0.0)), keyframe(1.0, translate_x(20.0))],
                 ..VisualAnimation::default()
             },
             VisualAnimation {
                 target_kind: FfiVisualAnimationTargetKind::Opacity,
                 node_indices: vec![effect.0],
-                iteration_duration_ms: 1000.0,
+                timing: AnimationEffectTiming {
+                    iteration_duration: TimeValue::milliseconds(1000.0),
+                    ..VisualAnimation::default().timing
+                },
                 keyframes: vec![
                     keyframe(0.0, VisualAnimationValue::Opacity(0.0)),
                     keyframe(1.0, VisualAnimationValue::Opacity(1.0)),
@@ -296,8 +341,11 @@ mod tests {
         tree.set_visual_animations(vec![VisualAnimation {
             target_kind: FfiVisualAnimationTargetKind::Transform,
             node_indices: vec![spatial.0],
-            start_delay_ms: 1000.0,
-            iteration_duration_ms: 1000.0,
+            timing: AnimationEffectTiming {
+                start_delay: TimeValue::milliseconds(1000.0),
+                iteration_duration: TimeValue::milliseconds(1000.0),
+                ..VisualAnimation::default().timing
+            },
             keyframes: vec![keyframe(0.0, translate_x(0.0)), keyframe(1.0, translate_x(20.0))],
             ..VisualAnimation::default()
         }]);
@@ -309,6 +357,42 @@ mod tests {
             panic!("not a transform node");
         };
         assert_eq!(sampled_transform.matrix, translation_matrix(5.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn a_running_transform_animation_covers_a_point_in_the_bounds_it_moves() {
+        let mut tree = VisualContextTree::create(transform_data(FloatMatrix4x4::identity()));
+        // A box from x 150 to 1150 slides 150 pixels a second to the left: it covers x 50 from 2/3 s to 7 1/3 s in.
+        let spatial = tree.append_spatial(
+            SpatialData::Transform(TransformData {
+                bounds: libgfx_rust::FloatRect::new(150.0, 0.0, 1000.0, 100.0),
+                ..transform_data(FloatMatrix4x4::identity())
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        tree.set_visual_animations(vec![VisualAnimation {
+            target_kind: FfiVisualAnimationTargetKind::Transform,
+            node_indices: vec![spatial.0],
+            timing: AnimationEffectTiming {
+                iteration_duration: TimeValue::milliseconds(10000.0),
+                iteration_count: 1.0,
+                ..VisualAnimation::default().timing
+            },
+            keyframes: vec![keyframe(0.0, translate_x(0.0)), keyframe(1.0, translate_x(-1500.0))],
+            ..VisualAnimation::default()
+        }]);
+        let point = FloatPoint { x: 50.0, y: 50.0 };
+        let covers_at = |time_ns: i64| {
+            tree.with_visual_animation_samples(time_ns)
+                .running_transform_animation_covers_point(time_ns, point, &[])
+        };
+        assert!(!covers_at(milliseconds(0)));
+        assert!(covers_at(milliseconds(2000)));
+        assert!(!covers_at(milliseconds(9000)));
+        // The animation over, the node holds the value the main thread published, which has the box beside the point.
+        assert!(!covers_at(milliseconds(11000)));
+        // The tree answers for the values it holds: unsampled, the box is where the main thread published it.
+        assert!(!tree.running_transform_animation_covers_point(milliseconds(2000), point, &[]));
     }
 
     #[test]
@@ -327,7 +411,10 @@ mod tests {
             node_indices: vec![spatial.0],
             monotonic_time_at_anchor_ns: 10,
             local_time_at_anchor_ms: 20.0,
-            iteration_duration_ms: 1000.0,
+            timing: AnimationEffectTiming {
+                iteration_duration: TimeValue::milliseconds(1000.0),
+                ..VisualAnimation::default().timing
+            },
             keyframes: vec![keyframe(0.0, translate_x(0.0)), keyframe(1.0, translate_x(20.0))],
             ..VisualAnimation::default()
         };
@@ -376,15 +463,21 @@ mod tests {
         let rotation = VisualAnimation {
             target_kind: FfiVisualAnimationTargetKind::Transform,
             node_indices: vec![rotated.0],
-            iteration_duration_ms: 1000.0,
-            iteration_count: 1.0,
+            timing: AnimationEffectTiming {
+                iteration_duration: TimeValue::milliseconds(1000.0),
+                iteration_count: 1.0,
+                ..VisualAnimation::default().timing
+            },
             keyframes: vec![keyframe(0.0, rotate(0.0)), keyframe(1.0, rotate(1.0))],
             ..VisualAnimation::default()
         };
         let opacity = VisualAnimation {
             target_kind: FfiVisualAnimationTargetKind::Opacity,
             node_indices: vec![effect.0],
-            iteration_duration_ms: 1000.0,
+            timing: AnimationEffectTiming {
+                iteration_duration: TimeValue::milliseconds(1000.0),
+                ..VisualAnimation::default().timing
+            },
             keyframes: vec![
                 keyframe(0.0, VisualAnimationValue::Opacity(0.0)),
                 keyframe(1.0, VisualAnimationValue::Opacity(1.0)),

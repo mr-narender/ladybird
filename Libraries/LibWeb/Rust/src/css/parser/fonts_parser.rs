@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#![allow(clippy::arc_with_non_send_sync)]
-
+use super::arbitrary_substitution::contains_arbitrary_substitution_function;
 use super::component_value::ComponentValue;
 use super::token_stream::TokenStream;
 use super::value_parser::{
@@ -15,20 +14,20 @@ use super::value_parser::{
 use crate::css::css_enums::{
     font_tech, keyword, keyword_from_ascii_case_insensitive, keyword_to_common_lig_value,
     keyword_to_contextual_alt_value, keyword_to_discretionary_lig_value, keyword_to_east_asian_variant,
-    keyword_to_east_asian_width, keyword_to_font_style_keyword, keyword_to_font_tech, keyword_to_generic_font_family,
-    keyword_to_historical_lig_value, keyword_to_numeric_figure_value, keyword_to_numeric_fraction_value,
-    keyword_to_numeric_spacing_value,
+    keyword_to_east_asian_width, keyword_to_font_size_adjust_metric, keyword_to_font_style_keyword,
+    keyword_to_font_tech, keyword_to_generic_font_family, keyword_to_historical_lig_value,
+    keyword_to_numeric_figure_value, keyword_to_numeric_fraction_value, keyword_to_numeric_spacing_value,
 };
 use crate::css::css_string::CssString;
 use crate::css::property_metadata::property_id;
+use crate::css::style_value::{FontSourcePayload, FunctionPayload, OpenTypeTaggedPayload, StyleValueBox, UrlPayload};
 use crate::css::style_value::{
     RetainedByteList, RetainedRequestUrlModifierList, RetainedString, RetainedStyleValueData,
     RetainedStyleValueDataList, StyleValueData,
 };
-use std::sync::Arc;
+use crate::css::style_value_arc::StyleValueArc;
 
-// NB: Mirrors Libraries/LibGfx/Font/FontSupport.cpp and the format-name mapping that this series
-//     removed from Libraries/LibWeb/CSS/FontFace.cpp.
+// NB: Mirrors Libraries/LibGfx/Font/FontSupport.cpp.
 const FONT_FORMAT_SUPPORT: &[(&str, bool)] = &[
     ("embedded-opentype", false),
     ("opentype", true),
@@ -39,8 +38,8 @@ const FONT_FORMAT_SUPPORT: &[(&str, bool)] = &[
     ("woff2", true),
 ];
 
-// NB: Mirrors Libraries/LibGfx/Font/FontSupport.cpp:36. Its HB_HAS_GRAPHITE branch is false because
-//     vcpkg.json does not enable HarfBuzz's optional Graphite support on any supported platform.
+// NB: HarfBuzz reads every font technology but incremental transfer, and Graphite, which vcpkg.json
+//     does not enable on any supported platform.
 const FONT_TECH_SUPPORT: [bool; font_tech::NAMES.len()] = [
     true,  // avar2
     true,  // color-cbdt
@@ -117,6 +116,34 @@ fn parse_family_name(_context: &ParseContext, values: &[ComponentValue]) -> Opti
     })
 }
 
+// INTEROP: Chrome and Firefox serialize family names as unquoted identifier sequences when possible.
+//          https://github.com/w3c/csswg-drafts/issues/5846
+fn font_family_name_can_be_unquoted(name: &[u16]) -> bool {
+    if !is_valid_custom_ident(name, &[]) {
+        return false;
+    }
+    let first_word = name.split(|&unit| unit == u16::from(b' ')).next().unwrap();
+    if keyword_from_ascii_case_insensitive(first_word)
+        .and_then(keyword_to_generic_font_family)
+        .is_some()
+    {
+        return false;
+    }
+    let is_ident_start = |unit| matches!(unit, 0x41..=0x5a | 0x61..=0x7a | 0x5f | 0x80..=0xffff);
+    name.split(|&unit| unit == u16::from(b' ')).all(|word| {
+        let mut units = word.iter().copied();
+        let Some(first) = units.next() else { return false };
+        let valid_start = if first == u16::from(b'-') {
+            units
+                .next()
+                .is_some_and(|unit| unit == u16::from(b'-') || is_ident_start(unit))
+        } else {
+            is_ident_start(first)
+        };
+        valid_start && units.all(|unit| is_ident_start(unit) || matches!(unit, 0x30..=0x39 | 0x2d))
+    })
+}
+
 fn parse_font_family(context: &ParseContext, values: &[ComponentValue]) -> Option<StyleValueData> {
     let families = values
         .split(ComponentValue::is_comma)
@@ -130,7 +157,19 @@ fn parse_font_family(context: &ParseContext, values: &[ComponentValue]) -> Optio
             {
                 return (single.len() == 1).then_some(StyleValueData::Keyword { keyword });
             }
-            parse_family_name(context, family)
+            // https://drafts.csswg.org/css-fonts-4/#family-name-syntax
+            // If a sequence of identifiers is given as a <font-family-name>, the computed value is the name converted
+            // to a string by joining all the identifiers in the sequence by single spaces.
+            let string = match parse_family_name(context, family)? {
+                StyleValueData::String { string, .. } => string,
+                StyleValueData::CustomIdent { custom_ident } => custom_ident,
+                _ => unreachable!("a family name is a string or an identifier sequence"),
+            };
+            Some(StyleValueData::String {
+                serialize_without_quotes: font_family_name_can_be_unquoted(string.units()),
+                is_valid_animation_name_custom_ident: is_valid_custom_ident(string.units(), &["none"]),
+                string,
+            })
         })
         .collect::<Option<Vec<_>>>()?;
     (!families.is_empty()).then(|| value_list(families, 1, true))
@@ -159,6 +198,53 @@ fn parse_font_style(context: &ParseContext, values: &[ComponentValue]) -> Option
     Some(StyleValueData::FontStyle {
         font_style,
         angle_value: angle_value.map_or_else(RetainedStyleValueData::none, retained),
+    })
+}
+
+// https://drafts.csswg.org/css-fonts-5/#font-size-adjust-prop
+// none | [ ex-height | cap-height | ch-width | ic-width | ic-height ]? [ from-font | <number [0,∞]> ]
+// NB: Anything but none is a tuple of the metric keyword, absent for the default ex-height, and the value: a number,
+//     or the from-font keyword until computation replaces it with the first available font's own metric.
+fn parse_font_size_adjust(context: &ParseContext, values: &[ComponentValue]) -> Option<StyleValueData> {
+    let mut tokens = TokenStream::new(values);
+    tokens.discard_whitespace();
+    let mut metric = None;
+    if let Some((keyword, keyword_value)) = keyword_value(tokens.next_token()) {
+        if keyword == keyword::NONE {
+            tokens.discard_a_token();
+            tokens.discard_whitespace();
+            return (!tokens.has_next_token()).then_some(keyword_value);
+        }
+        if keyword_to_font_size_adjust_metric(keyword).is_some() {
+            tokens.discard_a_token();
+            // ex-height is the default metric, which serializes as nothing.
+            if keyword != keyword::EX_HEIGHT {
+                metric = Some(keyword_value);
+            }
+        }
+    }
+    tokens.discard_whitespace();
+    let value = match keyword_value(tokens.next_token()) {
+        Some((keyword::FROM_FONT, keyword_value)) => {
+            tokens.discard_a_token();
+            keyword_value
+        }
+        _ => parse_number_from_stream(
+            context,
+            property_id::FONT_SIZE_ADJUST,
+            &mut tokens,
+            NumericRange::NON_NEGATIVE,
+        )?,
+    };
+    tokens.discard_whitespace();
+    if tokens.has_next_token() {
+        return None;
+    }
+    Some(StyleValueData::Tuple {
+        values: RetainedStyleValueDataList::from_retained_values(vec![
+            metric.map_or_else(RetainedStyleValueData::none, retained),
+            retained(value),
+        ]),
     })
 }
 
@@ -286,26 +372,13 @@ fn parse_font_variant_alternates(context: &ParseContext, values: &[ComponentValu
             return None;
         }
         let function_name = canonical_name.encode_utf16().collect::<Vec<_>>();
-        parsed[slot] = Some(StyleValueData::Function {
+        parsed[slot] = Some(StyleValueData::Function(StyleValueBox::new(FunctionPayload {
             name: CssString::from_utf16(&function_name),
             value: retained(value_list(names, 1, true)),
-        });
+        })));
     }
     let parsed = parsed.into_iter().flatten().collect::<Vec<_>>();
     (!parsed.is_empty()).then(|| value_list(parsed, 0, true))
-}
-
-fn contains_substitution(values: &[ComponentValue]) -> bool {
-    values.iter().any(|value| {
-        let Some((name, arguments)) = value.function() else {
-            return false;
-        };
-        (name.len() >= 2 && name[0] == u16::from(b'-') && name[1] == u16::from(b'-'))
-            || ["attr", "env", "if", "inherit", "var"]
-                .iter()
-                .any(|function| equals_ascii_case_insensitive(name, function.as_bytes()))
-            || contains_substitution(arguments)
-    })
 }
 
 fn parse_opentype_tag(_context: &ParseContext, tokens: &mut TokenStream<'_>) -> Option<([u16; 4], StyleValueData)> {
@@ -320,12 +393,12 @@ fn parse_opentype_tag(_context: &ParseContext, tokens: &mut TokenStream<'_>) -> 
 
 fn open_type_tagged(mode: u8, tag: [u16; 4], value: StyleValueData) -> StyleValueData {
     let packed_tag = u32::from(tag[0]) << 24 | u32::from(tag[1]) << 16 | u32::from(tag[2]) << 8 | u32::from(tag[3]);
-    StyleValueData::OpenTypeTagged {
+    StyleValueData::OpenTypeTagged(StyleValueBox::new(OpenTypeTaggedPayload {
         mode,
         tag_name: CssString::from_utf16(&tag),
         packed_tag,
         value: retained(value),
-    }
+    }))
 }
 
 fn parse_font_feature_settings(context: &ParseContext, values: &[ComponentValue]) -> Option<StyleValueData> {
@@ -477,27 +550,27 @@ fn parse_font_source(context: &ParseContext, values: &[ComponentValue]) -> Optio
         if tokens.has_next_token() {
             return None;
         }
-        return Some(StyleValueData::FontSource {
+        return Some(StyleValueData::FontSource(StyleValueBox::new(FontSourcePayload {
             is_local: true,
             local_name: retained(local_name),
             url: RetainedString::from_ascii(String::new()),
             url_type: 0,
-            url_modifiers: RetainedRequestUrlModifierList::from_retained_modifiers(Vec::new()),
+            url_modifiers: RetainedRequestUrlModifierList::from_vec(Vec::new()),
             has_format: false,
             format: crate::css::css_string::CssString::none(),
-            tech: RetainedByteList::from_bytes(Vec::new()),
-        });
+            tech: RetainedByteList::from_vec(Vec::new()),
+        })));
     }
 
     let url = super::value_parser::parse_url_value(context, tokens.consume_a_token())?;
-    let StyleValueData::Url {
+    let StyleValueData::Url(url_payload) = url else {
+        unreachable!()
+    };
+    let UrlPayload {
         url,
         url_type,
         modifiers: url_modifiers,
-    } = url
-    else {
-        unreachable!()
-    };
+    } = url_payload.into_inner();
     tokens.discard_whitespace();
     let mut tech = Vec::new();
     let mut format = None;
@@ -518,7 +591,7 @@ fn parse_font_source(context: &ParseContext, values: &[ComponentValue]) -> Optio
     if tokens.has_next_token() {
         return None;
     }
-    Some(StyleValueData::FontSource {
+    Some(StyleValueData::FontSource(StyleValueBox::new(FontSourcePayload {
         is_local: false,
         local_name: RetainedStyleValueData::none(),
         url,
@@ -529,8 +602,8 @@ fn parse_font_source(context: &ParseContext, values: &[ComponentValue]) -> Optio
             Some(format) => CssString::from_utf16(&format),
             None => crate::css::css_string::CssString::none(),
         },
-        tech: RetainedByteList::from_bytes(tech),
-    })
+        tech: RetainedByteList::from_vec(tech),
+    })))
 }
 
 fn parse_unicode_range_text(text: &[u16]) -> Option<StyleValueData> {
@@ -609,7 +682,7 @@ pub(crate) fn parse_font_descriptor(
     kind: FontDescriptorKind,
     values: &[ComponentValue],
 ) -> ParseOutcome {
-    if contains_substitution(values) {
+    if contains_arbitrary_substitution_function(values) {
         return ParseOutcome::NotHandled;
     }
     let parsed = match kind {
@@ -623,7 +696,9 @@ pub(crate) fn parse_font_descriptor(
         }
         FontDescriptorKind::UnicodeRangeList => parse_unicode_ranges(values),
     };
-    parsed.map_or(ParseOutcome::Invalid, |parsed| ParseOutcome::Parsed(Arc::new(parsed)))
+    parsed.map_or(ParseOutcome::Invalid, |parsed| {
+        ParseOutcome::Parsed(StyleValueArc::new(parsed))
+    })
 }
 
 pub(crate) fn parse_font_property(context: &ParseContext, property: u16, values: &[ComponentValue]) -> ParseOutcome {
@@ -631,6 +706,7 @@ pub(crate) fn parse_font_property(context: &ParseContext, property: u16, values:
         property,
         property_id::FONT_FAMILY
             | property_id::FONT_STYLE
+            | property_id::FONT_SIZE_ADJUST
             | property_id::FONT_FEATURE_SETTINGS
             | property_id::FONT_VARIATION_SETTINGS
             | property_id::FONT_VARIANT_ALTERNATES
@@ -640,7 +716,7 @@ pub(crate) fn parse_font_property(context: &ParseContext, property: u16, values:
     ) {
         return ParseOutcome::NotHandled;
     }
-    if contains_substitution(values) {
+    if contains_arbitrary_substitution_function(values) {
         return ParseOutcome::NotHandled;
     }
     let single_keyword = values.iter().filter(|value| !value.is_whitespace()).collect::<Vec<_>>();
@@ -658,11 +734,12 @@ pub(crate) fn parse_font_property(context: &ParseContext, property: u16, values:
             ))
             || (keyword == keyword::NONE && property == property_id::FONT_VARIANT_LIGATURES))
     {
-        return ParseOutcome::Parsed(Arc::new(StyleValueData::Keyword { keyword }));
+        return ParseOutcome::Parsed(StyleValueArc::new(StyleValueData::Keyword { keyword }));
     }
     let parsed = match property {
         property_id::FONT_FAMILY => parse_font_family(context, values),
         property_id::FONT_STYLE => parse_font_style(context, values),
+        property_id::FONT_SIZE_ADJUST => parse_font_size_adjust(context, values),
         property_id::FONT_FEATURE_SETTINGS => parse_font_feature_settings(context, values),
         property_id::FONT_VARIATION_SETTINGS => parse_font_variation_settings(context, values),
         property_id::FONT_VARIANT_ALTERNATES => parse_font_variant_alternates(context, values),
@@ -671,7 +748,9 @@ pub(crate) fn parse_font_property(context: &ParseContext, property: u16, values:
         property_id::FONT_VARIANT_NUMERIC => parse_font_variant_numeric(values),
         _ => unreachable!(),
     };
-    parsed.map_or(ParseOutcome::Invalid, |parsed| ParseOutcome::Parsed(Arc::new(parsed)))
+    parsed.map_or(ParseOutcome::Invalid, |parsed| {
+        ParseOutcome::Parsed(StyleValueArc::new(parsed))
+    })
 }
 
 #[cfg(test)]
@@ -686,23 +765,8 @@ mod tests {
     use crate::css::parser::value_parser::{ParseContext, ParseOutcome};
     use crate::css::property_metadata::property_id;
 
-    fn context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    fn context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     #[test]

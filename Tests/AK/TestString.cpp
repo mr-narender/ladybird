@@ -186,9 +186,8 @@ TEST_CASE(invalid_utf8)
 
 TEST_CASE(with_replacement_character)
 {
-    auto string1 = String::from_utf8_with_replacement_character("long string \xf4\x8f\xbf\xc0"sv, String::WithBOMHandling::No); // U+110000
-    Array<u8, 24> string1_expected { 0x6c, 0x6f, 0x6e, 0x67, 0x20, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x20, 0xef, 0xbf, 0xbd, 0xef, 0xbf, 0xbd, 0xef, 0xbf, 0xbd, 0xef, 0xbf, 0xbd };
-    EXPECT_EQ(string1.bytes(), string1_expected);
+    auto string1 = String::from_utf8_with_replacement_character("long string \xf4\x8f\xbf\xc0"sv, String::WithBOMHandling::No);
+    EXPECT_EQ(string1, "long string \ufffd\ufffd"sv);
 
     auto string3 = String::from_utf8_with_replacement_character("A valid string!"sv, String::WithBOMHandling::No);
     EXPECT_EQ(string3, "A valid string!"sv);
@@ -203,7 +202,43 @@ TEST_CASE(with_replacement_character)
     EXPECT_EQ(string6, "\xEF\xBB\xBFWHF!"sv);
 
     auto string7 = String::from_utf8_with_replacement_character("\xED\xA0\x80WHF!"sv); // U+D800
-    EXPECT_EQ(string7, "\ufffdWHF!"sv);
+    EXPECT_EQ(string7, "\ufffd\ufffd\ufffdWHF!"sv);
+}
+
+TEST_CASE(with_replacement_character_matches_utf8_decoder)
+{
+    auto decode = [](StringView input) { return String::from_utf8_with_replacement_character(input, String::WithBOMHandling::No); };
+
+    EXPECT_EQ(decode("\xE0\x80\x80"sv), "\ufffd\ufffd\ufffd"sv);
+    EXPECT_EQ(decode("\xC0\x80"sv), "\ufffd\ufffd"sv);
+    EXPECT_EQ(decode("\xF0\x9F\x98"sv), "\ufffd"sv);
+    EXPECT_EQ(decode("\xF0\x9F\x98"
+                     "A"sv),
+        "\ufffdA"sv);
+    EXPECT_EQ(decode("\xF4\x90\x80\x80"sv), "\ufffd\ufffd\ufffd\ufffd"sv);
+    EXPECT_EQ(decode("\xFF"sv), "\ufffd"sv);
+    EXPECT_EQ(decode("a\x80"
+                     "b"sv),
+        "a\ufffdb"sv);
+    EXPECT_EQ(decode("\xFF\xF0\x9F\x98\x80"sv), "\ufffd\U0001F600"sv);
+}
+
+TEST_CASE(from_wtf8_with_replacement_character)
+{
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("A valid string!"sv), "A valid string!"sv);
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("\xF0\x9F\x98\x80"sv), "\U0001F600"sv);
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("\xEF\xBB\xBFWHF!"sv), "\ufeffWHF!"sv);
+
+    // Each encoded surrogate is a single code point.
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("\xED\xA0\x80-\xED\xB0\x80"sv), "\ufffd-\ufffd"sv);
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("\xED\xA0\xED\xBF\xBF"sv), "\ufffd\ufffd"sv);
+
+    // Bytes that are not WTF-8 are replaced as UTF-8's decoder does.
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("\xC0\x80"sv), "\ufffd\ufffd"sv);
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("\xF0\x9F\x98"
+                                                           "A"sv),
+        "\ufffdA"sv);
+    EXPECT_EQ(String::from_wtf8_with_replacement_character("\xF4\x90\x80\x80"sv), "\ufffd\ufffd\ufffd\ufffd"sv);
 }
 
 TEST_CASE(from_utf16_with_replacement_character)
@@ -805,13 +840,6 @@ TEST_CASE(to_titlecase_special_casing_i)
 
     result = MUST("i"_string.to_titlecase("tr"sv));
     EXPECT_EQ(result, "\u0130"sv);
-}
-
-BENCHMARK_CASE(casefold)
-{
-    for (size_t i = 0; i < 50'000; ++i) {
-        __test_to_casefold();
-    }
 }
 
 TEST_CASE(equals_ignoring_case)
@@ -1642,46 +1670,4 @@ TEST_CASE(roman_numerals)
 
     auto four_thousand = String::roman_number_from(4000, String::Case::Upper);
     EXPECT_EQ(four_thousand, "4000"sv);
-}
-
-BENCHMARK_CASE(string_number_u16)
-{
-    for (size_t i = 0; i < 10'000'000; ++i) {
-        (void)String::number(static_cast<u16>(12345));
-    }
-}
-
-BENCHMARK_CASE(string_number_u32)
-{
-    for (size_t i = 0; i < 10'000'000; ++i) {
-        (void)String::number(static_cast<u32>(123456789));
-    }
-}
-
-BENCHMARK_CASE(string_number_u64)
-{
-    for (size_t i = 0; i < 10'000'000; ++i) {
-        (void)String::number(static_cast<u64>(123456789));
-    }
-}
-
-BENCHMARK_CASE(string_number_i16)
-{
-    for (size_t i = 0; i < 10'000'000; ++i) {
-        (void)String::number(static_cast<i16>(-12345));
-    }
-}
-
-BENCHMARK_CASE(string_number_i32)
-{
-    for (size_t i = 0; i < 10'000'000; ++i) {
-        (void)String::number(static_cast<i32>(-123456789));
-    }
-}
-
-BENCHMARK_CASE(string_number_i64)
-{
-    for (size_t i = 0; i < 10'000'000; ++i) {
-        (void)String::number(static_cast<i64>(-123456789));
-    }
 }

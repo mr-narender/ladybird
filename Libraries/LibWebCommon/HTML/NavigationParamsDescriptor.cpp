@@ -7,6 +7,7 @@
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibWebCommon/HTML/NavigationParamsDescriptor.h>
+#include <LibWebCommon/HTML/NavigationResponseCodecs.h>
 
 namespace IPC {
 
@@ -66,6 +67,9 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::NavigationRequestDescriptor co
     TRY(encoder.encode(request.referrer_policy));
     TRY(encoder.encode(request.policy_container));
     TRY(encoder.encode(request.redirect_count));
+    TRY(encoder.encode(request.text_directive_user_activation));
+    TRY(encoder.encode(request.browsing_context_group_has_multiple_contexts));
+    TRY(encoder.encode(request.cache_mode));
     return {};
 }
 
@@ -80,6 +84,9 @@ ErrorOr<Web::HTML::NavigationRequestDescriptor> decode(Decoder& decoder)
         .referrer_policy = TRY(decoder.decode<Web::ReferrerPolicy::ReferrerPolicy>()),
         .policy_container = TRY(decoder.decode<Web::HTML::SerializedPolicyContainer>()),
         .redirect_count = TRY(decoder.decode<u8>()),
+        .text_directive_user_activation = TRY(decoder.decode<bool>()),
+        .browsing_context_group_has_multiple_contexts = TRY(decoder.decode<bool>()),
+        .cache_mode = TRY(decoder.decode<HTTP::CacheMode>()),
     };
 }
 
@@ -88,6 +95,7 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::NavigationResponseBodyHandle c
 {
     TRY(encoder.encode(handle.request_server_client_id));
     TRY(encoder.encode(handle.request_server_request_id));
+    TRY(encoder.encode(handle.request_server_top_level_site));
     return {};
 }
 
@@ -97,37 +105,7 @@ ErrorOr<Web::HTML::NavigationResponseBodyHandle> decode(Decoder& decoder)
     return Web::HTML::NavigationResponseBodyHandle {
         .request_server_client_id = TRY(decoder.decode<int>()),
         .request_server_request_id = TRY(decoder.decode<u64>()),
-    };
-}
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::HTML::NavigationResponseDescriptor const& response)
-{
-    TRY(encoder.encode(response.url_list));
-    TRY(encoder.encode(response.status));
-    TRY(encoder.encode(response.status_message));
-    TRY(encoder.encode(response.headers));
-    TRY(encoder.encode(response.network_error_message));
-    TRY(encoder.encode(response.timing_allow_passed));
-    TRY(encoder.encode(response.navigation_timing_allow_values_list));
-    TRY(encoder.encode(response.redirect_taint));
-    TRY(encoder.encode(response.body));
-    return {};
-}
-
-template<>
-ErrorOr<Web::HTML::NavigationResponseDescriptor> decode(Decoder& decoder)
-{
-    return Web::HTML::NavigationResponseDescriptor {
-        .url_list = TRY(decoder.decode<Vector<URL::URL>>()),
-        .status = TRY(decoder.decode<u16>()),
-        .status_message = TRY(decoder.decode<ByteString>()),
-        .headers = TRY(decoder.decode<Vector<HTTP::Header>>()),
-        .network_error_message = TRY(decoder.decode<Optional<String>>()),
-        .timing_allow_passed = TRY(decoder.decode<bool>()),
-        .navigation_timing_allow_values_list = TRY(decoder.decode<Vector<Vector<String>>>()),
-        .redirect_taint = TRY(decoder.decode<Web::Fetch::Infrastructure::RedirectTaint>()),
-        .body = TRY(decoder.decode<Web::HTML::NavigationResponseBody>()),
+        .request_server_top_level_site = TRY(decoder.decode<Optional<Utf16String>>()),
     };
 }
 
@@ -262,6 +240,10 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::NavigationParamsDescriptor con
     TRY(encoder.encode(params.about_base_url));
     TRY(encoder.encode(params.user_involvement));
     TRY(encoder.encode(params.agent_cluster_id));
+    TRY(encoder.encode(params.agent_cluster_is_origin_keyed));
+    TRY(encoder.encode(params.agent_cluster_cross_origin_isolation_mode));
+    TRY(encoder.encode(params.new_browsing_context_group_id));
+    TRY(encoder.encode(params.permissions_policy));
     return {};
 }
 
@@ -285,6 +267,10 @@ ErrorOr<Web::HTML::NavigationParamsDescriptor> decode(Decoder& decoder)
         .about_base_url = TRY(decoder.decode<Optional<URL::URL>>()),
         .user_involvement = TRY(decoder.decode<Web::HTML::UserNavigationInvolvement>()),
         .agent_cluster_id = TRY(decoder.decode<Optional<u64>>()),
+        .agent_cluster_is_origin_keyed = TRY(decoder.decode<bool>()),
+        .agent_cluster_cross_origin_isolation_mode = TRY(decoder.decode<Web::HTML::CrossOriginIsolationMode>()),
+        .new_browsing_context_group_id = TRY(decoder.decode<Optional<u64>>()),
+        .permissions_policy = TRY(decoder.decode<Optional<Web::PermissionsPolicy::PermissionsPolicy>>()),
     };
 }
 

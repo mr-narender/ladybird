@@ -1,4 +1,4 @@
-$d36729be eval-same-function.js:10:1
+$d50eb73b eval-same-function.js:10:1
   Registers: 7
   Blocks:    1
   Constants:
@@ -6,38 +6,39 @@ $d36729be eval-same-function.js:10:1
 
 block0:
   [   0] Enter
-  [   8] GetGlobal dst:reg6, `foo`
-  [  18] Call dst:reg5, callee:reg6, this_value:Undefined, foo
-  [  38] End value:reg5
+  [   1] Mov dst:reg5, src:Undefined
+  [   4] GetGlobal value_feedback:0, dst:reg6, `foo`
+  [   c] Call call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined
+  [  13] End value:reg5
 
 
-foo$c25bdd1c eval-same-function.js:6:9
-  Registers: 8
+foo$59dd5e24 eval-same-function.js:6:9
+  Registers: 7
   Blocks:    1
   Constants:
     [0] = String("var x = 1")
-    [1] = Undefined
-    [2] = Int32(42)
+    [1] = Int32(42)
 
 block0:
   [   0] Enter
-  [   8] CreateArguments is_immutable:false
-  [  18] DynamicGetCalleeAndThisFromEnvironment callee:reg6, this_value:reg7, `eval`
-  [  30] CallDirectEval dst:reg5, callee:reg6, this_value:reg7, eval, arguments:[String("var x = 1")]
-  [  58] DynamicGetBinding dst:reg6, `Number`
-  [  68] CallConstruct dst:reg5, callee:reg6, Number, arguments:[Int32(42)]
-  [  88] Return value:reg5
+  [   1] CreateArguments is_immutable:false, creates_parameter_bindings:false
+  [   6] DynamicGetCalleeAndThisFromEnvironment value_feedback:0, callee:reg5, this_value:reg6, `eval`
+  [   f] CallDirectEval call_feedback:0, dst:reg5, callee:reg5, this_value:reg6, arguments:[String("var x = 1")]
+  [  17] DynamicGetBinding value_feedback:1, dst:reg5, `Number`
+  [  1f] CallConstruct call_feedback:1, dst:reg5, callee:reg5, arguments:[Int32(42)]
+  [  26] Return value:reg5
 
 
-eval$5fd20edb line 1, column 1
-  Registers: 6
+eval$1ffbe850 line 1, column 5
+  Registers: 7
   Blocks:    1
   Constants:
-    [0] = Int32(1)
-    [1] = Undefined
+    [0] = Undefined
+    [1] = Int32(1)
 
 block0:
   [   0] Enter
-  [   8] ResolveBinding dst:reg5, `x`
-  [  18] SetResolvedBinding environment:reg5, `x`, src:Int32(1)
-  [  28] End value:Undefined
+  [   1] Mov dst:reg5, src:Undefined
+  [   4] ResolveBinding dst:reg6, `x`
+  [   8] SetResolvedBinding environment:reg6, `x`, src:Int32(1)
+  [   d] End value:reg5

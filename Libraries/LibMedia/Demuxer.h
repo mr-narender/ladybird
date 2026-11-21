@@ -15,12 +15,13 @@
 #include <LibCore/EventReceiver.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 
-#include "CodecID.h"
-#include "CodedFrame.h"
-#include "DecoderError.h"
+#include "DemuxerScanState.h"
 #include "SeekMode.h"
 #include "TimeRanges.h"
 #include "Track.h"
+#include <LibMediaCodecs/CodecID.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 namespace Media {
 
@@ -37,44 +38,6 @@ enum class DemuxerSeekResult : u8 {
     KeptCurrentPosition,
 };
 
-struct DemuxerTrackScanState {
-    Track track;
-    TimeRanges buffered_ranges;
-    bool reached_end_of_stream { false };
-
-    bool operator==(DemuxerTrackScanState const&) const = default;
-};
-
-struct DemuxerScanState {
-    Vector<DemuxerTrackScanState> tracks;
-    AK::Duration duration;
-
-    static DemuxerScanState create_from_track_scans(Vector<Track> const& tracks, HashMap<u64, BufferedRangesScan> scans_by_track_identifier, AK::Duration minimum_duration, bool closing_bytes_are_available)
-    {
-        DemuxerScanState state;
-        state.duration = minimum_duration;
-        for (auto const& track : tracks) {
-            auto scan = scans_by_track_identifier.take(track.identifier());
-            if (!scan.has_value())
-                continue;
-            state.duration = max(state.duration, scan->time_ranges.highest_end_time());
-            state.tracks.empend(track, move(scan->time_ranges), scan->last_byte_range_has_samples && closing_bytes_are_available);
-        }
-        return state;
-    }
-
-    DemuxerTrackScanState const* state_for_track(Track const& track) const LIFETIME_BOUND
-    {
-        for (auto const& track_state : tracks) {
-            if (track_state.track == track)
-                return &track_state;
-        }
-        return nullptr;
-    }
-
-    bool operator==(DemuxerScanState const&) const = default;
-};
-
 class Demuxer : public AtomicRefCounted<Demuxer> {
 public:
     virtual ~Demuxer() = default;
@@ -89,6 +52,10 @@ public:
     virtual DecoderErrorOr<CodedFrame> get_next_sample_for_track(Track const&) = 0;
 
     virtual AK::Duration select_fast_seek_target_for_track(Track const&, AK::Duration target, SeekMode) = 0;
+
+    // Moves to the keyframe prior to the target. If the track is already reading within the GOP for that keyframe, it
+    // will remain where it was unless the seek is forced. Thus, it may return with the track reading a frame past the
+    // target, so the caller should ensure that a backwards seek is forced.
     virtual DecoderErrorOr<DemuxerSeekResult> seek_to_most_recent_keyframe(Track const&, AK::Duration timestamp, DemuxerSeekOptions = DemuxerSeekOptions::None) = 0;
 
     virtual DecoderErrorOr<AK::Duration> duration_of_track(Track const&) = 0;
@@ -97,8 +64,14 @@ public:
     // Returns the timeline offset if the media resource provides one.
     virtual Optional<AK::UnixDateTime> start_time_realtime() const { return {}; }
 
+    // The earliest presentation time among the first samples of the audio and video tracks, never negative.
+    virtual AK::Duration earliest_possible_position() const { return AK::Duration::zero(); }
+
     virtual DemuxerScanState const& scan_state() const LIFETIME_BOUND = 0;
-    virtual void set_scan_state_change_handler(Function<void()>) = 0;
+    // Also passes the time ranges of delivered data that has since been replaced or ended early, which the consumer
+    // must read again.
+    using ScanStateChangeHandler = Function<void(TimeRanges const& invalidated_ranges)>;
+    virtual void set_scan_state_change_handler(ScanStateChangeHandler) = 0;
 
     virtual void set_blocking_reads_aborted_for_track(Track const&) = 0;
     virtual void reset_blocking_reads_aborted_for_track(Track const&) = 0;

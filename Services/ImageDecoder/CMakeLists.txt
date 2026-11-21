@@ -4,26 +4,15 @@ set(CMAKE_AUTOUIC OFF)
 
 set(SOURCES
     ConnectionFromClient.cpp
+    ControlConnection.cpp
 )
 
-if (ANDROID)
-    add_library(imagedecoderservice SHARED
-        ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/ImageDecoderService.cpp
-        ${LADYBIRD_SOURCE_DIR}/UI/Android/src/main/cpp/LadybirdServiceBaseJNI.cpp
-        ${SOURCES}
-    )
-    target_link_libraries(imagedecoderservice PRIVATE LibWebView)
-else()
-    add_library(imagedecoderservice STATIC ${SOURCES})
-endif()
+add_library(imagedecoderservice STATIC ${SOURCES})
 
 add_executable(ImageDecoder main.cpp)
 
 if (LINUX)
     target_sources(ImageDecoder PRIVATE SandboxLinux.cpp)
-    if (ENABLE_ADDRESS_SANITIZER)
-        target_sources(ImageDecoder PRIVATE LeakSanitizer.cpp)
-    endif()
 elseif (APPLE)
     target_sources(ImageDecoder PRIVATE SandboxMacOS.cpp)
 else()

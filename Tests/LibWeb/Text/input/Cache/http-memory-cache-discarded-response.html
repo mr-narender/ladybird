@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    // With no other response for the request pending, a response the fetch discards mid-body leaves no pending
+    // memory-cache entry behind, so a later response for the same request is the one the cache stores.
+    //
+    // The fixture echoes each fetch's Accept marker in its body, without Vary, to distinguish a hit from a miss.
+    asyncTest(async done => {
+        const server = httpTestServer();
+        const url = `${server.getStaticURL("Text/input/Cache/resources/discarded-response.py")}?token=${crypto.randomUUID()}`;
+
+        // A nosniff response that is not JavaScript is blocked for a script.
+        const script = document.createElement("script");
+        const blocked = new Promise(resolve => script.addEventListener("error", resolve, { once: true }));
+        script.src = url;
+        document.body.append(script);
+        await blocked;
+        println("script load was blocked");
+        await fetch(`${url}&unblock`);
+
+        // The discarded response is already stale. The replacement stays fresh beyond the test's timeout.
+        const stored = await fetch(url, { headers: { Accept: "stored" } });
+        println(`stored response arrived whole: ${(await stored.arrayBuffer()).byteLength === 64}`);
+
+        const checked = await fetch(url, { headers: { Accept: "check" } });
+        println(`next fetch served from the cache: ${(await checked.text()) === "stored".padEnd(64, "K")}`);
+
+        done();
+    });
+</script>

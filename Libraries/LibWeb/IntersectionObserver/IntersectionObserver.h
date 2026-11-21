@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <AK/Time.h>
 #include <AK/Variant.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/IntersectionObserver.h>
@@ -23,7 +24,7 @@ using IntersectionObserverRoot = NullableIntersectionObserverRoot;
 using IntersectionObserverOptions = Bindings::IntersectionObserverInit;
 
 struct ObservationTarget {
-    GC::Ref<DOM::Element> target;
+    GC::Weak<DOM::Element> target;
     Optional<size_t> previous_threshold_index;
     bool previous_is_intersecting { false };
 };
@@ -46,6 +47,7 @@ public:
 
     Vector<ObservationTarget>& observation_targets() { return m_observation_targets; }
     Vector<ObservationTarget> const& observation_targets() const { return m_observation_targets; }
+    void remove_dead_observation_targets();
     WebIDL::CallbackType& callback() { return *m_callback; }
 
     NullableIntersectionObserverRoot root() const;
@@ -59,7 +61,8 @@ public:
     Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::Document>> intersection_root() const;
     GC::Ref<DOM::Node> intersection_root_node() const;
     bool is_implicit_root() const { return !m_root; }
-    CSSPixelRect root_intersection_rectangle(Compositing::AccumulatedVisualContextTree const* = nullptr) const;
+    // An element root's box is mapped with the compositor's animations sampled at the time, where one is given.
+    CSSPixelRect root_intersection_rectangle(Layout::BegunRead const& read, Optional<MonotonicTime> visual_animation_sample_time = {}) const;
 
     void queue_entry(Badge<DOM::Document>, GC::Ref<IntersectionObserverEntry>);
 
@@ -67,7 +70,6 @@ private:
     explicit IntersectionObserver(GC::Ptr<WebIDL::CallbackType> callback, IntersectionObserverRoot const& root, GC::Ref<DOM::Document> implicit_root_document, Vector<CSS::LengthPercentage> root_margin, Vector<CSS::LengthPercentage> scroll_margin, Vector<double>&& thresholds, double delay, bool track_visibility);
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
-    virtual void finalize() override;
 
     static Optional<Vector<CSS::LengthPercentage>> parse_a_margin(String);
 

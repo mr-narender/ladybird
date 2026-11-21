@@ -121,18 +121,18 @@ void HTMLDetailsElement::queue_a_details_toggle_event_task(Utf16FlyString old_st
     }
 
     // 2. Queue an element task given the DOM manipulation task source and element to run the following steps:
-    auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, old_state, new_state = move(new_state)]() mutable {
+    auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this, old_state, move(new_state)), [](auto& self, auto& old_state, auto& new_state) {
         // 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
         //    oldState and the newState attribute initialized to newState.
         ToggleEventInit event_init {};
         event_init.old_state = move(old_state);
         event_init.new_state = move(new_state);
 
-        dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+        self.dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(self))));
 
         // 2. Set element's details toggle task tracker to null.
-        m_details_toggle_task_tracker = {};
-    });
+        self.m_details_toggle_task_tracker = {};
+    }));
 
     // 3. Set element's details toggle task tracker to a struct with task set to the just-queued task and old state set to oldState.
     m_details_toggle_task_tracker = ToggleTaskTracker {
@@ -276,24 +276,25 @@ void HTMLDetailsElement::update_shadow_tree_slots()
     if (!shadow_root())
         return;
 
-    GC::ConservativeVector<HTMLSlotElement::SlottableHandle> summary_assignment;
-    GC::ConservativeVector<HTMLSlotElement::SlottableHandle> descendants_assignment;
+    GC::RootVector<HTMLSlotElement::SlottableHandle> summary_assignment;
+    GC::RootVector<HTMLSlotElement::SlottableHandle> descendants_assignment;
 
     auto* summary = first_child_of_type<HTMLSummaryElement>();
     if (summary != nullptr)
         summary_assignment.append(GC::Ref { static_cast<DOM::Element&>(*summary) });
 
-    for_each_in_subtree([&](auto& child) {
+    // NB: Only the details element's children can be assigned to its slots.
+    for_each_child([&](auto& child) {
         if (&child == summary)
-            return TraversalDecision::Continue;
+            return IterationDecision::Continue;
         if (!child.is_slottable())
-            return TraversalDecision::Continue;
+            return IterationDecision::Continue;
 
         child.as_slottable().visit([&](auto& node) {
             descendants_assignment.append(node);
         });
 
-        return TraversalDecision::Continue;
+        return IterationDecision::Continue;
     });
 
     m_summary_slot->assign(move(summary_assignment));

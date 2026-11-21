@@ -121,6 +121,13 @@ FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> 
                 self.on_navigation_finished(move(url), move(title));
             }));
 
+        devtools.delegate().listen_for_inspect_element_requests(
+            tab->description(),
+            weak_callback(*this, [](auto& self, Web::UniqueNodeID node_id) {
+                if (auto console = self.m_console.strong_ref())
+                    console->inspect_element(node_id);
+            }));
+
         m_is_listening = true;
     }
 }
@@ -139,6 +146,7 @@ void FrameActor::stop_listening()
         devtools().delegate().stop_listening_for_console_messages(tab->description());
         devtools().delegate().stop_listening_for_network_events(tab->description());
         devtools().delegate().stop_listening_for_navigation_events(tab->description());
+        devtools().delegate().stop_listening_for_inspect_element_requests(tab->description());
     }
 
     m_is_listening = false;
@@ -415,23 +423,47 @@ void FrameActor::on_console_message(WebView::ConsoleOutput console_output)
             switch (log.type) {
             case WebView::ConsoleLogType::ConsoleAPI:
                 switch (log.level) {
+                // The client prefixes an assertion's message with "Assertion failed", which the console has done already.
+                case JS::ConsoleLogLevel::Assert:
+                case JS::ConsoleLogLevel::Error:
+                    message.set("level"sv, "error"sv);
+                    break;
+                // The client formats a count or a time itself, from fields the console doesn't send, so these go as the text
+                // that the console formatted.
+                case JS::ConsoleLogLevel::Count:
+                case JS::ConsoleLogLevel::TimeEnd:
+                case JS::ConsoleLogLevel::TimeLog:
+                case JS::ConsoleLogLevel::Log:
+                    message.set("level"sv, "log"sv);
+                    break;
+                // The console reports a reset only for a label that has no count, which the client shows as a warning.
+                case JS::ConsoleLogLevel::CountReset:
+                case JS::ConsoleLogLevel::Warn:
+                    message.set("level"sv, "warn"sv);
+                    break;
                 case JS::ConsoleLogLevel::Debug:
                     message.set("level"sv, "debug"sv);
                     break;
-                case JS::ConsoleLogLevel::Error:
-                    message.set("level"sv, "error"sv);
+                case JS::ConsoleLogLevel::Dir:
+                    message.set("level"sv, "dir"sv);
+                    break;
+                case JS::ConsoleLogLevel::DirXML:
+                    message.set("level"sv, "dirxml"sv);
+                    break;
+                case JS::ConsoleLogLevel::Group:
+                    message.set("level"sv, "group"sv);
+                    break;
+                case JS::ConsoleLogLevel::GroupCollapsed:
+                    message.set("level"sv, "groupCollapsed"sv);
                     break;
                 case JS::ConsoleLogLevel::Info:
                     message.set("level"sv, "info"sv);
                     break;
-                case JS::ConsoleLogLevel::Log:
-                    message.set("level"sv, "log"sv);
+                case JS::ConsoleLogLevel::Table:
+                    message.set("level"sv, "table"sv);
                     break;
-                case JS::ConsoleLogLevel::Warn:
-                    message.set("level"sv, "warn"sv);
-                    break;
-                default:
-                    // FIXME: Implement remaining console levels.
+                case JS::ConsoleLogLevel::Trace:
+                    // A trace arrives as a ConsoleTrace instead.
                     return;
                 }
                 break;
@@ -455,7 +487,12 @@ void FrameActor::on_console_message(WebView::ConsoleOutput console_output)
             if (log.stacktrace.has_value())
                 message.set("stacktrace"sv, serialize_console_stacktrace(*log.stacktrace));
             message.set("timeStamp"sv, console_output.timestamp.milliseconds_since_epoch());
-            message.set("arguments"sv, JsonArray { move(log.arguments) });
+            // An object argument names the object by its ID, which needs an actor before the client can expand it.
+            JsonArray arguments;
+            auto thread = m_thread.strong_ref();
+            for (auto& argument : log.arguments)
+                arguments.must_append(thread ? thread->resolve_object_references(argument, WebView::DebuggerObjectScope::Console) : move(argument));
+            message.set("arguments"sv, move(arguments));
 
             console_messages.must_append(move(message));
         },
@@ -480,6 +517,16 @@ void FrameActor::on_console_message(WebView::ConsoleOutput console_output)
                 message.set("lineNumber"sv, static_cast<i64>(first_frame.line.value_or(0)));
                 message.set("columnNumber"sv, static_cast<i64>(first_frame.column.value_or(0)));
             }
+
+            console_messages.must_append(move(message));
+        },
+        [&](WebView::ConsoleGroupEnd const&) {
+            message.set("level"sv, "groupEnd"sv);
+            message.set("filename"sv, "<eval>"sv);
+            message.set("lineNumber"sv, 1);
+            message.set("columnNumber"sv, 1);
+            message.set("timeStamp"sv, console_output.timestamp.milliseconds_since_epoch());
+            message.set("arguments"sv, JsonArray {});
 
             console_messages.must_append(move(message));
         },
@@ -579,7 +626,7 @@ void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkR
 
     auto& actor = *it->value;
     actor.set_response_start(data.status_code, data.reason_phrase);
-    auto loaded_from_cache = data.came_from_cache == Requests::CameFromCache::Yes;
+    auto loaded_from_cache = data.cache_state != Requests::CacheState::NotCached;
     actor.set_loaded_from_cache(loaded_from_cache);
 
     // Extract Content-Type before moving headers

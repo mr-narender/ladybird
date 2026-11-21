@@ -50,32 +50,9 @@ Selector::~Selector()
     SelectorFFI::rust_selector_destroy(m_rust_selector);
 }
 
-Optional<PseudoElement> Selector::target_pseudo_element() const
-{
-    auto value = SelectorFFI::rust_selector_target_pseudo_element(m_rust_selector);
-    if (value == NumericLimits<u8>::max())
-        return {};
-    return pseudo_element_from_ffi(value);
-}
-
-bool Selector::contains_the_nesting_selector() const
-{
-    return SelectorFFI::rust_selector_contains_nesting(m_rust_selector);
-}
-
-bool Selector::contains_pseudo_class(PseudoClass pseudo_class) const
-{
-    return SelectorFFI::rust_selector_contains_pseudo_class(m_rust_selector, to_underlying(pseudo_class));
-}
-
 bool Selector::contains_named_namespace() const
 {
     return SelectorFFI::rust_selector_contains_named_namespace(m_rust_selector);
-}
-
-Selector::Combinator Selector::first_combinator() const
-{
-    return static_cast<Combinator>(SelectorFFI::rust_selector_first_combinator(m_rust_selector));
 }
 
 u32 Selector::specificity() const
@@ -96,8 +73,8 @@ Optional<SelectorList> parse_selector_list_in_rust(Utf16View input, RustNamespac
 {
     auto* parsed = SelectorFFI::rust_selector_parse_with_namespace_context(
         {
-            .ascii = input.has_ascii_storage() ? reinterpret_cast<u8 const*>(input.ascii_span().data()) : nullptr,
-            .utf16 = input.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
+            .latin1 = input.has_latin1_storage() ? input.latin1_span().data() : nullptr,
+            .utf16 = input.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
             .length = input.length_in_code_units(),
         },
         namespaces.handle(), is_relative, is_forgiving);
@@ -129,22 +106,6 @@ static SelectorList take_selector_list(SelectorFFI::RustParsedSelectorList* pars
 SelectorList matching_selectors_for_rule(RustRule const& rule)
 {
     auto* bound = Parser::ValueParserFFI::rust_rule_matching_selectors(rule.handle());
-    return take_selector_list(static_cast<SelectorFFI::RustParsedSelectorList*>(bound));
-}
-
-Optional<SelectorList> scope_start_selectors_for_rule(RustRule const& rule)
-{
-    auto* bound = Parser::ValueParserFFI::rust_rule_scope_start_selectors(rule.handle());
-    if (!bound)
-        return {};
-    return take_selector_list(static_cast<SelectorFFI::RustParsedSelectorList*>(bound));
-}
-
-Optional<SelectorList> scope_end_selectors_for_rule(RustRule const& rule)
-{
-    auto* bound = Parser::ValueParserFFI::rust_rule_scope_end_selectors(rule.handle());
-    if (!bound)
-        return {};
     return take_selector_list(static_cast<SelectorFFI::RustParsedSelectorList*>(bound));
 }
 

@@ -9,36 +9,35 @@
 #include <AK/Error.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
-#include <LibCrypto/BigInt/SignedBigInteger.h>
+#include <AK/Utf16String.h>
+#include <AK/Vector.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/Ptr.h>
 #include <LibJS/Export.h>
+#include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibJS/Heap/EngineCell.h>
 
 namespace JS {
 
-class JS_API BigInt final : public Cell {
-    GC_CELL(BigInt, Cell);
-    GC_DECLARE_ALLOCATOR(BigInt);
-
+class JS_API BigInt final : public EngineCell {
 public:
-    static constexpr GC::CellKind cell_kind_for_class = GC::CellKind::BigInt;
+    // The magnitude is in 32-bit words, least significant first.
+    [[nodiscard]] static GC::Ref<BigInt> create(VM&, bool is_negative, ReadonlySpan<u32> magnitude_words);
+    [[nodiscard]] static GC::Ref<BigInt> create_from_i64(VM&, i64);
+    [[nodiscard]] static GC::Ref<BigInt> create_from_u64(VM&, u64);
 
-    [[nodiscard]] static GC::Ref<BigInt> create(VM&, Crypto::SignedBigInteger);
+    // https://tc39.es/ecma262/#sec-stringtobigint
+    [[nodiscard]] static GC::Ptr<BigInt> create_from_string(VM&, Utf16View const&);
 
-    virtual ~BigInt() override = default;
+    bool is_negative() const;
+    // The magnitude in 32-bit words, least significant first, without leading zero words.
+    Vector<u32> magnitude_words() const;
 
-    Crypto::SignedBigInteger const& big_integer() const { return m_big_integer; }
+    // The decimal digits, after a "-" if it is negative, which is ToString(bigint).
+    String to_string() const;
 
     Utf16String to_utf16_string() const;
-
-private:
-    virtual size_t external_memory_size() const override;
-
-    explicit BigInt(Crypto::SignedBigInteger);
-
-    Crypto::SignedBigInteger m_big_integer;
 };
-
-ThrowCompletionOr<GC::Ref<BigInt>> number_to_bigint(VM&, Value);
 
 }

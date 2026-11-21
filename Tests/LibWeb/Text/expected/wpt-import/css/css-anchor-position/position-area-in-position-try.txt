@@ -1,0 +1,69 @@
+Harness status: OK
+
+Found 64 tests
+
+64 Pass
+Pass	none
+Pass	span-all
+Pass	span-all span-all
+Pass	top left
+Pass	top center
+Pass	top right
+Pass	center left
+Pass	center center
+Pass	center right
+Pass	bottom left
+Pass	bottom center
+Pass	bottom right
+Pass	start start
+Pass	start center
+Pass	start end
+Pass	center start
+Pass	center end
+Pass	end start
+Pass	end center
+Pass	end end
+Pass	self-start self-start
+Pass	self-start center
+Pass	self-start self-end
+Pass	center self-start
+Pass	center self-end
+Pass	self-end self-start
+Pass	self-end center
+Pass	self-end self-end
+Pass	y-start x-start
+Pass	y-start center
+Pass	y-start x-end
+Pass	center x-start
+Pass	center x-end
+Pass	y-end x-start
+Pass	y-end center
+Pass	y-end x-end
+Pass	self-y-start self-x-start
+Pass	self-y-start center
+Pass	self-y-start self-x-end
+Pass	center self-x-start
+Pass	center self-x-end
+Pass	self-y-end self-x-start
+Pass	self-y-end center
+Pass	self-y-end self-x-end
+Pass	span-self-y-start span-self-x-end
+Pass	span-bottom span-all
+Pass	Placement: --top
+Pass	Placement: --left
+Pass	Placement: --right, --top
+Pass	Placement: --bottom, --top
+Pass	Placement: --bottom, --right, --top
+Pass	Placement: --bottom, --right, --left, --top
+Pass	Placement: --bottom, --left, --top, --right
+Pass	Placement: --right flip-inline
+Pass	Placement: --bottom flip-block
+Pass	Placement: --left flip-start
+Pass	Placement: --right flip-x
+Pass	Placement: --bottom flip-y
+Pass	Placement: --left flip-inline, --top
+Pass	Placement: --left flip-x, --top
+Pass	Placement: --top flip-block, --left
+Pass	Placement: --top flip-y, --left
+Pass	Placement: --left flip-start flip-block, --left
+Pass	Placement: --left flip-start flip-y, --left

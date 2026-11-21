@@ -4,9 +4,8 @@
     // The emulated position the UI process sets for a tab reaches the page hosting an isolated iframe's document, so
     // geolocation there answers with it rather than asking the system.
     promiseTest(async () => {
-        const runId = crypto.randomUUID();
         const childUrl = new URL(
-            await httpTestServer().createEcho("GET", `/oop-geolocation-${runId}`, {
+            await httpTestServer().createEcho("GET", "/oop-geolocation", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
@@ -20,6 +19,7 @@
 
         const result = new Promise(resolve => addEventListener("message", event => resolve(event.data), { once: true }));
         const iframe = document.createElement("iframe");
+        iframe.allow = "geolocation";
         iframe.src = childUrl;
         document.body.appendChild(iframe);
 

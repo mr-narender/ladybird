@@ -2,67 +2,45 @@
  * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
  * Copyright (c) 2024-2025, Shannon Booth <shannon@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #pragma once
 
-#include <AK/FlyString.h>
-#include <AK/Optional.h>
-#include <AK/String.h>
-#include <LibWeb/Bindings/Wrappable.h>
+#include <AK/Function.h>
+#include <AK/Utf16String.h>
+#include <LibWeb/Bindings/RustInterface.h>
+#include <LibWeb/Bindings/Storage.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/StorageAPI/StorageBottle.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::HTML {
 
 class Window;
 
 // https://html.spec.whatwg.org/multipage/webstorage.html#storage-2
-class WEB_API Storage : public Bindings::GCAllocatedWrappable {
-    WEB_WRAPPABLE(Storage, Bindings::GCAllocatedWrappable);
-    GC_DECLARE_ALLOCATOR(Storage);
+class WEB_API Storage : public Bindings::RustInterfaceCell {
+    WEB_RUST_INTERFACE(Storage, storage)
 
 public:
     // https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-type
-    enum class Type {
+    enum class Type : u8 {
         Local,
         Session,
     };
 
-    [[nodiscard]] static GC::Ref<Storage> create(Window&, Type, GC::Ref<StorageAPI::StorageBottle>);
+    // A new Storage object of the type for the window, whose map is a new storage proxy map over the bottle for the
+    // window's relevant settings object, or null when obtaining the bottle map fails.
+    [[nodiscard]] static GC::Ptr<Storage> create(Window&, Type);
 
-    ~Storage();
+    // A window listening for storage events has its storage connected so that changes made in other processes reach
+    // it; a map is otherwise only loaded on first access.
+    void connect();
 
-    Window& window() { return m_window; }
-    Window const& window() const { return m_window; }
+    void for_each_item(Function<void(Utf16String const& key, Utf16String const& value)> const&);
 
-    size_t length() const;
-    Optional<Utf16String> key(size_t index);
-    Optional<Utf16String> get_item(Utf16View key) const;
-    WebIDL::ExceptionOr<void> set_item(Utf16View key, Utf16View value);
-    void remove_item(Utf16View key);
-    void clear();
-    Type type() const { return m_type; }
-
-    void dump() const;
-
-private:
-    Storage(Window&, Type, GC::Ref<StorageAPI::StorageBottle>);
-
-    virtual void visit_edges(GC::Cell::Visitor&) override;
-    virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
-
-    // ^Wrappable
-    virtual Vector<Utf16FlyString> supported_property_names() const override;
-    void reorder();
-    void broadcast(Optional<Utf16View> key, Optional<Utf16View> old_value, Optional<Utf16View> new_value);
-
-    GC::Ref<Window> m_window;
-    Type m_type {};
-    GC::Ref<StorageAPI::StorageBottle> m_storage_bottle;
+    void dump();
 };
 
 }

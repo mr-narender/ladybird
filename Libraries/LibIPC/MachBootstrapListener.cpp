@@ -4,89 +4,46 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Debug.h>
+#include <AK/Format.h>
 #include <LibIPC/MachBootstrapListener.h>
-#include <LibIPC/MachBootstrapMessages.h>
-#include <LibThreading/Thread.h>
+#include <LibIPC/RustFFI.h>
 
 namespace IPC {
 
 MachBootstrapListener::MachBootstrapListener(ByteString server_port_name)
-    : m_thread(Threading::Thread::construct("MachBootstrapListener"sv, [this]() -> intptr_t { thread_loop(); return 0; }))
-    , m_server_port_name(move(server_port_name))
+    : m_server_port_name(move(server_port_name))
 {
-    if (auto err = allocate_server_port(); err.is_error())
-        dbgln("Failed to allocate server port: {}", err.error());
-    else
-        start();
+    auto handle_request = [](void* listener, i32 pid, u32 task_name_port, u32 reply_port) {
+        auto& self = *static_cast<MachBootstrapListener*>(listener);
+        VERIFY(self.on_bootstrap_request);
+        self.on_bootstrap_request({
+            .pid = pid,
+            .task_name_port = Core::MachPort::adopt_right(task_name_port, Core::MachPort::PortRight::Send),
+            .reply_port = Core::MachPort::adopt_right(reply_port, Core::MachPort::PortRight::SendOnce),
+        });
+    };
+    m_listener = FFI::ipc_mach_bootstrap_listener_create(m_server_port_name.bytes(), this, handle_request);
+    if (!m_listener)
+        dbgln("Failed to allocate server port");
 }
 
 MachBootstrapListener::~MachBootstrapListener()
 {
-    stop();
-}
-
-void MachBootstrapListener::start()
-{
-    m_thread->start();
+    if (!m_listener)
+        return;
+    // NB: Destroying the listener stops it, after which nothing reaches this object.
+    FFI::ipc_mach_bootstrap_listener_destroy(m_listener);
 }
 
 void MachBootstrapListener::stop()
 {
-    // FIXME: We should join instead (after storing should_stop = false) when we have a way to interrupt the thread's mach_msg call
-    m_thread->detach();
-    m_should_stop.store(true, MemoryOrder::memory_order_release);
+    if (m_listener)
+        FFI::ipc_mach_bootstrap_listener_stop(m_listener);
 }
 
 bool MachBootstrapListener::is_initialized()
 {
-    return MACH_PORT_VALID(m_server_port_recv_right.port()) && MACH_PORT_VALID(m_server_port_send_right.port());
-}
-
-ErrorOr<void> MachBootstrapListener::allocate_server_port()
-{
-    m_server_port_recv_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
-    m_server_port_send_right = TRY(m_server_port_recv_right.insert_right(Core::MachPort::MessageRight::MakeSend));
-    TRY(m_server_port_recv_right.register_with_bootstrap_server(m_server_port_name));
-
-    dbgln_if(MACH_PORT_DEBUG, "Success! we created and attached mach port {:x} to bootstrap server with name {}", m_server_port_recv_right.port(), m_server_port_name);
-    return {};
-}
-
-void MachBootstrapListener::thread_loop()
-{
-    while (!m_should_stop.load(MemoryOrder::memory_order_acquire)) {
-        ReceivedMachMessage message {};
-
-        // Get the pid of the child from the audit trailer so we can associate the port w/it
-        mach_msg_options_t const options = MACH_RCV_MSG | MACH_RCV_TRAILER_TYPE(MACH_RCV_TRAILER_AUDIT) | MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT);
-
-        // FIXME: How can we interrupt this call during application shutdown?
-        auto const ret = mach_msg(&message.header, options, 0, sizeof(message), m_server_port_recv_right.port(), MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-        if (ret != KERN_SUCCESS) {
-            dbgln("mach_msg failed: {}", mach_error_string(ret));
-            break;
-        }
-
-        if (message.header.msgh_id == SELF_TASK_PORT_MESSAGE_ID) {
-            auto const& task_port_message = message.body;
-            VERIFY(MACH_MSGH_BITS_LOCAL(message.header.msgh_bits) == MACH_MSG_TYPE_MOVE_SEND);
-            VERIFY(task_port_message.body.msgh_descriptor_count == 1);
-            VERIFY(task_port_message.port_descriptor.type == MACH_MSG_PORT_DESCRIPTOR);
-            auto pid = static_cast<pid_t>(task_port_message.trailer.msgh_audit.val[5]);
-            auto task_port = Core::MachPort::adopt_right(task_port_message.port_descriptor.name, Core::MachPort::PortRight::Send);
-
-            // Extract reply port from the message header (kernel swaps local/remote on receive)
-            auto reply_port = Core::MachPort::adopt_right(message.header.msgh_remote_port, Core::MachPort::PortRight::SendOnce);
-
-            dbgln_if(MACH_PORT_DEBUG, "Received bootstrap request from pid {} (task port {:x}, reply port {:x})", pid, task_port.port(), reply_port.port());
-            VERIFY(on_bootstrap_request);
-            on_bootstrap_request({ pid, move(task_port), move(reply_port) });
-            continue;
-        }
-
-        VERIFY_NOT_REACHED();
-    }
+    return m_listener;
 }
 
 }

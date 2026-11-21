@@ -9,6 +9,7 @@
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <AK/Utf16String.h>
 #include <LibCore/SharedVersion.h>
 #include <LibHTTP/Forward.h>
 #include <LibIPC/Forward.h>
@@ -28,6 +29,19 @@ enum class Source : u8 {
     Http,
 };
 
+enum class SameSiteStatus : u8 {
+    CrossSite,
+    SameSite,
+};
+
+struct SameSiteContext {
+    SameSiteStatus status { SameSiteStatus::CrossSite };
+    bool is_top_level_navigation { false };
+    bool is_safe_method { false };
+
+    static SameSiteContext same_site() { return { .status = SameSiteStatus::SameSite }; }
+};
+
 struct Cookie {
     String creation_time_to_string() const;
     String last_access_time_to_string() const;
@@ -45,6 +59,19 @@ struct Cookie {
     bool http_only { false };
     bool host_only { false };
     bool persistent { false };
+
+    // AD-HOC: The serialized top-level site that a cookie set in a third-party context belongs to, or empty for a
+    //         cookie set in a first-party context. Like Firefox's Total Cookie Protection, a third-party context only
+    //         gets the cookies of its own top-level site.
+    Utf16String partition_key {};
+};
+
+// AD-HOC: The context that a request or script uses cookies in. A context is third-party if its top-level site is not the
+//         site of the URL whose cookies it uses, or if it has an ancestor of another site; it then only uses the cookies
+//         of its top-level site's partition. See Cookie::partition_key.
+struct PartitionContext {
+    Utf16String top_level_site;
+    bool has_cross_site_ancestor { false };
 };
 
 struct VersionedCookie {
@@ -60,7 +87,8 @@ bool domain_matches(StringView string, StringView domain_string);
 bool path_matches(StringView request_path, StringView cookie_path);
 String default_path(URL::URL const&);
 
-bool cookie_matches_url(Cookie const&, URL::URL const&, String const& retrieval_host_canonical, Optional<Source> = {});
+bool cookie_matches_url(Cookie const&, URL::URL const&, String const& retrieval_host_canonical, Source, SameSiteContext);
+SameSiteContext non_http_same_site_context(PartitionContext const&);
 
 }
 
@@ -71,6 +99,17 @@ ErrorOr<void> encode(Encoder&, HTTP::Cookie::Cookie const&);
 
 template<>
 ErrorOr<HTTP::Cookie::Cookie> decode(Decoder&);
+
+template<>
+ErrorOr<void> encode(Encoder&, HTTP::Cookie::SameSiteContext const&);
+template<>
+ErrorOr<HTTP::Cookie::SameSiteContext> decode(Decoder&);
+
+template<>
+ErrorOr<void> encode(Encoder&, HTTP::Cookie::PartitionContext const&);
+
+template<>
+ErrorOr<HTTP::Cookie::PartitionContext> decode(Decoder&);
 
 template<>
 ErrorOr<void> encode(Encoder&, HTTP::Cookie::VersionedCookie const&);

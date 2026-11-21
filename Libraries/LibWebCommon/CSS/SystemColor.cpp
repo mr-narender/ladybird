@@ -29,31 +29,32 @@ Color active_text(PreferredColorScheme scheme)
 Color button_border(PreferredColorScheme scheme)
 {
     if (scheme == PreferredColorScheme::Dark) {
-        return Color(72, 72, 72);
+        return Color(255, 255, 255);
     }
-    return Color(128, 128, 128);
+    return Color(0, 0, 0);
 }
 
 Color button_face(PreferredColorScheme scheme)
 {
     if (scheme == PreferredColorScheme::Dark) {
-        return Color(32, 29, 25);
+        return Color(107, 107, 107);
     }
-    return Color(212, 208, 200);
+    return Color(239, 239, 239);
 }
 
 Color button_text(PreferredColorScheme scheme)
 {
     if (scheme == PreferredColorScheme::Dark) {
-        return Color(235, 235, 235);
+        return Color(255, 255, 255);
     }
     return Color(0, 0, 0);
 }
 
+// NB: The dark canvas is the page color of Ladybird's own pages, --page in ladybird.css.
 Color canvas(PreferredColorScheme scheme)
 {
     if (scheme == PreferredColorScheme::Dark) {
-        return Color(20, 20, 20);
+        return Color(28, 28, 30);
     }
     return Color(255, 255, 255);
 }
@@ -61,7 +62,7 @@ Color canvas(PreferredColorScheme scheme)
 Color canvas_text(PreferredColorScheme scheme)
 {
     if (scheme == PreferredColorScheme::Dark) {
-        return Color(235, 235, 235);
+        return Color(255, 255, 255);
     }
     return Color(0, 0, 0);
 }
@@ -69,7 +70,7 @@ Color canvas_text(PreferredColorScheme scheme)
 Color field(PreferredColorScheme scheme)
 {
     if (scheme == PreferredColorScheme::Dark) {
-        return Color(32, 29, 25);
+        return Color(59, 59, 59);
     }
     return Color(255, 255, 255);
 }
@@ -77,7 +78,7 @@ Color field(PreferredColorScheme scheme)
 Color field_text(PreferredColorScheme scheme)
 {
     if (scheme == PreferredColorScheme::Dark) {
-        return Color(235, 235, 235);
+        return Color(255, 255, 255);
     }
     return Color(0, 0, 0);
 }
@@ -87,10 +88,15 @@ Color gray_text(PreferredColorScheme)
     return Color(128, 128, 128);
 }
 
-Color transform_selection_background_color(Color color)
+Color transform_selection_background_color(Color color, PreferredColorScheme scheme)
 {
     if (color.alpha() < 255)
         return color;
+
+    // NB: The translucent color below looks like `color` only over white. Over a dark page it comes out much darker, so
+    //     a dark color scheme keeps the color as it is, at 80% opacity.
+    if (scheme == PreferredColorScheme::Dark)
+        return color.with_alpha(204);
 
     constexpr int start_alpha = 153; // 60%
     constexpr int end_alpha = 204;   // 80%

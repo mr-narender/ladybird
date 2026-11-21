@@ -7,9 +7,11 @@
 //! The filter graphs painting hands over as bytes, and the device-pixel filter functions hosts
 //! build them from outside the style system.
 
+use libgfx_rust::FloatRect;
 use libgfx_rust::filter::Filter;
+use libipc_rust::wire::{Decode, Encode};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
 pub enum FfiFilterFunctionKind {
     Blur,
@@ -20,7 +22,7 @@ pub enum FfiFilterFunctionKind {
 
 /// One function of a CSS filter list with its lengths already in device pixels, for a host that
 /// builds filter graphs outside the style system: compositor animation samples and canvas filters.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FfiFilterFunction {
     pub kind: FfiFilterFunctionKind,
@@ -65,6 +67,18 @@ pub fn filter_functions_graph(functions: impl IntoIterator<Item = Filter>) -> Op
 /// Whether a serialized filter can change the painted bounds of what it is applied to.
 pub fn may_affect_output_bounds(bytes: &[u8]) -> bool {
     Filter::serialized_may_affect_output_bounds(bytes)
+}
+
+/// Where a serialized filter paints when what it is applied to paints within `source`, or `None`
+/// when it can paint everywhere.
+pub fn output_bounds(bytes: &[u8], source: FloatRect) -> Option<FloatRect> {
+    Filter::serialized_output_bounds(bytes, source)
+}
+
+/// Where a serialized filter's output can change when what it is applied to changes only within
+/// `changed_source`, or `None` when it can change everywhere.
+pub fn changed_output_bounds(bytes: &[u8], changed_source: FloatRect) -> Option<FloatRect> {
+    Filter::serialized_changed_output_bounds(bytes, changed_source)
 }
 
 #[cfg(test)]

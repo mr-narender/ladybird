@@ -25,7 +25,7 @@ static Optional<URL::BlobURLEntry::Token> token_of(Web::FileAPI::SerializedBlobU
 }
 
 // https://w3c.github.io/FileAPI/#add-an-entry
-URL::BlobURLEntry::Token BlobURLStore::add_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry, BlobURLEntryOwner added_by)
+URL::BlobURLEntry::Token BlobURLStore::add_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry, BlobURLEntryOwner added_by, Optional<LocalFileRoot> root_of_adder)
 {
     // NB: Blob URLs are random, so one that is already here came from a different process. Leave it alone.
     if (m_entries.contains(url))
@@ -39,7 +39,7 @@ URL::BlobURLEntry::Token BlobURLStore::add_entry(Utf16String url, Web::FileAPI::
         m_entry_urls_by_token.set(token, url);
     }
 
-    m_entries.set(move(url), Entry { move(entry), move(added_by), false, 0 });
+    m_entries.set(move(url), Entry { move(entry), move(added_by), move(root_of_adder), false, 0 });
     return token;
 }
 
@@ -105,6 +105,19 @@ void BlobURLStore::remove_entries_added_by(BlobURLEntryOwner const& owner)
     });
 }
 
+void BlobURLStore::remove_entries_added_by(Vector<Utf16String> const& urls, BlobURLEntryOwner const& owner)
+{
+    for (auto const& url : urls) {
+        auto entry = m_entries.get(url);
+        if (!entry.has_value() || entry->revoked || owner_pointer(entry->added_by) != owner_pointer(owner))
+            continue;
+
+        entry->revoked = true;
+        if (entry->handles == 0)
+            remove_entry(url);
+    }
+}
+
 void BlobURLStore::acquire(URL::BlobURLEntry::Token token)
 {
     auto url = m_entry_urls_by_token.get(token);
@@ -147,6 +160,14 @@ Optional<Web::FileAPI::SerializedBlobURLEntry> BlobURLStore::resolve(Utf16String
     if (!entry.has_value() || entry->revoked)
         return {};
     return entry->entry;
+}
+
+Optional<LocalFileRoot> BlobURLStore::local_file_root_of_entry(Utf16String const& url, URL::Origin const& origin) const
+{
+    auto entry = m_entries.get(url);
+    if (!entry.has_value() || entry->revoked || !entry->entry.origin.is_file_origin() || !entry->entry.origin.is_same_origin(origin))
+        return {};
+    return entry->root_of_adder;
 }
 
 BlobURLHandle::BlobURLHandle(BlobURLStore& store, URL::BlobURLEntry::Token token)

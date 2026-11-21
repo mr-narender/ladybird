@@ -21,7 +21,7 @@ public:
 
     virtual NonnullOwnPtr<EventLoopImplementation> make_implementation() override;
 
-    virtual intptr_t register_timer(EventReceiver&, int milliseconds, bool should_reload) override;
+    virtual intptr_t register_timer(EventReceiver&, AK::Duration interval, bool should_reload) override;
     virtual void unregister_timer(intptr_t timer_id) override;
 
     virtual void register_notifier(Notifier&) override;
@@ -33,7 +33,6 @@ public:
     virtual void unregister_signal(int handler_id) override;
 
     void wait_for_events(EventLoopImplementation::PumpMode);
-    static Optional<MonotonicTime> get_next_timer_expiration();
 
 private:
     void dispatch_signal(int signal_number);

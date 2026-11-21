@@ -5,27 +5,26 @@
     // displayed before the new document is activated, and only then hands the frame to the new process.
     promiseTest(async () => {
         const httpServer = httpTestServer();
-        const runId = crypto.randomUUID();
 
         const firstUrl = new URL(
-            await httpServer.createEcho("GET", `/oop-handoff-first-${runId}`, {
+            await httpServer.createEcho("GET", "/oop-handoff-first", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
-                    addEventListener("unload", () => { document.cookie = "unloadPing=1; path=/"; });
-                    document.cookie = "loaded=1; path=/";
+                    addEventListener("unload", () => { document.cookie = "unloadPing=1; path=/; SameSite=None; Secure"; });
+                    document.cookie = "loaded=1; path=/; SameSite=None; Secure";
                 <\/script>`,
             })
         );
         firstUrl.hostname = uniqueLocalhostHostname("oop-handoff-first");
 
         const secondUrl = new URL(
-            await httpServer.createEcho("GET", `/oop-handoff-second-${runId}`, {
+            await httpServer.createEcho("GET", "/oop-handoff-second", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
                     const firstUnloaded = internals.hasCookieForURL(${JSON.stringify(firstUrl.href)}, "unloadPing", "1");
-                    document.cookie = "order=" + (firstUnloaded ? "unload-first" : "activate-first") + "; path=/";
+                    document.cookie = "order=" + (firstUnloaded ? "unload-first" : "activate-first") + "; path=/; SameSite=None; Secure";
                 <\/script>`,
             })
         );

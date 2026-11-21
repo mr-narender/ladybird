@@ -29,23 +29,66 @@ pub enum ParameterMode {
     InOut,
 }
 
-#[derive(Debug, Clone)]
+/// One `Value` of an operation's `Op::Values` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlowPathField {
+    /// The name of the bytecode field that holds the operand.
+    pub name: String,
     pub instruction_offset: usize,
     pub value_offset: usize,
     pub mode: ParameterMode,
     pub optional: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+/// The variable-length input operands that end an `Op::Values` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowPathArray {
+    /// The name of the bytecode field that holds the operands.
+    pub name: String,
+    pub instruction_offset: usize,
+    /// The instruction offset of the operand count, which is one byte.
+    pub count_offset: usize,
+    pub optional: bool,
+}
+
+/// The `Op::Values` record of an operation: one `Value` per scalar operand
+/// field in declaration order, followed by the variable-length operands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlowPathLayout {
     pub fields: Vec<SlowPathField>,
-    /// Instruction offsets of the operand array and its count, and whether its entries are optional.
-    pub array: Option<(usize, usize, bool)>,
+    pub array: Option<SlowPathArray>,
+}
+
+/// How an operation's slow path receives its operands and returns its outputs.
+///
+/// The control word every form returns is the runtime's `SlowPathControl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlowPathAbi {
+    /// `AsmSlowPathResult f(VM*, u32 pc, Op::Name const*, Value inputs...)`,
+    /// where `AsmSlowPathResult` is `{ i64 control; u64 value; }` returned in
+    /// two registers and `value` is the encoded output, if there is one.
+    Scalar,
+    /// `i64 f(VM*, u32 pc, Op::Name const*, Op::Name::Values& outputs, Value inputs...)`,
+    /// where the inputs include input/output operands.
+    Mixed,
+    /// `i64 f(VM*, u32 pc, Op::Name const*, Op::Name::Values& values)`.
+    Record,
 }
 
 impl SlowPathLayout {
-    pub fn uses_scalar_arguments(&self) -> bool {
+    /// Classify the slow-path call of this operation, where `record_form_only`
+    /// is set for targets that always pass a record, which is what Windows does.
+    pub fn abi(&self, record_form_only: bool) -> SlowPathAbi {
+        if record_form_only || self.array.is_some() {
+            SlowPathAbi::Record
+        } else if self.uses_scalar_arguments() {
+            SlowPathAbi::Scalar
+        } else {
+            SlowPathAbi::Mixed
+        }
+    }
+
+    fn uses_scalar_arguments(&self) -> bool {
         self.array.is_none()
             && self
                 .fields
@@ -71,13 +114,15 @@ impl SlowPathLayout {
             let optional = field.ty == "Optional<Operand>";
             if field.is_array {
                 let array = op.array.as_ref().expect("operand array has a count");
-                layout.array = Some((
-                    array.offset,
-                    op.layout.field_offsets[&op.fields[array.count_field_index].name],
+                layout.array = Some(SlowPathArray {
+                    name: field.name.clone(),
+                    instruction_offset: array.offset,
+                    count_offset: op.layout.field_offsets[&op.fields[array.count_field_index].name],
                     optional,
-                ));
+                });
             } else {
                 layout.fields.push(SlowPathField {
+                    name: field.name.clone(),
                     instruction_offset: op.layout.field_offsets[&field.name],
                     value_offset: layout.fields.len() * 8,
                     mode: field.mode,
@@ -102,14 +147,9 @@ pub struct SpecializationParameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpecializationComponent {
+pub struct Specialization {
     pub bytecode: String,
     pub parameters: Vec<SpecializationParameter>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Specialization {
-    pub components: Vec<SpecializationComponent>,
     pub name: Option<String>,
 }
 
@@ -120,31 +160,23 @@ pub enum SpecializedParameterBinding {
 }
 
 #[derive(Debug, Clone)]
-pub struct SpecializedComponentLayout {
-    pub bytecode: String,
-    pub parameters: HashMap<String, SpecializedParameterBinding>,
-}
-
-#[derive(Debug, Clone)]
 pub struct SpecializedInstruction {
     pub definition: InstructionDefinition,
-    pub components: Vec<SpecializedComponentLayout>,
+    pub bytecode: String,
+    pub parameters: HashMap<String, SpecializedParameterBinding>,
 }
 
 pub fn specialization_name(specialization: &Specialization) -> String {
     if let Some(name) = &specialization.name {
         return name.clone();
     }
-    let mut name = String::new();
-    for component in &specialization.components {
-        name.push_str(&component.bytecode);
-        for parameter in &component.parameters {
-            name.push_str(&parameter.name[..1].to_ascii_uppercase());
-            name.push_str(&parameter.name[1..]);
-            match parameter.constraint {
-                SpecializationConstraint::Int32 => name.push_str("Int32"),
-                SpecializationConstraint::Undefined => name.push_str("Undefined"),
-            }
+    let mut name = specialization.bytecode.clone();
+    for parameter in &specialization.parameters {
+        name.push_str(&parameter.name[..1].to_ascii_uppercase());
+        name.push_str(&parameter.name[1..]);
+        match parameter.constraint {
+            SpecializationConstraint::Int32 => name.push_str("Int32"),
+            SpecializationConstraint::Undefined => name.push_str("Undefined"),
         }
     }
     name
@@ -156,9 +188,26 @@ pub struct InstructionDefinition {
     pub name: String,
     pub parent: String,
     pub fields: Vec<Field>,
+    /// The instruction ends a basic block (`@terminator`).
     pub is_terminator: bool,
+    /// The terminator may also continue with the next instruction, like a
+    /// conditional jump with a single target (`@fallthrough`).
+    pub falls_through: bool,
     pub layout: OpLayout,
     pub array: Option<ArrayLayout>,
+    /// The opcode a raw-bytes instruction dispatches on (`@opcode(...)`).
+    pub opcode: Option<RawOpcode>,
+    /// The handler runs every opcode that has no handler of its own
+    /// (`@fallback`).
+    pub is_fallback: bool,
+}
+
+/// The encoding of a raw-bytes instruction: a primary opcode byte, or a prefix
+/// byte followed by a LEB128 sub-opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RawOpcode {
+    Primary(u8),
+    Prefixed { prefix: u8, sub_opcode: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -169,27 +218,27 @@ pub struct ArrayLayout {
     pub element_size: usize,
 }
 
+/// The type of an instruction field. Instructions are packed, so fields have no alignment.
 pub struct FieldType {
     pub rust_type: &'static str,
-    pub align: usize,
     pub size: usize,
     pub kind: &'static str,
 }
 
-impl From<(&'static str, usize, usize, &'static str)> for FieldType {
-    fn from(v: (&'static str, usize, usize, &'static str)) -> Self {
+impl From<(&'static str, usize, &'static str)> for FieldType {
+    fn from(v: (&'static str, usize, &'static str)) -> Self {
         Self {
             rust_type: v.0,
-            align: v.1,
-            size: v.2,
-            kind: v.3,
+            size: v.1,
+            kind: v.2,
         }
     }
 }
 
-/// The alignment of the C++ Instruction base class (`alignas(void*)`).
-/// On 64-bit: alignof(void*) = 8.
-pub const STRUCT_ALIGN: usize = 8;
+/// How many bytes an operand takes in an instruction.
+pub const OPERAND_SIZE: usize = 1;
+/// The encoding of an absent optional operand.
+pub const NO_OPERAND: i64 = u8::MAX as i64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -298,21 +347,72 @@ pub fn parse_flap_metadata(source_name: &str, content: &str) -> Result<Vec<Instr
         let close = find_matching_parenthesis(declaration, open)
             .ok_or_else(|| ParseError::new(source_name, start_line, 1, "unterminated handler parameter list"))?;
         let fields = parse_handler_fields(source_name, start_line, &declaration[open + 1..close])?;
+        let has_annotation = |annotation: &str| {
+            declaration[close + 1..]
+                .split_whitespace()
+                .any(|token| token == annotation)
+        };
+        let opcode = parse_opcode_annotation(&declaration[close + 1..])
+            .map_err(|message| ParseError::new(source_name, start_line, 1, format!("handler '{name}': {message}")))?;
         let mut op = InstructionDefinition {
             name: name.to_string(),
             parent: "Instruction".to_string(),
             fields,
-            is_terminator: declaration[close + 1..]
-                .split_whitespace()
-                .any(|token| token == "@terminator"),
+            is_terminator: has_annotation("@terminator"),
+            falls_through: has_annotation("@fallthrough"),
             layout: OpLayout::default(),
             array: None,
+            opcode,
+            is_fallback: has_annotation("@fallback"),
         };
+        if op.falls_through && !op.is_terminator {
+            return Err(ParseError::new(
+                source_name,
+                start_line,
+                1,
+                format!("handler '{name}' is @fallthrough but not @terminator"),
+            ));
+        }
         validate_op(&mut op).map_err(|message| ParseError::new(source_name, start_line, 1, message))?;
         ops.push(op);
         line_index += 1;
     }
     Ok(ops)
+}
+
+fn parse_integer_literal(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Some(hexadecimal) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return u64::from_str_radix(hexadecimal, 16).ok();
+    }
+    text.parse().ok()
+}
+
+/// Parse the `@opcode(primary)` or `@opcode(prefix, sub_opcode)` annotation
+/// that follows a handler's parameter list, if it has one.
+fn parse_opcode_annotation(annotations: &str) -> Result<Option<RawOpcode>, String> {
+    let Some(start) = annotations.find("@opcode") else {
+        return Ok(None);
+    };
+    let rest = annotations[start + "@opcode".len()..].trim_start();
+    let arguments = rest
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(')'))
+        .map(|(arguments, _)| arguments)
+        .ok_or("malformed @opcode annotation")?;
+    let values = arguments
+        .split(',')
+        .map(|argument| parse_integer_literal(argument).ok_or(format!("invalid opcode '{}'", argument.trim())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let byte = |value: u64| u8::try_from(value).map_err(|_| format!("opcode {value:#x} does not fit in a byte"));
+    match values.as_slice() {
+        [primary] => Ok(Some(RawOpcode::Primary(byte(*primary)?))),
+        [prefix, sub_opcode] => Ok(Some(RawOpcode::Prefixed {
+            prefix: byte(*prefix)?,
+            sub_opcode: u32::try_from(*sub_opcode).map_err(|_| format!("sub-opcode {sub_opcode:#x} is too large"))?,
+        })),
+        _ => Err("@opcode takes an opcode byte, or a prefix byte and a sub-opcode".to_string()),
+    }
 }
 
 fn find_matching_parenthesis(source: &str, open: usize) -> Option<usize> {
@@ -446,10 +546,8 @@ fn parse_specialization(source_name: &str, line: usize, source: &str) -> Result<
         index: 0,
     };
     parser.expect("specialize")?;
-    let mut components = vec![parser.parse_component()?];
-    while parser.consume("+") {
-        components.push(parser.parse_component()?);
-    }
+    let bytecode = parser.identifier("bytecode name")?.to_string();
+    let parameters = parser.parse_parameters()?;
     let name = if parser.consume("as") {
         Some(parser.identifier("specialization name")?.to_string())
     } else {
@@ -459,7 +557,11 @@ fn parse_specialization(source_name: &str, line: usize, source: &str) -> Result<
     if parser.index != tokens.len() {
         return Err(parser.error("unexpected token after specialization declaration"));
     }
-    Ok(Specialization { components, name })
+    Ok(Specialization {
+        bytecode,
+        parameters,
+        name,
+    })
 }
 
 fn tokenize_specialization(source_name: &str, line: usize, source: &str) -> Result<Vec<String>, ParseError> {
@@ -476,7 +578,7 @@ fn tokenize_specialization(source_name: &str, line: usize, source: &str) -> Resu
         if character.is_whitespace() {
             continue;
         }
-        if matches!(character, '(' | ')' | ',' | ':' | '+' | ';') {
+        if matches!(character, '(' | ')' | ',' | ':' | ';') {
             tokens.push(character.to_string());
         } else {
             return Err(ParseError::new(
@@ -535,8 +637,7 @@ impl SpecializationParser<'_> {
         Ok(&self.tokens[self.index - 1])
     }
 
-    fn parse_component(&mut self) -> Result<SpecializationComponent, ParseError> {
-        let bytecode = self.identifier("bytecode name")?.to_string();
+    fn parse_parameters(&mut self) -> Result<Vec<SpecializationParameter>, ParseError> {
         self.expect("(")?;
         let mut parameters = Vec::new();
         while !self.consume(")") {
@@ -549,7 +650,7 @@ impl SpecializationParser<'_> {
             }
             self.expect(",")?;
         }
-        Ok(SpecializationComponent { bytecode, parameters })
+        Ok(parameters)
     }
 
     fn parse_constraint(&mut self) -> Result<SpecializationConstraint, ParseError> {
@@ -569,36 +670,37 @@ impl SpecializationParser<'_> {
 fn try_field_type_info(ty: &str) -> Option<FieldType> {
     Some(
         match ty {
-            "bool" => ("bool", 1, 1, "bool"),
-            "i32" => ("i32", 4, 4, "i32"),
-            "u32" => ("u32", 4, 4, "u32"),
-            "u64" => ("u64", 8, 8, "u64"),
-            "Operand" => ("Operand", 4, 4, "operand"),
-            "Optional<Operand>" => ("Option<Operand>", 4, 4, "optional_operand"),
-            "Label" => ("Label", 4, 4, "label"),
-            "Optional<Label>" => ("Option<Label>", 4, 8, "optional_label"),
-            "IdentifierTableIndex" => ("IdentifierTableIndex", 4, 4, "u32_newtype"),
-            "Optional<IdentifierTableIndex>" => ("Option<IdentifierTableIndex>", 4, 4, "optional_u32_newtype"),
-            "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 4, 4, "u32_newtype"),
-            "StringTableIndex" => ("StringTableIndex", 4, 4, "u32_newtype"),
-            "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 4, 4, "optional_u32_newtype"),
-            "RegexTableIndex" => ("RegexTableIndex", 4, 4, "u32_newtype"),
-            "EnvironmentCoordinate" => ("EnvironmentCoordinate", 4, 8, "env_coord"),
-            "Builtin" => ("u8", 1, 1, "u8"),
-            "Completion::Type" => ("u32", 4, 4, "u32"),
-            "IteratorHint" => ("u32", 4, 4, "u32"),
-            "EnvironmentMode" => ("u32", 4, 4, "u32"),
-            "PutKind" => ("u32", 4, 4, "u32"),
-            "ArgumentsKind" => ("u32", 4, 4, "u32"),
-            "FunctionNamePrefix" => ("u32", 4, 4, "u32"),
-            "Value" => ("u64", 8, 8, "u64"),
+            "bool" => ("bool", 1, "bool"),
+            "u8" => ("u32", 1, "byte_count"),
+            "u16" => ("u16", 2, "u16"),
+            "i32" => ("i32", 4, "i32"),
+            "u32" => ("u32", 4, "u32"),
+            "u64" => ("u64", 8, "u64"),
+            "Operand" => ("Operand", OPERAND_SIZE, "operand"),
+            "Optional<Operand>" => ("Option<Operand>", OPERAND_SIZE, "optional_operand"),
+            "Label" => ("Label", 4, "label"),
+            "Optional<Label>" => ("Option<Label>", 5, "optional_label"),
+            "IdentifierTableIndex" => ("IdentifierTableIndex", 2, "u32_newtype"),
+            "Optional<IdentifierTableIndex>" => ("Option<IdentifierTableIndex>", 2, "optional_u32_newtype"),
+            "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 2, "u32_newtype"),
+            "StringTableIndex" => ("StringTableIndex", 2, "u32_newtype"),
+            "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 2, "optional_u32_newtype"),
+            "EnvironmentCoordinate" => ("EnvironmentCoordinate", 3, "env_coord"),
+            "Builtin" | "Completion::Type" | "IteratorHint" | "EnvironmentMode" | "PutKind" | "ArgumentsKind"
+            | "FunctionNamePrefix" => ("u8", 1, "u8"),
+            "Value" => ("u64", 8, "u64"),
             "PropertyLookupCacheIndex"
+            | "ProfiledPropertyLookupCacheIndex"
             | "GlobalVariableCacheIndex"
             | "EnvironmentCoordinateCacheIndex"
-            | "TemplateObjectCacheIndex"
-            | "ObjectShapeCacheIndex"
-            | "ObjectPropertyIteratorCacheIndex"
-            | "EnvironmentShapeCacheIndex" => ("u32", 4, 4, "u32"),
+            | "ObjectShapeCacheIndex" => ("u32", 2, "cache_index"),
+            // NB: The sites of these are rare and they cannot share a slot, so they stay wide.
+            "TemplateObjectCacheIndex" | "ObjectPropertyIteratorCacheIndex" | "EnvironmentShapeCacheIndex" => {
+                ("u32", 4, "u32")
+            }
+            "ArithFeedbackIndex" | "CallFeedbackIndex" | "KeyedFeedbackIndex" | "ValueFeedbackIndex" => {
+                ("u16", 2, "u16")
+            }
             _ => return None,
         }
         .into(),
@@ -614,11 +716,11 @@ pub fn round_up(value: usize, align: usize) -> usize {
     value.checked_add(align - 1).expect("layout size overflow") & !(align - 1)
 }
 
-/// Returns the user-visible fields (excludes m_type, m_strict, m_length).
+/// Returns the user-visible fields (excludes m_type, m_strict).
 pub fn user_fields(op: &InstructionDefinition) -> Vec<&Field> {
     op.fields
         .iter()
-        .filter(|f| f.name != "m_type" && f.name != "m_strict" && f.name != "m_length")
+        .filter(|f| f.name != "m_type" && f.name != "m_strict")
         .collect()
 }
 
@@ -627,7 +729,7 @@ fn count_field_index(op: &InstructionDefinition, array_field: &Field) -> Option<
     let singular = array_field.name.strip_suffix('s').map(|name| format!("{name}_count"));
     op.fields.iter().position(|field| {
         !field.is_array
-            && field.ty == "u32"
+            && (field.ty == "u32" || field.ty == "u8")
             && (field.name == plural || singular.as_ref().is_some_and(|name| field.name == *name))
     })
 }
@@ -641,7 +743,7 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
         return Err(format!("op '{}' must derive directly from Instruction", op.name));
     }
 
-    let mut offset = 2usize;
+    let mut offset = 1usize;
     let mut field_offsets = HashMap::new();
     let array_indices = op
         .fields
@@ -666,10 +768,6 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
             continue;
         }
         let info = try_field_type_info(&field.ty).expect("field types are checked while parsing");
-        offset = offset
-            .checked_add(info.align - 1)
-            .map(|offset| offset & !(info.align - 1))
-            .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?;
         field_offsets.insert(field.name.clone(), offset);
         offset = offset
             .checked_add(info.size)
@@ -677,54 +775,35 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
     }
 
     let array = if let Some(array_index) = array_indices.first().copied() {
-        let length_field = op
-            .fields
-            .iter()
-            .position(|field| field.name == "m_length" && field.ty == "u32" && !field.is_array);
-        if length_field.is_none() {
-            return Err(format!("array op '{}' requires a u32 m_length field", op.name));
-        }
         let count_field_index = count_field_index(op, &op.fields[array_index]).ok_or_else(|| {
             format!(
-                "array field '{}' in op '{}' requires a matching u32 count field",
+                "array field '{}' in op '{}' requires a matching u8 or u32 count field",
                 op.fields[array_index].name, op.name
             )
         })?;
+        if op.fields[array_index].ty == "Operand" && op.fields[count_field_index].ty != "u8" {
+            return Err(format!(
+                "operand array field '{}' in op '{}' requires a u8 count field",
+                op.fields[array_index].name, op.name
+            ));
+        }
         let info = try_field_type_info(&op.fields[array_index].ty).expect("field types are checked while parsing");
-        let array_offset = offset
-            .checked_add(info.align - 1)
-            .map(|offset| offset & !(info.align - 1))
-            .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?;
-        field_offsets.insert(op.fields[array_index].name.clone(), array_offset);
+        field_offsets.insert(op.fields[array_index].name.clone(), offset);
         Some(ArrayLayout {
             field_index: array_index,
             count_field_index,
-            offset: array_offset,
+            offset,
             element_size: info.size,
         })
     } else {
         None
     };
-    let size = if array.is_some() {
-        None
-    } else {
-        Some(
-            offset
-                .checked_add(STRUCT_ALIGN - 1)
-                .map(|offset| offset & !(STRUCT_ALIGN - 1))
-                .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?,
-        )
-    };
-    let minimum_size = offset
-        .checked_add(STRUCT_ALIGN - 1)
-        .map(|offset| offset & !(STRUCT_ALIGN - 1))
-        .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?;
-    let m_length_offset = field_offsets.get("m_length").copied();
+    let size = array.is_none().then_some(offset);
+    let minimum_size = offset;
     op.layout = OpLayout {
         field_offsets,
         size,
         minimum_size,
-        m_length_offset,
     };
     op.array = array;
     Ok(())
@@ -733,14 +812,12 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
 /// Computed layout info for a single opcode.
 #[derive(Debug, Clone, Default)]
 pub struct OpLayout {
-    /// Byte offset of each field within the C++ struct (keyed by field name, e.g. "m_dst").
+    /// Byte offset of each field within the instruction (keyed by field name, e.g. "m_dst").
     pub field_offsets: HashMap<String, usize>,
     /// Total encoded size (for fixed-size instructions), or None for variable-length.
     pub size: Option<usize>,
-    /// Minimum encoded size, including the fixed header and tail padding.
+    /// Minimum encoded size: the fixed fields, without the array.
     pub minimum_size: usize,
-    /// Byte offset of m_length for variable-length instructions.
-    pub m_length_offset: Option<usize>,
 }
 
 /// Compute field offsets and total sizes for all opcodes.
@@ -757,66 +834,59 @@ pub fn derive_specialized_instructions(
 
     for specialization in specializations {
         let name = specialization_name(specialization);
+        let op = ops_by_name.get(specialization.bytecode.as_str()).ok_or_else(|| {
+            format!(
+                "specialization references unknown bytecode '{}'",
+                specialization.bytecode
+            )
+        })?;
+        let constraints = specialization
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), &parameter.constraint))
+            .collect::<HashMap<_, _>>();
         let mut fields = Vec::new();
-        let mut components = Vec::with_capacity(specialization.components.len());
-        let is_fused = specialization.components.len() > 1;
-        for (component_index, component) in specialization.components.iter().enumerate() {
-            let op = ops_by_name
-                .get(component.bytecode.as_str())
-                .ok_or_else(|| format!("specialization references unknown bytecode '{}'", component.bytecode))?;
-            let constraints = component
-                .parameters
-                .iter()
-                .map(|parameter| (parameter.name.as_str(), &parameter.constraint))
-                .collect::<HashMap<_, _>>();
-            let mut parameters = HashMap::new();
+        let mut parameters = HashMap::new();
 
-            for field in user_fields(op) {
-                let source_name = field.name.strip_prefix("m_").unwrap_or(&field.name);
-                let constraint = constraints.get(source_name).copied();
-                let binding = match constraint {
-                    Some(SpecializationConstraint::Undefined) => SpecializedParameterBinding::Undefined,
-                    constraint => {
-                        let specialized_name = if is_fused {
-                            format!("c{component_index}_{source_name}")
-                        } else {
-                            source_name.to_string()
-                        };
-                        let ty = match constraint {
-                            Some(SpecializationConstraint::Int32) => "i32",
-                            _ => field.ty.as_str(),
-                        };
-                        fields.push(Field {
-                            name: format!("m_{specialized_name}"),
-                            ty: ty.to_string(),
-                            is_array: field.is_array,
-                            mode: field.mode,
-                        });
-                        SpecializedParameterBinding::Field(specialized_name)
-                    }
-                };
-                parameters.insert(source_name.to_string(), binding);
-            }
-            components.push(SpecializedComponentLayout {
-                bytecode: component.bytecode.clone(),
-                parameters,
-            });
+        for field in user_fields(op) {
+            let source_name = field.name.strip_prefix("m_").unwrap_or(&field.name);
+            let constraint = constraints.get(source_name).copied();
+            let binding = match constraint {
+                Some(SpecializationConstraint::Undefined) => SpecializedParameterBinding::Undefined,
+                constraint => {
+                    let ty = match constraint {
+                        Some(SpecializationConstraint::Int32) => "i32",
+                        _ => field.ty.as_str(),
+                    };
+                    fields.push(Field {
+                        name: format!("m_{source_name}"),
+                        ty: ty.to_string(),
+                        is_array: field.is_array,
+                        mode: field.mode,
+                    });
+                    SpecializedParameterBinding::Field(source_name.to_string())
+                }
+            };
+            parameters.insert(source_name.to_string(), binding);
         }
 
-        let last_component = specialization
-            .components
-            .last()
-            .expect("specializations contain at least one component");
         let mut definition = InstructionDefinition {
             name,
             parent: "Instruction".to_string(),
             fields,
-            is_terminator: ops_by_name[last_component.bytecode.as_str()].is_terminator,
+            is_terminator: op.is_terminator,
+            falls_through: op.falls_through,
             layout: OpLayout::default(),
             array: None,
+            opcode: None,
+            is_fallback: false,
         };
         validate_op(&mut definition)?;
-        derived.push(SpecializedInstruction { definition, components });
+        derived.push(SpecializedInstruction {
+            definition,
+            bytecode: specialization.bytecode.clone(),
+            parameters,
+        });
     }
 
     Ok(derived)
@@ -830,12 +900,12 @@ mod tests {
     fn lays_out_explicit_helper_values_with_operand_modes() {
         let ops = parse_flap_metadata(
             "test.flap",
-            "handler Call(length: u32, dst: out Operand, callee: in Operand, state: inout Optional<Operand>, argument_count: u32, arguments: Operand[]) = call_slow_path(call);",
+            "handler Call(dst: out Operand, callee: in Operand, state: inout Optional<Operand>, argument_count: u8, arguments: Operand[]) = call_slow_path(call);",
         )
         .unwrap();
         let op = &ops[0];
         let layout = SlowPathLayout::new(op);
-        assert!(!layout.uses_scalar_arguments());
+        assert_eq!(layout.abi(false), SlowPathAbi::Record);
         assert_eq!(layout.fields.len(), 3);
         for (index, (name, mode)) in [
             ("m_dst", ParameterMode::Out),
@@ -845,6 +915,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
+            assert_eq!(layout.fields[index].name, name);
             assert_eq!(layout.fields[index].instruction_offset, op.layout.field_offsets[name]);
             assert_eq!(layout.fields[index].value_offset, index * 8);
             assert_eq!(layout.fields[index].mode, mode);
@@ -852,11 +923,12 @@ mod tests {
         }
         assert_eq!(
             layout.array,
-            Some((
-                op.array.as_ref().unwrap().offset,
-                op.layout.field_offsets["m_argument_count"],
-                false
-            ))
+            Some(SlowPathArray {
+                name: "m_arguments".to_string(),
+                instruction_offset: op.array.as_ref().unwrap().offset,
+                count_offset: op.layout.field_offsets["m_argument_count"],
+                optional: false,
+            })
         );
     }
 
@@ -866,10 +938,13 @@ mod tests {
             "test.flap",
             "handler Get(dst: out Operand, base: Operand, property: Optional<Operand>) { dispatch_next; }\nhandler Update(dst: out Operand, src: inout Operand) { dispatch_next; }\nhandler OptionalOutput(dst: out Optional<Operand>) { dispatch_next; }\nhandler Put(base: Operand, value: Operand) { dispatch_next; }",
         ).unwrap();
-        assert!(SlowPathLayout::new(&ops[0]).uses_scalar_arguments());
-        assert!(!SlowPathLayout::new(&ops[1]).uses_scalar_arguments());
-        assert!(!SlowPathLayout::new(&ops[2]).uses_scalar_arguments());
-        assert!(SlowPathLayout::new(&ops[3]).uses_scalar_arguments());
+        assert_eq!(SlowPathLayout::new(&ops[0]).abi(false), SlowPathAbi::Scalar);
+        assert_eq!(SlowPathLayout::new(&ops[1]).abi(false), SlowPathAbi::Mixed);
+        assert_eq!(SlowPathLayout::new(&ops[2]).abi(false), SlowPathAbi::Mixed);
+        assert_eq!(SlowPathLayout::new(&ops[3]).abi(false), SlowPathAbi::Scalar);
+        for op in &ops {
+            assert_eq!(SlowPathLayout::new(op).abi(true), SlowPathAbi::Record);
+        }
     }
 
     #[test]
@@ -878,8 +953,7 @@ mod tests {
             "interpreter.flap",
             r#"
 handler Call(
-    length: u32,
-    argument_count: u32,
+    argument_count: u8,
     arguments: Operand[]
 ) @terminator = call_slow_path(call);
 "#,
@@ -889,8 +963,21 @@ handler Call(
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].name, "Call");
         assert!(ops[0].is_terminator);
-        assert_eq!(ops[0].fields.len(), 3);
-        assert!(ops[0].fields[2].is_array);
+        assert!(!ops[0].falls_through);
+        assert_eq!(ops[0].fields.len(), 2);
+        assert!(ops[0].fields[1].is_array);
+    }
+
+    #[test]
+    fn parses_fallthrough_terminators() {
+        let ops = parse_flap_metadata(
+            "test.flap",
+            "handler JumpTrue(condition: in Operand, target: BytecodeOffset) @terminator @fallthrough { dispatch_next; }\nhandler Jump(target: BytecodeOffset) @terminator = jump(target);",
+        )
+        .unwrap();
+
+        assert!(ops[0].is_terminator && ops[0].falls_through);
+        assert!(ops[1].is_terminator && !ops[1].falls_through);
     }
 
     #[test]
@@ -922,29 +1009,24 @@ handler Second() { dispatch_next; }
     }
 
     #[test]
-    fn parses_specializations_of_arbitrary_length() {
+    fn parses_specializations() {
         let specializations = parse_specializations(
             "test.flap",
             r#"
 specialize Add(rhs: Int32);
-specialize Increment()
-    + JumpLessThan(rhs: Int32);
-specialize Mov() + Add(rhs: Undefined)
-    + JumpIf(condition: Int32) as HotLoop;
-specialize A() + B() + C() + D();
+specialize JumpIf(
+    condition: Int32) as HotLoop;
 "#,
         )
         .unwrap();
 
-        assert_eq!(specializations.len(), 4);
-        assert_eq!(specializations[1].components.len(), 2);
+        assert_eq!(specializations.len(), 2);
+        assert_eq!(specializations[0].bytecode, "Add");
         assert_eq!(
-            specializations[1].components[1].parameters[0].constraint,
+            specializations[0].parameters[0].constraint,
             SpecializationConstraint::Int32
         );
-        assert_eq!(specializations[2].components.len(), 3);
-        assert_eq!(specializations[2].name.as_deref(), Some("HotLoop"));
-        assert_eq!(specializations[3].components.len(), 4);
+        assert_eq!(specializations[1].name.as_deref(), Some("HotLoop"));
     }
 
     #[test]
@@ -952,24 +1034,20 @@ specialize A() + B() + C() + D();
         let specializations = parse_specializations(
             "test.flap",
             r#"
-specialize Increment() # Continue with the comparison.
-    + JumpLessThan( # Only the right-hand side is constant.
-        rhs: Int32); # End the declaration.
+specialize JumpLessThan( # Only the right-hand side is constant.
+    rhs: Int32); # End the declaration.
 "#,
         )
         .unwrap();
 
         assert_eq!(specializations.len(), 1);
-        assert_eq!(specializations[0].components.len(), 2);
+        assert_eq!(specializations[0].parameters.len(), 1);
     }
 
     #[test]
-    fn derives_compact_single_and_fused_instruction_layouts() {
+    fn derives_compact_instruction_layouts() {
         let source = r#"
 handler Add(dst: out Operand, lhs: in Operand, rhs: in Operand) {
-    dispatch_next;
-}
-handler Increment(dst: inout Operand) {
     dispatch_next;
 }
 handler Mov(dst: out Operand, src: in Operand) {
@@ -980,7 +1058,7 @@ handler JumpLessThan(lhs: in Operand, rhs: in Operand, target: Label) @terminato
 }
 specialize Add(rhs: Int32);
 specialize Mov(src: Undefined);
-specialize Increment() + JumpLessThan(rhs: Int32);
+specialize JumpLessThan(rhs: Int32);
 "#;
         let ops = parse_flap_metadata("test.flap", source).unwrap();
         let specializations = parse_specializations("test.flap", source).unwrap();
@@ -1006,11 +1084,8 @@ specialize Increment() + JumpLessThan(rhs: Int32);
                 .collect::<Vec<_>>(),
             [("m_dst", "Operand")]
         );
-        assert_eq!(
-            derived[1].components[0].parameters["src"],
-            SpecializedParameterBinding::Undefined
-        );
-        assert_eq!(derived[2].definition.name, "IncrementJumpLessThanRhsInt32");
+        assert_eq!(derived[1].parameters["src"], SpecializedParameterBinding::Undefined);
+        assert_eq!(derived[2].definition.name, "JumpLessThanRhsInt32");
         assert_eq!(
             derived[2]
                 .definition
@@ -1018,44 +1093,12 @@ specialize Increment() + JumpLessThan(rhs: Int32);
                 .iter()
                 .map(|field| (field.name.as_str(), field.ty.as_str()))
                 .collect::<Vec<_>>(),
-            [
-                ("m_c0_dst", "Operand"),
-                ("m_c1_lhs", "Operand"),
-                ("m_c1_rhs", "i32"),
-                ("m_c1_target", "Label"),
-            ]
+            [("m_lhs", "Operand"), ("m_rhs", "i32"), ("m_target", "Label")]
         );
         assert!(derived[2].definition.is_terminator);
         assert_eq!(
-            derived[2].components[1].parameters["lhs"],
-            SpecializedParameterBinding::Field("c1_lhs".to_string())
-        );
-    }
-
-    #[test]
-    fn qualifies_field_names_across_fused_components() {
-        let source = r#"
-handler Copy(dst: out Operand) { dispatch_next; }
-handler Convert(dst: out Operand) { dispatch_next; }
-handler Use(dst1: in Operand) { dispatch_next; }
-specialize Copy() + Convert() + Use();
-"#;
-        let ops = parse_flap_metadata("test.flap", source).unwrap();
-        let specializations = parse_specializations("test.flap", source).unwrap();
-        let derived = derive_specialized_instructions(&ops, &specializations).unwrap();
-
-        assert_eq!(
-            derived[0]
-                .definition
-                .fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect::<Vec<_>>(),
-            ["m_c0_dst", "m_c1_dst", "m_c2_dst1"]
-        );
-        assert_eq!(
-            derived[0].components[2].parameters["dst1"],
-            SpecializedParameterBinding::Field("c2_dst1".to_string())
+            derived[2].parameters["lhs"],
+            SpecializedParameterBinding::Field("lhs".to_string())
         );
     }
 
@@ -1116,12 +1159,16 @@ specialize Copy() + Convert() + Use();
                 "duplicate handler parameter 'value'",
             ),
             (
-                "handler Array(values: Value[]) { dispatch_next; }\n",
-                "requires a u32 m_length field",
+                "handler Fall() @fallthrough { dispatch_next; }\n",
+                "is @fallthrough but not @terminator",
             ),
             (
-                "handler Array(length: u32, values: Value[]) { dispatch_next; }\n",
-                "requires a matching u32 count field",
+                "handler Array(values: Value[]) { dispatch_next; }\n",
+                "requires a matching u8 or u32 count field",
+            ),
+            (
+                "handler Call(argument_count: u32, arguments: Operand[]) { dispatch_next; }\n",
+                "requires a u8 count field",
             ),
             (
                 "handler Array(length: u32, value_count: u32, values: Value[], tail: u32) { dispatch_next; }\n",

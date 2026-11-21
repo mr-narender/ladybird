@@ -1,0 +1,12 @@
+Harness status: OK
+
+Found 7 tests
+
+7 Pass
+Pass	'grid-area' does not support 'a'
+Pass	'grid-area' does not support 'a / a'
+Pass	'grid-area' does not support 'auto'
+Pass	'grid-area' does not support 'auto / auto'
+Pass	'grid-area' does not support '2 / 1 / 2'
+Pass	'grid-area' does not support 'span 3'
+Pass	'grid-area' does not support '2 span / a span'

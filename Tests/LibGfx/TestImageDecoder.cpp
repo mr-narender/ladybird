@@ -5,10 +5,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/ByteString.h>
 #include <LibCore/MappedFile.h>
 #include <LibGfx/ImageFormats/AVIFLoader.h>
 #include <LibGfx/ImageFormats/BMPLoader.h>
+#include <LibGfx/ImageFormats/ExifReader.h>
 #include <LibGfx/ImageFormats/GIFLoader.h>
 #include <LibGfx/ImageFormats/ICOLoader.h>
 #include <LibGfx/ImageFormats/ImageDecoder.h>
@@ -40,6 +42,63 @@ static ErrorOr<Gfx::ImageFrameDescriptor> expect_single_frame_of_size(Gfx::Image
     auto frame = TRY(expect_single_frame(plugin_decoder));
     EXPECT_EQ(frame.image->size(), size);
     return frame;
+}
+
+static void append_u16(Vector<u8>& data, u16 value)
+{
+    data.append(value & 0xff);
+    data.append(value >> 8);
+}
+
+static void append_u32(Vector<u8>& data, u32 value)
+{
+    append_u16(data, value & 0xffff);
+    append_u16(data, value >> 16);
+}
+
+static void append_bitmap_info_header(Vector<u8>& data, u32 header_size, i32 width, i32 height, u16 bits_per_pixel, u32 compression, u32 palette_colors)
+{
+    append_u32(data, header_size);
+    append_u32(data, width);
+    append_u32(data, height);
+    append_u16(data, 1); // Plane count.
+    append_u16(data, bits_per_pixel);
+    append_u32(data, compression);
+    append_u32(data, 0); // Pixel data size.
+    append_u32(data, 0); // Horizontal resolution.
+    append_u32(data, 0); // Vertical resolution.
+    append_u32(data, palette_colors);
+    append_u32(data, 0); // Important palette colors.
+}
+
+static Vector<u8> make_bmp_file(ReadonlyBytes dib, size_t pixel_offset_in_dib)
+{
+    Vector<u8> data;
+    data.append('B');
+    data.append('M');
+    append_u32(data, 14 + dib.size()); // File size.
+    append_u32(data, 0);               // Reserved.
+    append_u32(data, 14 + pixel_offset_in_dib);
+    data.append(dib.data(), dib.size());
+    return data;
+}
+
+static Vector<u8> make_ico_file(u8 width, u8 height, u16 bits_per_pixel, ReadonlyBytes image)
+{
+    Vector<u8> data;
+    append_u16(data, 0); // Reserved.
+    append_u16(data, 1); // Icon type.
+    append_u16(data, 1); // Image count.
+    data.append(width);
+    data.append(height);
+    data.append(0);      // Palette colors.
+    data.append(0);      // Reserved.
+    append_u16(data, 1); // Plane count.
+    append_u16(data, bits_per_pixel);
+    append_u32(data, image.size());
+    append_u32(data, 22); // Image offset.
+    data.append(image.data(), image.size());
+    return data;
 }
 
 static ErrorOr<ByteBuffer> make_webp_with_declared_but_missing_iccp_chunk(ReadonlyBytes simple_webp)
@@ -82,6 +141,38 @@ static ErrorOr<ByteBuffer> make_webp_with_declared_but_missing_iccp_chunk(Readon
 
     TRY(extended_webp.try_append(vp8_chunk));
     return extended_webp;
+}
+
+TEST_CASE(test_frames_are_decoded_into_shareable_bitmaps)
+{
+    Array paths {
+        TEST_INPUT("avif/simple-lossy.avif"sv),
+        TEST_INPUT("bmp/bitmap.bmp"sv),
+        TEST_INPUT("gif/download-animation.gif"sv),
+        TEST_INPUT("ico/serenity.ico"sv),
+        TEST_INPUT("jpg/rgb24.jpg"sv),
+        TEST_INPUT("jpg/cmyk-no-adobe-marker.jpg"sv),
+        TEST_INPUT("jpg/ycck-1111.jpg"sv),
+        TEST_INPUT("jxl/modular_simple_tree_upsample2_10bits_rct.jxl"sv),
+        TEST_INPUT("png/buggie.png"sv),
+        TEST_INPUT("png/apng-blend.png"sv),
+        TEST_INPUT("png/corrupt-idat.png"sv),
+        TEST_INPUT("png/exif-orientation-5.png"sv),
+        TEST_INPUT("webp/simple-vp8.webp"sv),
+        TEST_INPUT("webp/extended-lossless-animated.webp"sv),
+    };
+    for (auto path : paths) {
+        auto file = TRY_OR_FAIL(Core::MappedFile::map(path));
+        auto decoder = TRY_OR_FAIL(Gfx::ImageDecoder::try_create_for_raw_bytes(file->bytes()));
+        EXPECT(decoder);
+        if (!decoder)
+            continue;
+        for (size_t index = 0; index < decoder->frame_count(); ++index) {
+            auto frame = TRY_OR_FAIL(decoder->frame(index));
+            if (!frame.image->is_in_shareable_memory())
+                FAIL(ByteString::formatted("Frame {} of {} is not shareable", index, path));
+        }
+    }
 }
 
 TEST_CASE(test_bmp)
@@ -202,8 +293,7 @@ TEST_CASE(test_bmp_v4)
 TEST_CASE(test_bmp_negative_int_min_height)
 {
     auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("bmp/negative-height-int-min.bmp"sv)));
-    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(file->bytes()));
-    EXPECT(plugin_decoder->frame(0).is_error());
+    EXPECT(Gfx::BMPImageDecoderPlugin::create(file->bytes()).is_error());
 }
 
 TEST_CASE(test_bmp_v5_icc_profile_out_of_bounds)
@@ -234,9 +324,136 @@ TEST_CASE(test_bmp_rle24)
     auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(file->bytes()));
 
     auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 2, 1 }));
-    EXPECT_EQ(frame.image->format(), Gfx::BitmapFormat::RGBx8888);
-    EXPECT_EQ(frame.image->begin()[0] & 0x00ffffffU, 0x00332211U);
-    EXPECT_EQ(frame.image->begin()[1] & 0x00ffffffU, 0x00332211U);
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color(0x11, 0x22, 0x33));
+    EXPECT_EQ(frame.image->get_pixel(1, 0), Gfx::Color(0x11, 0x22, 0x33));
+}
+
+TEST_CASE(test_bmp_rle4_rows_with_odd_width)
+{
+    // 9x2 BI_RLE4 image. Each row is one run of two alternating colors, so every row ends mid-byte.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 9, 2, 4, 2 /* BI_RLE4 */, 16);
+    for (u8 i = 0; i < 16; ++i)
+        append_u32(dib, i * 16 << 16);
+    auto pixel_offset = dib.size();
+    Array<u8, 8> rle_data { 9, 0x12, 0, 0, 9, 0x34, 0, 1 };
+    dib.append(rle_data.data(), rle_data.size());
+    auto bmp_data = make_bmp_file(dib, pixel_offset);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(bmp_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 9, 2 }));
+    for (int x = 0; x < 9; ++x) {
+        EXPECT_EQ(frame.image->get_pixel(x, 0), Gfx::Color(x % 2 ? 4 * 16 : 3 * 16, 0, 0));
+        EXPECT_EQ(frame.image->get_pixel(x, 1), Gfx::Color(x % 2 ? 2 * 16 : 1 * 16, 0, 0));
+    }
+}
+
+TEST_CASE(test_bmp_rgb32_has_no_alpha_channel)
+{
+    // 2x1 BI_RGB image. Without an alpha mask, the fourth byte of each pixel is not alpha.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 2, 1, 32, 0 /* BI_RGB */, 0);
+    auto pixel_offset = dib.size();
+    Array<u8, 8> pixels { 0x33, 0x22, 0x11, 0x00, 0x66, 0x55, 0x44, 0x80 };
+    dib.append(pixels.data(), pixels.size());
+    auto bmp_data = make_bmp_file(dib, pixel_offset);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(bmp_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 2, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color(0x11, 0x22, 0x33));
+    EXPECT_EQ(frame.image->get_pixel(1, 0), Gfx::Color(0x44, 0x55, 0x66));
+}
+
+TEST_CASE(test_bmp_v4_rgb16_with_empty_alpha_mask_is_opaque)
+{
+    // 1x1 BI_BITFIELDS RGB565 image with a BITMAPV4HEADER whose alpha mask is zero.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 108, 1, 1, 16, 3 /* BI_BITFIELDS */, 0);
+    append_u32(dib, 0xf800); // Red mask.
+    append_u32(dib, 0x07e0); // Green mask.
+    append_u32(dib, 0x001f); // Blue mask.
+    append_u32(dib, 0);      // Alpha mask.
+    dib.resize(108);         // Color space, endpoints and gamma.
+    auto pixel_offset = dib.size();
+    append_u32(dib, 0xf800); // Red pixel, then row padding.
+    auto bmp_data = make_bmp_file(dib, pixel_offset);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(bmp_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 1, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color::NamedColor::Red);
+}
+
+TEST_CASE(test_bmp_palette_index_out_of_range_is_black)
+{
+    // 2x1 8-bit image with a one-color palette, whose second pixel uses an index past the end of the palette.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 2, 1, 8, 0 /* BI_RGB */, 1);
+    append_u32(dib, 0xff0000); // Red.
+    auto pixel_offset = dib.size();
+    Array<u8, 4> pixels { 0, 5, 0, 0 };
+    dib.append(pixels.data(), pixels.size());
+    auto bmp_data = make_bmp_file(dib, pixel_offset);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(bmp_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 2, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color::NamedColor::Red);
+    EXPECT_EQ(frame.image->get_pixel(1, 0), Gfx::Color::NamedColor::Black);
+}
+
+TEST_CASE(test_bmp_ignores_plane_count)
+{
+    // 1x1 24-bit image whose plane count is 0 instead of 1.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 1, 1, 24, 0 /* BI_RGB */, 0);
+    dib[12] = 0;
+    auto pixel_offset = dib.size();
+    append_u32(dib, 0xff0000); // Red pixel in BGR order, then row padding.
+    auto bmp_data = make_bmp_file(dib, pixel_offset);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(bmp_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 1, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color::NamedColor::Red);
+}
+
+TEST_CASE(test_bmp_rle8_skipped_pixels_are_transparent)
+{
+    // 4x1 BI_RLE8 image: one red pixel, a delta that skips two pixels, then one green pixel.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 4, 1, 8, 1 /* BI_RLE8 */, 3);
+    append_u32(dib, 0x0000ff); // Blue.
+    append_u32(dib, 0xff0000); // Red.
+    append_u32(dib, 0x00ff00); // Green.
+    auto pixel_offset = dib.size();
+    Array<u8, 10> rle_data { 1, 1, 0, 2, 2, 0, 1, 2, 0, 1 };
+    dib.append(rle_data.data(), rle_data.size());
+    auto bmp_data = make_bmp_file(dib, pixel_offset);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(bmp_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 4, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color::NamedColor::Red);
+    EXPECT_EQ(frame.image->get_pixel(1, 0).alpha(), 0);
+    EXPECT_EQ(frame.image->get_pixel(2, 0).alpha(), 0);
+    EXPECT_EQ(frame.image->get_pixel(3, 0), Gfx::Color::NamedColor::Green);
+}
+
+TEST_CASE(test_bmp_rle8_top_down)
+{
+    // 2x2 top-down BI_RLE8 image: a red row, then a row that ends after one green pixel.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 2, -2, 8, 1 /* BI_RLE8 */, 2);
+    append_u32(dib, 0xff0000); // Red.
+    append_u32(dib, 0x00ff00); // Green.
+    auto pixel_offset = dib.size();
+    Array<u8, 8> rle_data { 2, 0, 0, 0, 1, 1, 0, 1 };
+    dib.append(rle_data.data(), rle_data.size());
+    auto bmp_data = make_bmp_file(dib, pixel_offset);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::BMPImageDecoderPlugin::create(bmp_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 2, 2 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color::NamedColor::Red);
+    EXPECT_EQ(frame.image->get_pixel(1, 0), Gfx::Color::NamedColor::Red);
+    EXPECT_EQ(frame.image->get_pixel(0, 1), Gfx::Color::NamedColor::Green);
+    EXPECT_EQ(frame.image->get_pixel(1, 1).alpha(), 0);
 }
 
 TEST_CASE(test_ico_malformed_frame)
@@ -425,6 +642,74 @@ TEST_CASE(test_24bit_bmp_embedded_in_ico)
     EXPECT_EQ(frame.image->get_pixel(13, 15), Gfx::Color(255, 10, 15));
 }
 
+TEST_CASE(test_32bit_bmp_without_alpha_values_in_ico)
+{
+    // 2x1 image whose fourth bytes are all zero, so only its AND mask makes pixels transparent.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 2, 2, 32, 0 /* BI_RGB */, 0);
+    Array<u8, 12> pixels_and_mask { 0x33, 0x22, 0x11, 0x00, 0x66, 0x55, 0x44, 0x00, 0b0100'0000, 0, 0, 0 };
+    dib.append(pixels_and_mask.data(), pixels_and_mask.size());
+    auto ico_data = make_ico_file(2, 1, 32, dib);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::ICOImageDecoderPlugin::create(ico_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 2, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color(0x11, 0x22, 0x33));
+    EXPECT_EQ(frame.image->get_pixel(1, 0).alpha(), 0);
+}
+
+TEST_CASE(test_32bit_bmp_with_alpha_values_in_ico_ignores_and_mask)
+{
+    // 2x1 image with alpha values, followed by an AND mask that would make both pixels transparent.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 2, 2, 32, 0 /* BI_RGB */, 0);
+    Array<u8, 12> pixels_and_mask { 0x33, 0x22, 0x11, 0x80, 0x66, 0x55, 0x44, 0xff, 0b1100'0000, 0, 0, 0 };
+    dib.append(pixels_and_mask.data(), pixels_and_mask.size());
+    auto ico_data = make_ico_file(2, 1, 32, dib);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::ICOImageDecoderPlugin::create(ico_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 2, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color(0x11, 0x22, 0x33, 0x80));
+    EXPECT_EQ(frame.image->get_pixel(1, 0), Gfx::Color(0x44, 0x55, 0x66));
+}
+
+TEST_CASE(test_bitfields_bmp_with_alpha_values_in_ico_ignores_and_mask)
+{
+    // 1x1 image with an alpha mask and an alpha value, followed by an AND mask that would make the pixel transparent.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 56, 1, 2, 32, 3 /* BI_BITFIELDS */, 0);
+    append_u32(dib, 0x00ff0000);
+    append_u32(dib, 0x0000ff00);
+    append_u32(dib, 0x000000ff);
+    append_u32(dib, 0xff000000);
+    Array<u8, 8> pixel_and_mask { 0x33, 0x22, 0x11, 0x80, 0b1000'0000, 0, 0, 0 };
+    dib.append(pixel_and_mask.data(), pixel_and_mask.size());
+    auto ico_data = make_ico_file(1, 1, 32, dib);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::ICOImageDecoderPlugin::create(ico_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 1, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color(0x11, 0x22, 0x33, 0x80));
+}
+
+TEST_CASE(test_rle8_bmp_in_ico_uses_and_mask)
+{
+    // 8x1 image whose RLE data sets the first four pixels and skips the rest, followed by an AND mask that makes the
+    // first pixel transparent.
+    Vector<u8> dib;
+    append_bitmap_info_header(dib, 40, 8, 2, 8, 1 /* BI_RLE8 */, 1);
+    append_u32(dib, 0xff0000); // Red.
+    Array<u8, 8> rle_data_and_mask { 4, 0, 0, 1, 0b1000'0000, 0, 0, 0 };
+    dib.append(rle_data_and_mask.data(), rle_data_and_mask.size());
+    auto ico_data = make_ico_file(8, 1, 8, dib);
+
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::ICOImageDecoderPlugin::create(ico_data));
+    auto frame = TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 8, 1 }));
+    EXPECT_EQ(frame.image->get_pixel(0, 0).alpha(), 0);
+    EXPECT_EQ(frame.image->get_pixel(1, 0), Gfx::Color::NamedColor::Red);
+    EXPECT_EQ(frame.image->get_pixel(3, 0), Gfx::Color::NamedColor::Red);
+    EXPECT_EQ(frame.image->get_pixel(4, 0).alpha(), 0);
+    EXPECT_EQ(frame.image->get_pixel(7, 0).alpha(), 0);
+}
+
 TEST_CASE(test_malformed_maskless_ico)
 {
     auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("ico/malformed_maskless.ico"sv)));
@@ -505,6 +790,21 @@ TEST_CASE(test_jpeg_cmyk_no_adobe_marker)
     EXPECT_EQ(plugin_decoder->frame(0).value().image->get_pixel(9, 9), Gfx::Color(24, 24, 194));
 }
 
+TEST_CASE(test_jpeg_cmyk_truncated)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("jpg/cmyk-no-adobe-marker.jpg"sv)));
+    auto truncated_file = file->bytes().slice(0, 450);
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::JPEGImageDecoderPlugin::create(truncated_file));
+    TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 10, 10 }));
+
+    auto image = plugin_decoder->frame(0).value().image;
+    EXPECT_EQ(image->get_pixel(8, 1), Gfx::Color(44, 184, 97));
+    for (int y = 8; y < 10; ++y) {
+        for (int x = 0; x < 10; ++x)
+            EXPECT_EQ(image->get_pixel(x, y), Gfx::Color(0, 0, 0));
+    }
+}
+
 TEST_CASE(test_jpeg_cmyk_adobe_transform_0)
 {
     auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("jpg/cmyk-adobe-transform-0.jpg"sv)));
@@ -554,6 +854,58 @@ TEST_CASE(test_jpeg_sof2_successive_approximation)
     auto plugin_decoder = TRY_OR_FAIL(Gfx::JPEGImageDecoderPlugin::create(file->bytes()));
 
     TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 600, 800 }));
+}
+
+TEST_CASE(test_jpeg_sof2_truncated)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("jpg/successive_approximation.jpg"sv)));
+    auto full_decoder = TRY_OR_FAIL(Gfx::JPEGImageDecoderPlugin::create(file->bytes()));
+    auto full_image = TRY_OR_FAIL(full_decoder->frame(0)).image;
+
+    // Cut off within the later scans, which only refine the image the earlier ones already cover.
+    auto truncated_file = file->bytes().slice(0, file->bytes().size() * 6 / 10);
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::JPEGImageDecoderPlugin::create(truncated_file));
+    TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 600, 800 }));
+
+    auto image = plugin_decoder->frame(0).value().image;
+    for (auto point : { Gfx::IntPoint { 100, 100 }, Gfx::IntPoint { 300, 400 }, Gfx::IntPoint { 500, 700 } }) {
+        auto pixel = image->get_pixel(point.x(), point.y());
+        auto full_pixel = full_image->get_pixel(point.x(), point.y());
+        EXPECT(abs(pixel.red() - full_pixel.red()) < 48);
+        EXPECT(abs(pixel.green() - full_pixel.green()) < 48);
+        EXPECT(abs(pixel.blue() - full_pixel.blue()) < 48);
+    }
+}
+
+TEST_CASE(test_jpeg_sof2_truncated_after_first_scan)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("jpg/successive_approximation.jpg"sv)));
+    auto bytes = file->bytes();
+    auto full_decoder = TRY_OR_FAIL(Gfx::JPEGImageDecoderPlugin::create(bytes));
+    auto full_image = TRY_OR_FAIL(full_decoder->frame(0)).image;
+
+    // Cut off where the second scan's SOS marker starts, so only the first scan arrives, but all of it.
+    size_t start_of_scan_markers = 0;
+    size_t cut = 0;
+    for (size_t i = 0; i + 1 < bytes.size(); ++i) {
+        if (bytes[i] == 0xFF && bytes[i + 1] == 0xDA && ++start_of_scan_markers == 2) {
+            cut = i;
+            break;
+        }
+    }
+    EXPECT(cut > 0);
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::JPEGImageDecoderPlugin::create(bytes.slice(0, cut)));
+    TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 600, 800 }));
+
+    // Every row comes out, the bottom ones too, as a coarser version of the full image.
+    auto image = plugin_decoder->frame(0).value().image;
+    for (int y = 790; y < 800; ++y) {
+        auto pixel = image->get_pixel(300, y);
+        auto full_pixel = full_image->get_pixel(300, y);
+        EXPECT(abs(pixel.red() - full_pixel.red()) < 64);
+        EXPECT(abs(pixel.green() - full_pixel.green()) < 64);
+        EXPECT(abs(pixel.blue() - full_pixel.blue()) < 64);
+    }
 }
 
 TEST_CASE(test_jpeg_empty_icc)
@@ -621,6 +973,17 @@ TEST_CASE(test_png)
     TRY_OR_FAIL(expect_single_frame(*plugin_decoder));
 }
 
+TEST_CASE(test_png_truncated)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("png/1x65535.png"sv)));
+    auto bytes = file->bytes().slice(0, file->bytes().size() / 2);
+    auto decoder = TRY_OR_FAIL(Gfx::PNGImageDecoderPlugin::create(bytes));
+    auto frame = TRY_OR_FAIL(decoder->frame(0));
+    EXPECT_EQ(frame.image->size(), Gfx::IntSize(1, 65535));
+    EXPECT_EQ(frame.image->get_pixel(0, 16384), Gfx::Color::NamedColor::Red);
+    EXPECT_EQ(frame.image->get_pixel(0, 65534), Gfx::Color::NamedColor::Transparent);
+}
+
 TEST_CASE(test_apng)
 {
     auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("png/apng-1-frame.png"sv)));
@@ -682,6 +1045,82 @@ TEST_CASE(test_exif_orientation_transpose_non_square)
     EXPECT_EQ(frame.image->get_pixel(0, 0), Gfx::Color(255, 0, 0));
     EXPECT_EQ(frame.image->get_pixel(0, 1), Gfx::Color(0, 255, 0));
     EXPECT_EQ(frame.image->get_pixel(0, 2), Gfx::Color(0, 0, 255));
+}
+
+TEST_CASE(test_exif_sub_ifd_chain)
+{
+    // Every IFD sets an orientation and points to the next one with an ExifIFD tag. Only the main IFD and the first
+    // sub-IFD are read, and the chain must not exhaust the stack.
+    static constexpr u32 ifd_count = 100'000;
+    static constexpr u32 ifd_size = 2 + 2 * 12 + 4;
+
+    ByteBuffer exif;
+    auto append_u16 = [&](u16 value) { exif.append(&value, sizeof(value)); };
+    auto append_u32 = [&](u32 value) { exif.append(&value, sizeof(value)); };
+
+    append_u16(0x4949);
+    append_u16(42);
+    append_u32(8);
+    for (u32 i = 0; i < ifd_count; ++i) {
+        append_u16(2);
+
+        // Orientation, Short, count 1.
+        append_u16(274);
+        append_u16(3);
+        append_u32(1);
+        append_u16(i == 0 ? 1 : (i == 1 ? 6 : 3));
+        append_u16(0);
+
+        // ExifIFD, UnsignedLong, count 1.
+        append_u16(34665);
+        append_u16(4);
+        append_u32(1);
+        append_u32(i + 1 < ifd_count ? 8 + (i + 1) * ifd_size : 0);
+
+        append_u32(0);
+    }
+
+    auto metadata = TRY_OR_FAIL(Gfx::TIFF::read_exif_metadata(exif));
+    EXPECT_EQ(*metadata->orientation(), Gfx::TIFF::Orientation::Rotate90Clockwise);
+}
+
+TEST_CASE(test_exif_repeated_sub_ifd_tag)
+{
+    // The main IFD points to two sub-IFDs that set different orientations. Only the first one is read.
+    ByteBuffer exif;
+    auto append_u16 = [&](u16 value) { exif.append(&value, sizeof(value)); };
+    auto append_u32 = [&](u32 value) { exif.append(&value, sizeof(value)); };
+    auto append_orientation_ifd = [&](u16 orientation) {
+        append_u16(1);
+        append_u16(274);
+        append_u16(3);
+        append_u32(1);
+        append_u16(orientation);
+        append_u16(0);
+        append_u32(0);
+    };
+
+    static constexpr u32 main_ifd_size = 2 + 2 * 12 + 4;
+    static constexpr u32 orientation_ifd_size = 2 + 12 + 4;
+
+    append_u16(0x4949);
+    append_u16(42);
+    append_u32(8);
+
+    append_u16(2);
+    for (u32 i = 0; i < 2; ++i) {
+        append_u16(34665);
+        append_u16(4);
+        append_u32(1);
+        append_u32(8 + main_ifd_size + i * orientation_ifd_size);
+    }
+    append_u32(0);
+
+    append_orientation_ifd(6);
+    append_orientation_ifd(3);
+
+    auto metadata = TRY_OR_FAIL(Gfx::TIFF::read_exif_metadata(exif));
+    EXPECT_EQ(*metadata->orientation(), Gfx::TIFF::Orientation::Rotate90Clockwise);
 }
 
 TEST_CASE(test_png_malformed_frame)
@@ -1134,6 +1573,36 @@ TEST_CASE(test_avif_frame_out_of_bounds)
 
     auto frame1 = TRY_OR_FAIL(plugin_decoder->frame(0));
     EXPECT(plugin_decoder->frame(1).is_error());
+}
+
+TEST_CASE(test_avif_animated)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("loop_forever.avif"sv)));
+    EXPECT(Gfx::AVIFImageDecoderPlugin::sniff(file->bytes()));
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::AVIFImageDecoderPlugin::create(file->bytes()));
+
+    EXPECT(plugin_decoder->is_animated());
+    EXPECT_EQ(plugin_decoder->frame_count(), 2u);
+    EXPECT_EQ(plugin_decoder->loop_count(), 0u);
+
+    // Durations are known before any frame is decoded.
+    EXPECT_EQ(plugin_decoder->frame_duration(0), 500);
+    EXPECT_EQ(plugin_decoder->frame_duration(1), 500);
+
+    // Frames can be decoded out of order and more than once.
+    auto second_frame = TRY_OR_FAIL(plugin_decoder->frame(1));
+    EXPECT_EQ(second_frame.image->size(), Gfx::IntSize(128, 128));
+    EXPECT_EQ(second_frame.duration, 500);
+    EXPECT_EQ(second_frame.image->get_pixel(64, 64), Gfx::Color(253, 253, 255));
+
+    auto first_frame = TRY_OR_FAIL(plugin_decoder->frame(0));
+    EXPECT_EQ(first_frame.duration, 500);
+    EXPECT_EQ(first_frame.image->get_pixel(64, 64), Gfx::Color(1, 0, 0));
+
+    auto second_frame_again = TRY_OR_FAIL(plugin_decoder->frame(1));
+    EXPECT_EQ(second_frame_again.image->get_pixel(64, 64), Gfx::Color(253, 253, 255));
+
+    EXPECT(plugin_decoder->frame(2).is_error());
 }
 
 TEST_CASE(test_avif_missing_pixi_property)

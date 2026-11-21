@@ -43,6 +43,7 @@ constexpr FourCC SEGMENT_TYPE_BOX { "styp" };
 constexpr FourCC MEDIA_DATA_BOX { "mdat" };
 constexpr FourCC FREE_SPACE_BOX { "free" };
 constexpr FourCC SKIP_BOX { "skip" };
+constexpr FourCC WIDE_ATOM { "wide" };
 constexpr FourCC EXTENDED_TYPE_BOX { "uuid" };
 constexpr FourCC PROGRESSIVE_DOWNLOAD_INFO_BOX { "pdin" };
 constexpr FourCC SEGMENT_INDEX_BOX { "sidx" };
@@ -133,6 +134,8 @@ constexpr FourCC FLAC_CONFIGURATION_BOX { "dfLa" };
 
 constexpr FourCC COLOUR_INFORMATION_BOX { "colr" };
 constexpr FourCC NCLX_COLOUR_TYPE { "nclx" };
+constexpr FourCC MASTERING_DISPLAY_COLOUR_VOLUME_BOX { "mdcv" };
+constexpr FourCC CONTENT_LIGHT_LEVEL_BOX { "clli" };
 
 }
 

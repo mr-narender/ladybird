@@ -13,7 +13,7 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Stream.h>
 #include <AK/Vector.h>
-#include <LibMedia/DecoderError.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 namespace Media {
 
@@ -33,6 +33,8 @@ public:
     virtual DecoderErrorOr<void> seek(i64 offset, AK::SeekMode) = 0;
     virtual DecoderErrorOr<size_t> read_into(Bytes) = 0;
     virtual DecoderErrorOr<FixedArray<u8>> read_bytes(size_t size) = 0;
+    // Advances past the bytes once they are all present without copying anything.
+    virtual DecoderErrorOr<void> read_and_discard(size_t size) = 0;
     virtual size_t position() const = 0;
     virtual Optional<u64> size() const = 0;
     // Waits for the size of the stream to become known. Only for callers with no way to express an
@@ -94,21 +96,39 @@ public:
 
     virtual NonnullRefPtr<MediaStreamCursor> create_cursor() = 0;
 
-    virtual Vector<ByteRange> available_byte_ranges() const = 0;
+    struct Availability {
+        Vector<ByteRange> byte_ranges;
+        Optional<u64> expected_size;
+        bool is_closed { false };
+
+        bool all_bytes_are_available() const
+        {
+            if (!expected_size.has_value())
+                return false;
+            u64 end = 0;
+            for (auto const& range : byte_ranges) {
+                if (range.start > end)
+                    return false;
+                end = max(end, static_cast<u64>(range.end));
+            }
+            return end >= expected_size.value();
+        }
+
+        bool closing_bytes_are_available() const
+        {
+            return is_closed && expected_size.has_value() && !byte_ranges.is_empty() && byte_ranges.last().end >= expected_size.value();
+        }
+    };
+
+    // Capture ranges (in ascending order), size, and closure together under the stream's lock.
+    virtual Availability availability() const = 0;
+    Vector<ByteRange> available_byte_ranges() const { return availability().byte_ranges; }
 
     virtual Optional<u64> expected_size() const = 0;
-
     virtual bool is_closed() const = 0;
 
-    bool closing_bytes_are_available() const
-    {
-        if (!is_closed())
-            return false;
-        auto ranges = available_byte_ranges();
-        return !ranges.is_empty() && ranges.last().end >= expected_size().value();
-    }
-
-    // The observer is invoked under the stream's lock, so it must be cheap and must not call back into the stream.
+    // Notify whenever any part of Availability changes. The observer is invoked under the stream's lock,
+    // so it must be cheap and must not call back into the stream.
     virtual void set_available_ranges_change_observer(Function<void()>) { }
 };
 

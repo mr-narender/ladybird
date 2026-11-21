@@ -24,6 +24,8 @@ struct SimilarOriginWindowAgent : public Agent {
 
     static WEB_API NonnullOwnPtr<SimilarOriginWindowAgent> create(GC::Heap&);
 
+    virtual bool is_similar_origin_window_agent() const override { return true; }
+
     // https://dom.spec.whatwg.org/#mutation-observer-compound-microtask-queued-flag
     // Each similar-origin window agent has a mutation observer microtask queued (a boolean), which is initially false. [HTML]
     bool mutation_observer_microtask_queued { false };
@@ -31,6 +33,10 @@ struct SimilarOriginWindowAgent : public Agent {
     // https://dom.spec.whatwg.org/#mutation-observer-list
     // Each similar-origin window agent also has pending mutation observers (a set of zero or more MutationObserver objects), which is initially empty.
     GC::RootVector<GC::Ref<DOM::MutationObserver>> pending_mutation_observers;
+
+    // https://dom.spec.whatwg.org/#mutation-observer-counter
+    // Each similar-origin window agent also has a mutation observer counter (a number), which is initially 0.
+    u64 mutation_observer_counter { 0 };
 
     // https://html.spec.whatwg.org/multipage/custom-elements.html#custom-element-reactions-stack
     // Each similar-origin window agent has a custom element reactions stack, which is initially empty.
@@ -48,7 +54,7 @@ struct SimilarOriginWindowAgent : public Agent {
     // https://html.spec.whatwg.org/multipage/custom-elements.html#active-custom-element-constructor-map
     // Each similar-origin window agent has an associated active custom element constructor map, which is a map of
     // constructors to CustomElementRegistry objects.
-    HashMap<GC::Ref<JS::FunctionObject>, GC::Root<CustomElementRegistry>> active_custom_element_constructor_map;
+    HashMap<GC::RawRef<JS::FunctionObject>, GC::Root<CustomElementRegistry>> active_custom_element_constructor_map;
 
 private:
     SimilarOriginWindowAgent(CanBlock);

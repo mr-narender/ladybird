@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/Atomic.h>
+#include <AK/ByteBuffer.h>
 #include <AK/ByteReader.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
@@ -89,6 +91,7 @@ class TestConnection final : public IPC::ConnectionBase {
 public:
     using ConnectionBase::drain_messages_from_peer;
     using ConnectionBase::handle_messages;
+    using ConnectionBase::MayCancel;
     using ConnectionBase::PeerEOF;
     using ConnectionBase::post_sync_request;
     using ConnectionBase::wait_for_transport_to_become_readable;
@@ -101,14 +104,15 @@ public:
         m_unprocessed_messages.append(move(message));
     }
 
-    OwnPtr<IPC::Message> call_wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id)
+    OwnPtr<IPC::Message> call_wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel may_cancel = MayCancel::No)
     {
-        return wait_for_specific_endpoint_message_impl(endpoint_magic, message_id);
+        return wait_for_specific_endpoint_message_impl(endpoint_magic, message_id, may_cancel);
     }
 
 protected:
-    OwnPtr<IPC::Message> try_parse_message(ReadonlyBytes bytes, Queue<IPC::Attachment>&) override
+    OwnPtr<IPC::Message> try_parse_message(IPC::ReceivedMessageBytes const& received_bytes, Queue<IPC::Attachment>&) override
     {
+        auto bytes = received_bytes.bytes();
         if (bytes.size() != sizeof(u32))
             return nullptr;
         return make<TestMessage>(static_cast<int>(AK::ByteReader::load32(bytes.data())));
@@ -163,6 +167,14 @@ ErrorOr<PeerCloseOutcome> send_one_message_then_close_peer(bool peer_owns_this_p
     outcome.messages_dispatched = stub.handle_count();
     outcome.die_count = connection->die_count();
     return outcome;
+}
+
+ByteBuffer patterned_bytes(size_t size, u8 seed)
+{
+    auto bytes = MUST(ByteBuffer::create_uninitialized(size));
+    for (size_t i = 0; i < size; ++i)
+        bytes[i] = static_cast<u8>(seed + i % 251);
+    return bytes;
 }
 
 }
@@ -230,6 +242,58 @@ TEST_CASE(taking_unprocessed_messages_preserves_nested_batch_order_and_unrelated
     EXPECT(connection->take_unprocessed_messages(TEST_MAGIC, TARGET_MESSAGE_ID).is_empty());
 }
 
+TEST_CASE(shutdown_stops_current_dispatch_batch)
+{
+    Core::EventLoop loop;
+    auto pair = TRY_OR_FAIL(IPC::Transport::create_paired());
+    CountingStub stub;
+    auto connection = TestConnection::construct(stub, move(pair.local));
+    stub.on_message = [&](IPC::Message const& message) {
+        if (message.message_id() == OTHER_MESSAGE_ID)
+            connection->shutdown();
+    };
+
+    connection->inject_unprocessed_message(make<TestMessage>(OTHER_MESSAGE_ID));
+    connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+    connection->handle_messages();
+
+    EXPECT_EQ(stub.handle_count(), 1u);
+    EXPECT_EQ(connection->die_count(), 1u);
+    EXPECT(!connection->is_open());
+}
+
+TEST_CASE(shutdown_discards_pending_messages_from_all_batches)
+{
+    Core::EventLoop loop;
+    auto pair = TRY_OR_FAIL(IPC::Transport::create_paired());
+    CountingStub stub;
+    auto connection = TestConnection::construct(stub, move(pair.local));
+
+    constexpr int shutdown_message_id = 3;
+    constexpr u32 response_endpoint_magic = TEST_MAGIC + 1;
+    Vector<int> dispatched;
+    stub.on_message = [&](IPC::Message const& message) {
+        dispatched.append(message.message_id());
+        if (message.message_id() == OTHER_MESSAGE_ID) {
+            connection->inject_unprocessed_message(make<TestMessage>(shutdown_message_id));
+            connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+            connection->handle_messages();
+        } else if (message.message_id() == shutdown_message_id) {
+            connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+            connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID, 0, response_endpoint_magic));
+            connection->shutdown();
+            EXPECT(connection->take_unprocessed_messages(TEST_MAGIC, TARGET_MESSAGE_ID).is_empty());
+            EXPECT(!connection->call_wait_for_specific_endpoint_message_impl(response_endpoint_magic, TARGET_MESSAGE_ID));
+        }
+    };
+
+    connection->inject_unprocessed_message(make<TestMessage>(OTHER_MESSAGE_ID));
+    connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+    connection->handle_messages();
+
+    EXPECT_EQ(dispatched, (Vector<int> { OTHER_MESSAGE_ID, shutdown_message_id }));
+}
+
 TEST_CASE(anonymous_buffer_size_uses_64_bits)
 {
     constexpr size_t buffer_size = 4096;
@@ -252,6 +316,42 @@ TEST_CASE(anonymous_buffer_size_uses_64_bits)
     EXPECT_EQ(decoded_buffer.size(), buffer_size);
 }
 
+TEST_CASE(payloads_of_any_size_arrive_intact_with_their_attachments)
+{
+    auto pair = TRY_OR_FAIL(IPC::Transport::create_paired());
+    auto receiver = TRY_OR_FAIL(pair.remote_handle.create_transport());
+
+    Array<size_t, 3> payload_sizes { 1 * KiB, 2 * MiB, 65 * MiB };
+    for (size_t i = 0; i < payload_sizes.size(); ++i) {
+        auto attachment = TRY_OR_FAIL(Core::AnonymousBuffer::create_with_size(sizeof(size_t)));
+        *attachment.data<size_t>() = i;
+
+        IPC::MessageBuffer buffer;
+        IPC::Encoder encoder { buffer };
+        TRY_OR_FAIL(encoder.encode(patterned_bytes(payload_sizes[i], static_cast<u8>(i))));
+        TRY_OR_FAIL(encoder.encode(attachment));
+        TRY_OR_FAIL(buffer.transfer_message(*pair.local));
+    }
+
+    size_t received = 0;
+    while (received < payload_sizes.size()) {
+        receiver->wait_until_readable();
+        auto should_shutdown = receiver->read_as_many_messages_as_possible_without_blocking([&](auto&& message) {
+            FixedMemoryStream stream { message.bytes.bytes() };
+            IPC::Decoder decoder { stream, message.attachments };
+            auto payload = MUST(decoder.decode<ByteBuffer>());
+            auto attachment = MUST(decoder.decode<Core::AnonymousBuffer>());
+            EXPECT(payload == patterned_bytes(payload_sizes[received], static_cast<u8>(received)));
+            EXPECT_EQ(*attachment.data<size_t>(), received);
+            EXPECT(message.attachments.is_empty());
+            ++received;
+        });
+        if (should_shutdown == IPC::Transport::ShouldShutdown::Yes)
+            break;
+    }
+    EXPECT_EQ(received, payload_sizes.size());
+}
+
 // Regression test for #9582. wait_for_specific_endpoint_message_impl is reachable from any sync IPC call, including
 // from inside a constructor whose members are still being initialized (e.g., PageHost's construction issues a sync
 // allocate_compositor_context_id IPC call before ConnectionFromClient::m_page_host has been assigned). If the peer
@@ -267,6 +367,8 @@ TEST_CASE(sync_wait_failure_does_not_dispatch_queued_messages)
     auto connection = TestConnection::construct(stub, move(pair.local));
 
     connection->inject_unprocessed_message(make<TestMessage>(OTHER_MESSAGE_ID));
+    // Queue a deferred dispatch before the transport can observe EOF.
+    EXPECT_EQ(connection->drain_messages_from_peer(), TestConnection::PeerEOF::No);
 
     // Hang up the peer before waiting for the response.
     {
@@ -278,10 +380,44 @@ TEST_CASE(sync_wait_failure_does_not_dispatch_queued_messages)
     EXPECT(!response);
     EXPECT_EQ(stub.handle_count(), 0u);
 
-    // Drain the deferred invocations queued by the EOF drain; the thread's event queue outlives this
-    // test's scope, and the stub must not be dispatched to after it is destroyed.
+    // The wait may not shut down if EOF was seen before it started.
+    connection->shutdown();
     while (loop.pump(Core::EventLoop::WaitMode::PollForEvents) != 0)
         ;
+    EXPECT_EQ(stub.handle_count(), 0u);
+}
+
+TEST_CASE(cancelled_thread_does_not_take_a_late_response)
+{
+    // NB: A canceller stays on its thread until that thread ends.
+    auto thread = Threading::Thread::construct("Cancelled"sv, [] -> intptr_t {
+        Core::EventLoop loop;
+
+        auto pair = MUST(IPC::Transport::create_paired());
+
+        CountingStub stub;
+        auto connection = TestConnection::construct(stub, move(pair.local));
+
+        auto canceller = IPC::SyncRequestCanceller::create();
+        EXPECT(!IPC::SyncRequestCanceller::is_installed_on_this_thread());
+        canceller->install_on_this_thread();
+        EXPECT(IPC::SyncRequestCanceller::is_installed_on_this_thread());
+        canceller->cancel();
+
+        // The response to the wait that was cancelled comes in, and the thread then makes a request of the same type.
+        connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID, 0, TEST_MAGIC + 1));
+        EXPECT(!connection->call_wait_for_specific_endpoint_message_impl(TEST_MAGIC + 1, TARGET_MESSAGE_ID, TestConnection::MayCancel::Yes));
+
+        connection->handle_messages();
+        EXPECT_EQ(stub.handle_count(), 0u);
+
+        connection->shutdown();
+        while (loop.pump(Core::EventLoop::WaitMode::PollForEvents) != 0)
+            ;
+        return 0;
+    });
+    thread->start();
+    TRY_OR_FAIL(thread->join());
 }
 
 TEST_CASE(async_posts_from_many_threads_all_arrive)

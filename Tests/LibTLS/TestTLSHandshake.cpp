@@ -10,8 +10,6 @@
 #include <LibCore/ConfigFile.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
-#include <LibCrypto/ASN1/ASN1.h>
-#include <LibCrypto/ASN1/PEM.h>
 #include <LibTLS/TLSv12.h>
 #include <LibTest/TestCase.h>
 
@@ -68,7 +66,7 @@ TEST_CASE(test_TLS_hello_handshake)
     };
     tls->set_notifications_enabled(true);
 
-    auto timeout = Core::Timer::create_single_shot(10'000, [&loop] {
+    auto timeout = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(10'000), [&loop] {
         loop.quit(1);
     });
 

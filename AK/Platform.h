@@ -150,6 +150,15 @@
 #    define AK_OS_ANDROID
 #endif
 
+// Reads a thread-local variable straight from the thread pointer instead of through __tls_get_addr(). It is for hot
+// variables of libraries that a program links, since a library that dlopen() loads later has no room for them: Android
+// loads all of its code that way.
+#if defined(__ELF__) && !defined(AK_OS_ANDROID)
+#    define AK_TLS_INITIAL_EXEC __attribute__((tls_model("initial-exec")))
+#else
+#    define AK_TLS_INITIAL_EXEC
+#endif
+
 #define ARCH(arch) (AK_IS_ARCH_##arch())
 
 #ifdef ALWAYS_INLINE
@@ -261,6 +270,10 @@
 #    define LSAN_REGISTER_ROOT_REGION(base, size)
 #    define LSAN_UNREGISTER_ROOT_REGION(base, size)
 #    define LSAN_IGNORE_OBJECT(base)
+#endif
+
+#if defined(HAS_ADDRESS_SANITIZER) && !defined(AK_OS_WINDOWS) && __has_include(<sanitizer/lsan_interface.h>)
+#    define HAS_LEAK_SANITIZER
 #endif
 
 #if __has_feature(thread_sanitizer) || defined(__SANITIZE_THREAD__)

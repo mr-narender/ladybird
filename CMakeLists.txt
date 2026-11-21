@@ -2,18 +2,11 @@ cmake_minimum_required(VERSION 3.25)
 
 include("Meta/CMake/environment.cmake")
 
-if (VCPKG_TARGET_ANDROID)
-    # If we are building for Android, we must load vcpkg_android.cmake before the project() declaration.
-    # This ensures that the CMAKE_TOOLCHAIN_FILE is set correctly.
-    # (we cannot set CMAKE_TOOLCHAIN_FILE from Gradle, unfortunately, so this is the only place we can do it.)
-    include("UI/Android/vcpkg_android.cmake")
-endif()
-
 # vcpkg flags depend on what linker we are using
 include("Meta/CMake/use_linker.cmake")
 
 if (APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 14.4)
 endif()
 
 # Pass additional information to vcpkg if we are using it.
@@ -57,9 +50,7 @@ if(ENABLE_ALL_THE_DEBUG_MACROS)
     include(all_the_debug_macros)
 endif()
 
-if (ENABLE_LAGOM_CCACHE)
-    include(setup_ccache)
-endif()
+include(setup_ccache)
 
 if (ENABLE_FUZZERS_LIBFUZZER OR ENABLE_FUZZERS_OSSFUZZ)
     set(ENABLE_FUZZERS ON)
@@ -84,6 +75,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang$")
         depend_on_clang_plugin(JSClangPlugin LibJSGCClangPlugin)
         depend_on_clang_plugin(GenericClangPlugin LambdaCaptureClangPlugin)
         depend_on_clang_plugin(GenericClangPlugin KmallocAllocationClangPlugin)
+        depend_on_clang_plugin(GenericClangPlugin MathFunctionsClangPlugin)
     endif()
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     if (ENABLE_FUZZERS_LIBFUZZER)
@@ -114,6 +106,7 @@ include_directories(${CMAKE_BINARY_DIR}/Services)
 include(lagom_install)
 
 include(rust_crate)
+include(licenses)
 include(targets)
 
 # Plugins need to be installed in order to be used by non-lagom builds
@@ -140,7 +133,14 @@ endif()
 if (ENABLE_GUI_TARGETS)
     add_subdirectory(Services)
     add_subdirectory(UI)
+
+    include(check_skia_confinement)
+    set(processes_without_skia ${ladybird_helper_processes} ladybird WebDriver)
+    list(REMOVE_ITEM processes_without_skia Compositor)
+    ladybird_check_skia_confinement(${processes_without_skia})
 endif()
+
+include(packaging)
 
 add_custom_target(lint-shell-scripts
     COMMAND "${ladybird_SOURCE_DIR}/Meta/Linters/lint_shell_scripts.sh"

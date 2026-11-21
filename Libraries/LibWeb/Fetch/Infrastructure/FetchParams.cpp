@@ -4,70 +4,99 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGC/Heap.h>
-#include <LibJS/Runtime/VM.h>
 #include <LibWeb/Fetch/Infrastructure/FetchParams.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 
 namespace Web::Fetch::Infrastructure {
 
-GC_DEFINE_ALLOCATOR(FetchParams);
-
-FetchParams::FetchParams(GC::Ref<Request> request, GC::Ref<FetchAlgorithms> algorithms, GC::Ref<FetchController> controller, NonnullRefPtr<FetchTimingInfo> timing_info)
-    : m_request(request)
-    , m_algorithms(algorithms)
-    , m_controller(controller)
+FetchParams::FetchParams(NonnullRefPtr<Request> request, GC::Ref<FetchAlgorithms const> algorithms, FetchController& controller, NonnullRefPtr<FetchTimingInfo> timing_info, NonnullRefPtr<LoaderConfigSnapshot const> loader_config)
+    : m_request(move(request))
+    , m_controller_token(controller.token())
+    , m_controller_registry(controller.registry())
+    , m_control_block(controller.control_block())
     , m_timing_info(move(timing_info))
+    , m_loader_config(move(loader_config))
 {
-    m_controller->set_fetch_params({}, *this);
+    controller.set_algorithms({}, algorithms);
+    controller.set_original_fetch_params({}, *this);
+    controller.set_network_observation({}, m_request->ensure_network_observation());
 }
 
 FetchParams::FetchParams(FetchParams const& params)
-    : m_request(params.m_request)
-    , m_algorithms(params.m_algorithms)
-    , m_task_destination(params.m_task_destination)
+    : RefCounted()
+    , m_request(params.m_request)
     , m_cross_origin_isolated_capability(params.m_cross_origin_isolated_capability)
-    , m_controller(params.m_controller)
+    , m_controller_token(params.m_controller_token)
+    , m_controller_registry(params.m_controller_registry)
+    , m_control_block(params.m_control_block)
     , m_timing_info(params.m_timing_info)
     , m_preloaded_response_candidate(params.m_preloaded_response_candidate)
     , m_has_response_body_transfer_lease(params.m_has_response_body_transfer_lease)
+    , m_blob_url_entry(params.m_blob_url_entry)
+    , m_loader_config(params.m_loader_config)
+    , m_engine_record(params.m_engine_record)
+    , m_is_cors_preflight(params.m_is_cors_preflight)
 {
 }
 
-GC::Ref<FetchParams> FetchParams::create(GC::Ref<Request> request, NonnullRefPtr<FetchTimingInfo> timing_info)
+NonnullRefPtr<FetchParams> FetchParams::create(FetchController& controller, NonnullRefPtr<Request> request, GC::Ref<FetchAlgorithms const> algorithms, NonnullRefPtr<FetchTimingInfo> timing_info, NonnullRefPtr<LoaderConfigSnapshot const> loader_config)
 {
-    auto algorithms = Infrastructure::FetchAlgorithms::create({});
-    auto controller = Infrastructure::FetchController::create();
-    return GC::Heap::the().allocate<FetchParams>(request, algorithms, controller, move(timing_info));
+    return adopt_ref(*new FetchParams(move(request), algorithms, controller, move(timing_info), move(loader_config)));
 }
 
-GC::Ref<FetchParams> FetchParams::copy(FetchParams const& params)
+NonnullRefPtr<FetchParams> FetchParams::copy(FetchParams const& params)
 {
-    return GC::Heap::the().allocate<FetchParams>(params);
+    return adopt_ref(*new FetchParams(params));
 }
 
-void FetchParams::visit_edges(JS::Cell::Visitor& visitor)
+Engine::StartFetchInput FetchParams::start_fetch_input(Engine::FetchId fetch_id, NonnullOwnPtr<Engine::EngineEventSink> event_sink) const
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_request);
-    visitor.visit(m_algorithms);
-    visitor.visit(m_controller);
-    visitor.visit(m_task_destination);
-    visitor.visit(m_preloaded_response_candidate);
+    return Engine::StartFetchInput { {}, fetch_id, m_control_block->body_intent(), m_blob_url_entry, move(event_sink) };
+}
+
+void FetchParams::set_body_transport(Engine::FetchBodyDeliveryGate::Transport& transport) const
+{
+    VERIFY(m_engine_record);
+    if (m_is_cors_preflight)
+        m_engine_record->set_cors_preflight_body_transport(transport);
+    else
+        m_engine_record->set_body_transport(transport);
+}
+
+void FetchParams::stop_body_transport() const
+{
+    if (!m_engine_record)
+        return;
+    if (m_is_cors_preflight)
+        m_engine_record->stop_cors_preflight_body_transport();
+    else
+        m_engine_record->stop_body_transport();
+}
+
+void FetchParams::discard_response_body(Response const& response) const
+{
+    response.release_request_transfer_lease();
+    stop_body_transport();
+}
+
+GC::Ref<FetchController> FetchParams::controller() const
+{
+    VERIFY(m_controller_registry);
+    auto controller = m_controller_registry->find(m_controller_token);
+    VERIFY(controller);
+    return *controller;
 }
 
 // https://fetch.spec.whatwg.org/#fetch-params-aborted
 bool FetchParams::is_aborted() const
 {
-    // A fetch params fetchParams is aborted if its controller’s state is "aborted".
-    return m_controller->state() == FetchController::State::Aborted;
+    return m_control_block->is_aborted();
 }
 
 // https://fetch.spec.whatwg.org/#fetch-params-canceled
 bool FetchParams::is_canceled() const
 {
-    // A fetch params fetchParams is canceled if its controller’s state is "aborted" or "terminated".
-    return m_controller->state() == FetchController::State::Aborted || m_controller->state() == FetchController::State::Terminated;
+    return m_control_block->is_canceled();
 }
 
 }

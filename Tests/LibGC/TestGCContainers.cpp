@@ -5,12 +5,8 @@
  */
 
 #include <AK/NeverDestroyed.h>
-#include <LibGC/ActivityRoot.h>
 #include <LibGC/Cell.h>
 #include <LibGC/CellAllocator.h>
-#include <LibGC/ConservativeHashMap.h>
-#include <LibGC/ConservativeHashTable.h>
-#include <LibGC/ConservativeVector.h>
 #include <LibGC/Heap.h>
 #include <LibGC/HeapHashTable.h>
 #include <LibGC/HeapVector.h>
@@ -18,9 +14,12 @@
 #include <LibGC/RootHashMap.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGC/RootVector.h>
+#include <LibGC/Testing.h>
 #include <LibGC/Weak.h>
 #include <LibGC/WeakHashMap.h>
 #include <LibTest/TestCase.h>
+
+namespace {
 
 class TestCell : public GC::Cell {
     GC_CELL(TestCell, GC::Cell);
@@ -32,17 +31,30 @@ class TestCell : public GC::Cell {
 
 GC_DEFINE_ALLOCATOR(TestCell);
 
+class FinalizerObservingCell : public GC::Cell {
+    GC_CELL(FinalizerObservingCell, GC::Cell);
+    GC_DECLARE_ALLOCATOR(FinalizerObservingCell);
+
+public:
+    GC::Weak<TestCell> weak_cell;
+    bool* weak_cell_was_null_while_finalizing { nullptr };
+    bool* weak_to_self_was_null_while_finalizing { nullptr };
+
+private:
+    virtual void finalize() override
+    {
+        Base::finalize();
+        *weak_cell_was_null_while_finalizing = !weak_cell;
+        *weak_to_self_was_null_while_finalizing = !GC::Weak<FinalizerObservingCell> { *this };
+    }
+};
+
+GC_DEFINE_ALLOCATOR(FinalizerObservingCell);
+
 static GC::Heap& test_heap()
 {
     static AK::NeverDestroyed<GC::Heap> heap([](auto&) { });
     return *heap;
-}
-
-static NEVER_INLINE void scrub_stack()
-{
-    u8 volatile filler[8 * KiB];
-    for (size_t i = 0; i < sizeof(filler); ++i)
-        filler[i] = 0;
 }
 
 TEST_SETUP
@@ -53,43 +65,10 @@ TEST_SETUP
 class TestVisitor : public GC::Cell::Visitor {
     virtual void visit_impl(GC::Cell& cell) override { visited_cells.set(&cell); }
     virtual void visit_impl(ReadonlySpan<GC::NanBoxedValue>) override { }
-    virtual void visit_possible_values(ReadonlyBytes) override { }
 
 public:
     HashTable<GC::Cell*> visited_cells;
 };
-
-static bool possible_values_contain(GC::ConservativeVectorBase const& container, GC::Cell* cell)
-{
-    auto target = bit_cast<FlatPtr>(cell);
-    for (auto value : container.possible_values()) {
-        if (value == target)
-            return true;
-    }
-    return false;
-}
-
-static bool possible_values_contain(GC::ConservativeHashMapBase const& container, GC::Cell* cell)
-{
-    bool found = false;
-    auto target = bit_cast<FlatPtr>(cell);
-    container.for_each_possible_value([&](FlatPtr value) {
-        if (value == target)
-            found = true;
-    });
-    return found;
-}
-
-static bool possible_values_contain(GC::ConservativeHashTableBase const& container, GC::Cell* cell)
-{
-    bool found = false;
-    auto target = bit_cast<FlatPtr>(cell);
-    container.for_each_possible_value([&](FlatPtr value) {
-        if (value == target)
-            found = true;
-    });
-    return found;
-}
 
 TEST_CASE(root_vector_reports_roots)
 {
@@ -104,28 +83,6 @@ TEST_CASE(root_vector_reports_roots)
 
     EXPECT(roots.contains(cell.ptr()));
     EXPECT_EQ(roots.size(), 1u);
-}
-
-TEST_CASE(activity_root_controls_cell_liveness)
-{
-    auto& heap = test_heap();
-    GC::ActivityRoot root;
-    GC::Weak<TestCell> weak_cell;
-
-    {
-        auto cell = heap.allocate<TestCell>();
-        weak_cell = cell.ptr();
-        root.take(*cell);
-    }
-
-    scrub_stack();
-    heap.collect_garbage();
-    EXPECT(weak_cell);
-
-    root.release();
-    scrub_stack();
-    heap.collect_garbage(GC::Heap::CollectionType::CollectEverything);
-    EXPECT(!weak_cell);
 }
 
 TEST_CASE(root_vector_ptr_reports_roots)
@@ -221,15 +178,137 @@ TEST_CASE(cleared_container_reports_no_roots)
     EXPECT_EQ(roots.size(), 0u);
 }
 
-TEST_CASE(conservative_vector_reports_possible_values)
+TEST_CASE(root_vector_adopts_moved_vector)
 {
     auto& heap = test_heap();
-    GC::ConservativeVector<GC::Ref<TestCell>> vector;
+    Vector<GC::Ref<TestCell>> vector;
 
     auto cell = heap.allocate<TestCell>();
     vector.append(cell);
+    GC::RootVector<GC::Ref<TestCell>> root_vector { move(vector) };
 
-    EXPECT(possible_values_contain(vector, cell.ptr()));
+    HashMap<GC::Cell*, GC::HeapRoot> roots;
+    root_vector.gather_roots(roots);
+
+    EXPECT(roots.contains(cell.ptr()));
+    EXPECT_EQ(roots.size(), 1u);
+}
+
+TEST_CASE(root_vector_native_member_survives_relocation)
+{
+    auto& heap = test_heap();
+    struct NativeState {
+        GC::RootVector<GC::Ref<TestCell>> cells;
+    };
+    Vector<NativeState> states;
+    states.append(NativeState {});
+    auto cell = heap.allocate<TestCell>();
+    states[0].cells.append(cell);
+
+    // Moving the enclosing native storage must transfer the member's registration in the heap's root list.
+    states.ensure_capacity(states.capacity() + 1);
+    heap.collect_garbage();
+
+    HashMap<GC::Cell*, GC::HeapRoot> roots;
+    states[0].cells.gather_roots(roots);
+    EXPECT(roots.contains(cell.ptr()));
+    EXPECT_EQ(roots.size(), 1u);
+
+    // Destruction must unregister the member before the collector next walks its root list.
+    states.clear();
+    heap.collect_garbage();
+}
+
+struct TracedRecord {
+    GC::Ref<TestCell> cell;
+    GC::Ptr<TestCell> other_cell;
+    int payload { 0 };
+
+    void visit_edges(GC::Cell::Visitor& visitor)
+    {
+        visitor.visit(cell);
+        visitor.visit(other_cell);
+    }
+};
+
+struct PlainRecord {
+    int payload { 0 };
+};
+
+static_assert(GC::Detail::IsRootableValue<GC::Ref<TestCell>>);
+static_assert(GC::Detail::IsRootableValue<TracedRecord>);
+static_assert(GC::Detail::IsRootableValue<Variant<GC::Ref<TestCell>, Empty>>);
+static_assert(GC::Detail::IsRootableValue<Optional<TracedRecord>>);
+static_assert(GC::Detail::IsRootableValue<Array<GC::Ref<TestCell>, 2>>);
+static_assert(!GC::Detail::IsRootableValue<int>);
+static_assert(!GC::Detail::IsRootableValue<PlainRecord>);
+
+TEST_CASE(root_vector_of_traced_values_reports_their_cells)
+{
+    auto& heap = test_heap();
+    GC::RootVector<TracedRecord> vector;
+
+    auto cell = heap.allocate<TestCell>();
+    auto other_cell = heap.allocate<TestCell>();
+    vector.append({ cell, other_cell, 1 });
+    vector.append({ cell, nullptr, 2 });
+
+    HashMap<GC::Cell*, GC::HeapRoot> roots;
+    vector.gather_roots(roots);
+
+    EXPECT(roots.contains(cell.ptr()));
+    EXPECT(roots.contains(other_cell.ptr()));
+    EXPECT_EQ(roots.size(), 2u);
+    EXPECT_EQ(roots.get(cell.ptr())->type, GC::HeapRoot::Type::RootVector);
+}
+
+TEST_CASE(root_vector_of_variants_reports_their_cells)
+{
+    auto& heap = test_heap();
+    GC::RootVector<Variant<GC::Ref<TestCell>, Empty>> vector;
+
+    auto cell = heap.allocate<TestCell>();
+    vector.append(cell);
+    vector.append(Empty {});
+
+    HashMap<GC::Cell*, GC::HeapRoot> roots;
+    vector.gather_roots(roots);
+
+    EXPECT(roots.contains(cell.ptr()));
+    EXPECT_EQ(roots.size(), 1u);
+}
+
+TEST_CASE(root_hash_map_traced_value_reports_its_cells)
+{
+    auto& heap = test_heap();
+    GC::RootHashMap<int, TracedRecord> map;
+
+    auto cell = heap.allocate<TestCell>();
+    map.set(1, { cell, nullptr, 1 });
+
+    HashMap<GC::Cell*, GC::HeapRoot> roots;
+    map.gather_roots(roots);
+
+    EXPECT(roots.contains(cell.ptr()));
+    EXPECT_EQ(roots.size(), 1u);
+    EXPECT_EQ(roots.get(cell.ptr())->type, GC::HeapRoot::Type::RootHashMap);
+}
+
+TEST_CASE(root_vector_of_traced_values_keeps_their_cells_alive)
+{
+    auto& heap = test_heap();
+    GC::Weak<TestCell> weak_cell;
+    GC::RootVector<TracedRecord> vector;
+
+    {
+        auto cell = heap.allocate<TestCell>();
+        weak_cell = cell.ptr();
+        vector.append({ cell, nullptr, 1 });
+    }
+
+    GC::scrub_stack_for_testing();
+    heap.collect_garbage();
+    EXPECT(weak_cell);
 }
 
 TEST_CASE(heap_vector_visit_edges_reports_cells)
@@ -297,6 +376,74 @@ TEST_CASE(root_hash_table_reports_roots)
     EXPECT_EQ(roots.size(), 1u);
 }
 
+template<typename Container, typename AddCell, typename Transfer>
+static void expect_transferred_container_keeps_cell_alive(AddCell add_cell, Transfer transfer)
+{
+    auto& heap = test_heap();
+    GC::Weak<TestCell> weak_cell;
+    Optional<Container> destination;
+
+    {
+        Container source;
+        auto cell = heap.allocate<TestCell>();
+        weak_cell = cell.ptr();
+        add_cell(source, cell);
+        transfer(destination, source);
+    }
+
+    GC::scrub_stack_for_testing();
+    heap.collect_garbage();
+    EXPECT(weak_cell);
+}
+
+TEST_CASE(root_hash_table_adopts_moved_hash_table)
+{
+    auto& heap = test_heap();
+    HashTable<GC::Ref<TestCell>> table;
+
+    auto cell = heap.allocate<TestCell>();
+    table.set(cell);
+    GC::RootHashTable<GC::Ref<TestCell>> root_table { move(table) };
+
+    HashMap<GC::Cell*, GC::HeapRoot> roots;
+    root_table.gather_roots(roots);
+
+    EXPECT(roots.contains(cell.ptr()));
+    EXPECT_EQ(roots.size(), 1u);
+}
+
+TEST_CASE(copied_and_moved_root_hash_maps_keep_cells_alive)
+{
+    using Map = GC::RootHashMap<int, GC::Ref<TestCell>>;
+    auto add_cell = [](Map& map, GC::Ref<TestCell> cell) { map.set(42, cell); };
+    expect_transferred_container_keeps_cell_alive<Map>(add_cell, [](Optional<Map>& destination, Map& source) { destination = source; });
+    expect_transferred_container_keeps_cell_alive<Map>(add_cell, [](Optional<Map>& destination, Map& source) { destination = move(source); });
+    expect_transferred_container_keeps_cell_alive<Map>(add_cell, [](Optional<Map>& destination, Map& source) {
+        destination.emplace();
+        *destination = source;
+    });
+    expect_transferred_container_keeps_cell_alive<Map>(add_cell, [](Optional<Map>& destination, Map& source) {
+        destination.emplace();
+        *destination = move(source);
+    });
+}
+
+TEST_CASE(copied_and_moved_root_hash_tables_keep_cells_alive)
+{
+    using Table = GC::RootHashTable<GC::Ref<TestCell>>;
+    auto add_cell = [](Table& table, GC::Ref<TestCell> cell) { table.set(cell); };
+    expect_transferred_container_keeps_cell_alive<Table>(add_cell, [](Optional<Table>& destination, Table& source) { destination = source; });
+    expect_transferred_container_keeps_cell_alive<Table>(add_cell, [](Optional<Table>& destination, Table& source) { destination = move(source); });
+    expect_transferred_container_keeps_cell_alive<Table>(add_cell, [](Optional<Table>& destination, Table& source) {
+        destination.emplace();
+        *destination = source;
+    });
+    expect_transferred_container_keeps_cell_alive<Table>(add_cell, [](Optional<Table>& destination, Table& source) {
+        destination.emplace();
+        *destination = move(source);
+    });
+}
+
 TEST_CASE(empty_containers_report_no_roots)
 {
     GC::RootVector<GC::Ref<TestCell>> vector;
@@ -309,64 +456,6 @@ TEST_CASE(empty_containers_report_no_roots)
     map.gather_roots(roots);
 
     EXPECT_EQ(roots.size(), 0u);
-}
-
-TEST_CASE(conservative_hash_map_reports_possible_values)
-{
-    auto& heap = test_heap();
-    GC::ConservativeHashMap<int, GC::Ref<TestCell>> map;
-
-    auto cell = heap.allocate<TestCell>();
-    map.set(42, cell);
-
-    EXPECT(possible_values_contain(map, cell.ptr()));
-}
-
-TEST_CASE(cleared_conservative_hash_map_reports_no_stale_values)
-{
-    auto& heap = test_heap();
-    GC::ConservativeHashMap<int, GC::Ref<TestCell>> map;
-
-    auto cell = heap.allocate<TestCell>();
-    map.set(42, cell);
-    map.clear();
-
-    EXPECT(!possible_values_contain(map, cell.ptr()));
-}
-
-TEST_CASE(removed_conservative_hash_map_entry_not_reported)
-{
-    auto& heap = test_heap();
-    GC::ConservativeHashMap<int, GC::Ref<TestCell>> map;
-
-    auto cell = heap.allocate<TestCell>();
-    map.set(42, cell);
-    map.remove(42);
-
-    EXPECT(!possible_values_contain(map, cell.ptr()));
-}
-
-TEST_CASE(conservative_hash_map_key_reports_possible_values)
-{
-    auto& heap = test_heap();
-    GC::ConservativeHashMap<GC::Ref<TestCell>, int> map;
-
-    auto cell = heap.allocate<TestCell>();
-    map.set(cell, 42);
-
-    EXPECT(possible_values_contain(map, cell.ptr()));
-}
-
-TEST_CASE(removed_conservative_hash_map_key_not_reported)
-{
-    auto& heap = test_heap();
-    GC::ConservativeHashMap<GC::Ref<TestCell>, int> map;
-
-    auto cell = heap.allocate<TestCell>();
-    map.set(cell, 42);
-    map.remove(cell);
-
-    EXPECT(!possible_values_contain(map, cell.ptr()));
 }
 
 TEST_CASE(weak_hash_map_non_cell_key_cell_value)
@@ -520,37 +609,24 @@ TEST_CASE(weak_hash_map_ensure_handles_non_cell_value)
     EXPECT_EQ(map.get(*default_key).value(), 13);
 }
 
-TEST_CASE(conservative_hash_table_reports_possible_values)
+TEST_CASE(weak_pointers_to_dead_cells_are_null_while_finalizing)
 {
     auto& heap = test_heap();
-    GC::ConservativeHashTable<GC::Ref<TestCell>> table;
+    bool weak_cell_was_null_while_finalizing = false;
+    bool weak_to_self_was_null_while_finalizing = false;
 
-    auto cell = heap.allocate<TestCell>();
-    table.set(cell);
+    {
+        auto cell = heap.allocate<TestCell>();
+        auto observer = heap.allocate<FinalizerObservingCell>();
+        observer->weak_cell = cell.ptr();
+        observer->weak_cell_was_null_while_finalizing = &weak_cell_was_null_while_finalizing;
+        observer->weak_to_self_was_null_while_finalizing = &weak_to_self_was_null_while_finalizing;
+    }
 
-    EXPECT(possible_values_contain(table, cell.ptr()));
+    GC::scrub_stack_for_testing();
+    heap.collect_garbage(GC::Heap::CollectionType::CollectEverything);
+    EXPECT(weak_cell_was_null_while_finalizing);
+    EXPECT(weak_to_self_was_null_while_finalizing);
 }
 
-TEST_CASE(cleared_conservative_hash_table_reports_no_stale_values)
-{
-    auto& heap = test_heap();
-    GC::ConservativeHashTable<GC::Ref<TestCell>> table;
-
-    auto cell = heap.allocate<TestCell>();
-    table.set(cell);
-    table.clear();
-
-    EXPECT(!possible_values_contain(table, cell.ptr()));
-}
-
-TEST_CASE(removed_conservative_hash_table_entry_not_reported)
-{
-    auto& heap = test_heap();
-    GC::ConservativeHashTable<GC::Ref<TestCell>> table;
-
-    auto cell = heap.allocate<TestCell>();
-    table.set(cell);
-    table.remove(cell);
-
-    EXPECT(!possible_values_contain(table, cell.ptr()));
 }

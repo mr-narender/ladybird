@@ -22,7 +22,7 @@ SVGStopElement::SVGStopElement(DOM::Document& document, DOM::QualifiedName quali
 Gfx::Color SVGStopElement::stop_color()
 {
     if (auto const* values = style_group<CSS::ComputedValues::SVGResetValues>())
-        return Gfx::Color::from_bgra(values->stop_color);
+        return CSS::resolve_style_color(values->stop_color, style_group<CSS::ComputedValues::InheritedTextValues>()->color_value());
     return CSS::InitialValues::stop_color();
 }
 
@@ -37,7 +37,8 @@ float SVGStopElement::stop_opacity() const
 GC::Ref<SVGAnimatedNumber> SVGStopElement::offset()
 {
     if (!m_stop_offset)
-        m_stop_offset = SVGAnimatedNumber::create(*this, DOM::QualifiedName { AttributeNames::offset, OptionalNone {}, OptionalNone {} }, 0.f);
+        m_stop_offset = SVGAnimatedNumber::create(*this, DOM::QualifiedName { AttributeNames::offset, OptionalNone {}, OptionalNone {} }, 0.f,
+            SVGAnimatedNumber::SupportsSecondValue::No, SVGAnimatedNumber::ValueRepresented::First, SVGAnimatedNumber::AcceptsPercentage::Yes);
     return *m_stop_offset;
 }
 

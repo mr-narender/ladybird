@@ -7,16 +7,17 @@
 #pragma once
 
 #include <AK/Time.h>
-#include <LibMedia/Audio/SampleSpecification.h>
-#include <LibMedia/AudioBlock.h>
+#include <LibAudio/SampleSpecification.h>
 #include <LibMedia/MediaPipelineNode.h>
 #include <LibMedia/PipelineStatus.h>
+#include <LibMediaCodecs/AudioBlock.h>
 
 namespace Media {
 
 struct AudioProducerOutput {
     AudioBlock const* block { nullptr };
     PipelineStatus status;
+    PipelineCheckpoint checkpoint { 0 };
 };
 
 class AudioProducer : public virtual MediaPipelineNode {
@@ -31,6 +32,11 @@ public:
     virtual void set_wake_handler(PipelineWakeHandler) = 0;
 
     virtual void seek(AK::Duration timestamp) = 0;
+    virtual void seek_continuing_at_output_frame(AK::Duration timestamp, i64 output_frame_index)
+    {
+        (void)output_frame_index;
+        seek(timestamp);
+    }
 
     virtual void set_playback_rate(float rate)
     {

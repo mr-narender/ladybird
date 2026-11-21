@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
-<script src="layout-test.js"></script>
+<script src="work-test.js"></script>
 <style>
     body { margin: 0; font: 16px/1 monospace; }
     #spacer { height: 20px; }
@@ -29,7 +29,7 @@
                     layout FULL
                       @viewport/block RUN (cache=bypass)
                         BlockContainer<HTML>/block RUN (cache=miss)
-                          Box<DIV>#cached/flex REUSE SUBTREE
+                          BlockContainer<DIV> REUSE IN-FLOW SUBTREE
                 `,
                 check: equal => {
                     const after = big.getBoundingClientRect();

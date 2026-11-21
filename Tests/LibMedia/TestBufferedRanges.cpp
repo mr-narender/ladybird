@@ -44,11 +44,6 @@ static ByteBuffer read_fixture(StringView path)
     return MUST(file->read_until_eof());
 }
 
-static NonnullRefPtr<Media::Demuxer> create_demuxer(NonnullRefPtr<Media::IncrementallyPopulatedStream> const& stream)
-{
-    return MUST(Media::create_demuxer(stream));
-}
-
 static NonnullRefPtr<Media::IncrementallyPopulatedStream> create_complete_stream(ByteBuffer const& data)
 {
     return Media::IncrementallyPopulatedStream::create_from_buffer(data);
@@ -66,29 +61,25 @@ static NonnullRefPtr<Media::IncrementallyPopulatedStream> create_disjoint_stream
     return stream;
 }
 
-// Every fixture is a single-track file; test against that track's ranges.
-static Media::TimeRanges single_track_buffered_ranges(Media::Demuxer& demuxer)
+static Media::TimeRanges source_buffered_ranges(Media::Demuxer& demuxer)
 {
-    auto const& scan_state = demuxer.scan_state();
-    if (scan_state.tracks.is_empty())
-        return {};
-    return scan_state.tracks[0].buffered_ranges;
+    return demuxer.scan_state().buffered_ranges();
 }
 
 // Wait until the scan has caught up with the stream; the change handler's dispatch wakes the pump.
 template<typename Condition>
 static Media::TimeRanges wait_for_buffered_ranges(Core::EventLoop& loop, Media::Demuxer& demuxer, Condition condition)
 {
-    demuxer.set_scan_state_change_handler([] { });
+    demuxer.set_scan_state_change_handler([](auto const&) { });
     ScopeGuard remove_handler = [&] { demuxer.set_scan_state_change_handler(nullptr); };
 
     bool deadline_expired = false;
-    auto deadline_timer = Core::Timer::create_single_shot(1'000, [&] { deadline_expired = true; });
+    auto deadline_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1'000), [&] { deadline_expired = true; });
     deadline_timer->start();
 
-    loop.spin_until([&] { return condition(single_track_buffered_ranges(demuxer)) || deadline_expired; });
+    loop.spin_until([&] { return condition(source_buffered_ranges(demuxer)) || deadline_expired; });
     EXPECT(!deadline_expired);
-    return single_track_buffered_ranges(demuxer);
+    return source_buffered_ranges(demuxer);
 }
 
 static void expect_valid_ranges(Media::TimeRanges const& ranges)
@@ -102,11 +93,6 @@ static void expect_valid_ranges(Media::TimeRanges const& ranges)
         EXPECT(range.start >= previous_end);
         previous_end = range.end;
     }
-}
-
-[[maybe_unused]] static bool nearly_greater_than_or_equal(AK::Duration lhs, AK::Duration rhs)
-{
-    return rhs - lhs <= AK::Duration::from_microseconds(5);
 }
 
 static void expect_complete_file_is_fully_buffered(Fixture const& fixture)
@@ -196,13 +182,14 @@ static Array fixtures {
     },
     Fixture {
         "buffered-ranges/tone.flac"sv,
-        { 32 * KiB, 87552, 0, 48000 },
-        { 68 * KiB, 221184, 0, 48000 },
+        { 32 * KiB, 82944, 4608, 48000 },
+        { 68 * KiB, 216576, 4608, 48000 },
     },
+    // Opus times count from after the stream's pre-skip of 312 samples.
     Fixture {
         "buffered-ranges/tone_opus.ogg"sv,
-        { 96 * KiB, 432000, 48000, 48000 },
-        { 160 * KiB, 768000, 48000, 48000 },
+        { 96 * KiB, 432000 - 312, 48000, 48000 },
+        { 160 * KiB, 768000 - 312, 48000, 48000 },
     },
     Fixture {
         "buffered-ranges/tone_flac.ogg"sv,
@@ -213,6 +200,18 @@ static Array fixtures {
         "buffered-ranges/tone_vorbis.ogg"sv,
         { 256 * KiB, 3333120, 45056, 44100 },
         { 320 * KiB, 4189184, 45056, 44100 },
+    },
+    Fixture {
+        "buffered-ranges/tone_vorbis.webm"sv,
+        { 256 * KiB, AK::Duration::from_milliseconds(71'866) + AK::Duration::from_time_units(1024, 1, 44100), AK::Duration::from_milliseconds(74'884) },
+        { 320 * KiB, AK::Duration::from_milliseconds(90'116) + AK::Duration::from_time_units(1024, 1, 44100), AK::Duration::from_milliseconds(94'853) },
+    },
+    // Millisecond-rounded timestamps on reordered frames leave 1 ms holes between the samples' presentation
+    // intervals, so these ranges only stay whole if the samples' availability decides them.
+    Fixture {
+        "buffered-ranges/ms_rounded_b_frames.mp4"sv,
+        { 5236, 29040, 19008, 24000 },
+        { 6614, 54072, 18000, 24000 },
     },
 };
 
@@ -240,6 +239,50 @@ TEST_CASE(removing_ends_of_complete_file_produces_middle_time_range)
         expect_removing_ends_of_complete_file_produces_middle_time_range(fixture);
 }
 
+// The media in these files starts 10 seconds into its timeline.
+static Array late_start_fixtures {
+    "buffered-ranges/late_start_fragmented.mp4"sv,
+    "buffered-ranges/late_start.webm"sv,
+};
+
+TEST_CASE(late_starting_files_report_their_earliest_possible_position)
+{
+    for (auto path : late_start_fixtures) {
+        dbgln("-- '{}' earliest possible position --", path);
+        auto demuxer = create_demuxer(create_complete_stream(read_fixture(path)));
+        EXPECT_EQ(demuxer->earliest_possible_position(), AK::Duration::from_seconds(10));
+    }
+}
+
+TEST_CASE(late_starting_files_are_buffered_from_zero)
+{
+    auto& loop = never_destroyed_event_loop();
+    for (auto path : late_start_fixtures) {
+        dbgln("-- '{}' buffered from zero --", path);
+        auto demuxer = create_demuxer(create_complete_stream(read_fixture(path)));
+        auto ranges = wait_for_buffered_ranges(loop, demuxer, [](auto const& ranges) { return !ranges.is_empty(); });
+        EXPECT_EQ(ranges.size(), 1u);
+        EXPECT_EQ(ranges[0].start, AK::Duration::zero());
+        EXPECT(ranges[0].end > AK::Duration::from_milliseconds(11'990));
+    }
+}
+
+TEST_CASE(late_starting_file_without_its_first_fragment_is_buffered_from_its_next_keyframe)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto data = read_fixture("buffered-ranges/late_start_fragmented.mp4"sv);
+    auto stream = create_complete_stream(data);
+    auto demuxer = create_demuxer(stream);
+    (void)wait_for_buffered_ranges(loop, demuxer, [](auto const& ranges) { return !ranges.is_empty(); });
+
+    // Remove the sample data of the first fragment, which holds the samples from 10 to 11 seconds.
+    stream->remove_byte_range(946, 2853);
+    auto ranges = wait_for_buffered_ranges(loop, demuxer, [](auto const& ranges) { return !ranges.is_empty() && ranges[0].start != AK::Duration::zero(); });
+    EXPECT_EQ(ranges.size(), 1u);
+    EXPECT_EQ(ranges[0].start, AK::Duration::from_seconds(11));
+    EXPECT_EQ(ranges[0].end, AK::Duration::from_seconds(12));
+}
+
 TEST_CASE(scan_state_change_handler_fires_when_available_data_changes)
 {
     auto& loop = never_destroyed_event_loop();
@@ -263,12 +306,12 @@ TEST_CASE(scan_state_reports_reached_end_of_stream)
 
     auto closed_full_demuxer = create_demuxer(create_complete_stream(data));
     (void)wait_for_buffered_ranges(loop, closed_full_demuxer, [](auto const& ranges) { return !ranges.is_empty(); });
-    EXPECT(closed_full_demuxer->scan_state().tracks[0].reached_end_of_stream);
+    EXPECT(closed_full_demuxer->scan_state().reached_end_of_stream);
 
     // A gap before the closing bytes does not move the end of the stream.
     auto closed_disjoint_demuxer = create_demuxer(create_disjoint_stream(data, fixtures[0].first_split, fixtures[0].second_split));
     (void)wait_for_buffered_ranges(loop, closed_disjoint_demuxer, [](auto const& ranges) { return ranges.size() == 2; });
-    EXPECT(closed_disjoint_demuxer->scan_state().tracks[0].reached_end_of_stream);
+    EXPECT(closed_disjoint_demuxer->scan_state().reached_end_of_stream);
 
     // A size expectation from the fetch is not a confirmation that the stream's data has ended.
     auto unclosed_stream = Media::IncrementallyPopulatedStream::create_empty();
@@ -276,17 +319,5 @@ TEST_CASE(scan_state_reports_reached_end_of_stream)
     unclosed_stream->add_chunk_at(0, data.bytes());
     auto unclosed_demuxer = create_demuxer(unclosed_stream);
     (void)wait_for_buffered_ranges(loop, unclosed_demuxer, [](auto const& ranges) { return !ranges.is_empty(); });
-    EXPECT(!unclosed_demuxer->scan_state().tracks[0].reached_end_of_stream);
-}
-
-TEST_CASE(single_track_files_scan_one_track_state)
-{
-    auto& loop = never_destroyed_event_loop();
-    auto data = read_fixture(fixtures[0].path);
-    auto demuxer = create_demuxer(create_complete_stream(data));
-    (void)wait_for_buffered_ranges(loop, demuxer, [](auto const& ranges) { return !ranges.is_empty(); });
-
-    auto const& scan_state = demuxer->scan_state();
-    EXPECT_EQ(scan_state.tracks.size(), 1u);
-    EXPECT_EQ(scan_state.tracks[0].track.type(), Media::TrackType::Audio);
+    EXPECT(!unclosed_demuxer->scan_state().reached_end_of_stream);
 }

@@ -76,8 +76,8 @@ Utf16String RustDescriptorBlock::item(size_t index) const
 
 Utf16String RustDescriptorBlock::serialized() const
 {
-    size_t result = 0;
-    VERIFY(rust_descriptor_block_serialize(m_block, &result));
+    size_t result = rust_descriptor_block_serialize(m_block);
+    VERIFY(result);
     return Utf16String::adopt_raw(result);
 }
 
@@ -96,7 +96,7 @@ RefPtr<StyleValue const> RustDescriptorBlock::descriptor(DescriptorNameAndID con
     auto* value = rust_descriptor_block_get(m_block, to_underlying(name.id()), Parser::ffi_utf16_view(name.name()));
     if (!value)
         return nullptr;
-    return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(value)));
+    return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(value));
 }
 
 RefPtr<StyleValue const> RustDescriptorBlock::descriptor_or_initial_value(AtRuleID at_rule, DescriptorNameAndID const& name) const

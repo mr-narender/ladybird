@@ -20,7 +20,7 @@ jobs:
         arch: ['x86_64']
         package_type: ['Linux-x86_64']
         runner_labels: ['["ubuntu-24.04-internal", "js-benchmarks", "self-hosted"]']
-        container: ['{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.08.28"}']
+        container: ['{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.20"}']
 
         include:
           - os_name: 'macOS'
@@ -83,20 +83,6 @@ jobs:
           cd wasm-repl
           tar -xvzf ladybird-wasm-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz
 
-      - name: 'Download cranelift-compiler artifact'
-        uses: dawidd6/action-download-artifact@v24
-        with:
-          run_id: ${{ github.event.workflow_run.id }}
-          name: ladybird-cranelift-compiler-${{ matrix.package_type }}
-          path: cranelift-compiler
-          if_no_artifact_found: warn
-
-      - name: 'Install cranelift-compiler next to wasm'
-        if: ${{ hashFiles('cranelift-compiler/cranelift-compiler') != '' && hashFiles('wasm-repl/bin/wasm') != '' }}
-        shell: bash
-        run: |
-          install -m 0755 cranelift-compiler/cranelift-compiler wasm-repl/bin/cranelift-compiler
-
       - name: 'Run the benchmarks'
         shell: bash
         run: |
@@ -105,7 +91,7 @@ jobs:
           source .venv/bin/activate
           python3 -m pip install -r requirements.txt
 
-          run_options='--iterations=5'
+          run_options='--iterations=3'
 
           js_path="${GITHUB_WORKSPACE}/js-repl/bin/js"
           run_options="${run_options} --executable=${js_path}"

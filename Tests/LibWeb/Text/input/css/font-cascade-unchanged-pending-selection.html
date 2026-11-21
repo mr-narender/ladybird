@@ -1,0 +1,64 @@
+<!doctype html>
+<script src="../include.js"></script>
+<script src="../work-test.js"></script>
+<script>
+    promiseTest(async () => {
+        const resident = new FontFace("PendingSelection", 'url("../../../Ref/data/fonts/Ahem.ttf")', { weight: "400", unicodeRange: "U+0-7F" });
+        await resident.load();
+        document.fonts.add(resident);
+        const pending = new FontFace("PendingSelection", 'url("unused-selection-subset.woff")', { weight: "400", unicodeRange: "U+400-4FF", display: "block" });
+        document.fonts.add(pending);
+        const target = document.body.appendChild(document.createElement("span"));
+        target.style.cssText = "display: inline-block; font: 20px PendingSelection, monospace; width: 10ch";
+        target.textContent = "AA";
+        const width = target.getBoundingClientRect().width;
+        internals.updateStyle();
+        const results = [];
+        const styleSummary = work => `passes [${work.passes().join(", ")}], restyled [${work.restyled().map(shortStyleName).join(", ")}]`;
+
+        const paintChangeWork = layoutWork(() => {
+            target.style.color = "red";
+            target.getBoundingClientRect();
+        });
+        results.push(`layout after paint change with pending cascade: ${paintChangeWork.passes().join(" | ") || "(no layout)"}`);
+
+        const unused = new FontFace("PendingSelection", 'url("../../../Ref/data/fonts/Ahem.ttf")', { weight: "700", unicodeRange: "U+0-7F" });
+        await unused.load();
+        const registrationWork = styleWork(() => document.fonts.add(unused));
+        results.push(`unused weight registration style work: ${styleSummary(registrationWork)}`);
+        document.fonts.delete(unused);
+        internals.updateStyle();
+
+        const loading = new FontFace("PendingSelection", 'url("../../../Ref/data/fonts/Ahem.ttf")', { weight: "700", unicodeRange: "U+0-7F" });
+        document.fonts.add(loading);
+        target.getBoundingClientRect();
+        internals.updateStyle();
+        internals.beginStyleTrace();
+        await loading.load();
+        internals.updateStyle();
+        const completionEvents = parseStyleTrace(internals.takeStyleTrace(), { stylePassesOnly: true });
+        const completionPasses = completionEvents.filter(event => event.event === "pass").map(event => event.kind);
+        const completionRestyled = completionEvents.filter(event => event.event === "restyle" && event.outcome !== "kept").map(event => shortStyleName(event.element));
+        results.push(`unused weight completion style work: passes [${completionPasses.join(", ")}], restyled [${completionRestyled.join(", ")}]`);
+        results.push(`unchanged selection preserves width: ${target.getBoundingClientRect().width === width}`);
+        results.push(`unused subset stays unloaded: ${pending.status === "unloaded"}`);
+
+        const replacement = new FontFace("PendingSelection", 'url("../../../Assets/HashSans.woff")', { weight: "400", unicodeRange: "U+0-7F" });
+        await replacement.load();
+        document.fonts.delete(loading);
+        document.fonts.delete(resident);
+        target.getBoundingClientRect();
+        let changedWidth;
+        const matchingWork = styleWork(() => {
+            document.fonts.add(replacement);
+            changedWidth = target.getBoundingClientRect().width;
+        }, internals, { flush: false });
+        results.push(`matching weight registration style work: ${styleSummary(matchingWork)}`);
+        results.push(`matching selection changes width: ${changedWidth !== width}`);
+        document.fonts.delete(replacement);
+        document.fonts.add(resident);
+        results.push(`removing matching face restores width: ${target.getBoundingClientRect().width === width}`);
+        for (const result of results)
+            println(result);
+    });
+</script>

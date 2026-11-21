@@ -9,6 +9,7 @@
 #include <AK/RefPtr.h>
 #include <AK/Time.h>
 #include <LibMedia/Forward.h>
+#include <LibMedia/InvalidateHeldData.h>
 #include <LibMedia/MediaPipelineNode.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/SeekMode.h>
@@ -18,6 +19,7 @@ namespace Media {
 struct VideoProducerOutput {
     RefPtr<VideoFrame> frame;
     PipelineStatus status;
+    PipelineCheckpoint checkpoint { 0 };
 };
 
 class VideoProducer : public virtual MediaPipelineNode {
@@ -30,7 +32,7 @@ public:
     virtual void consume() = 0;
     virtual void set_wake_handler(PipelineWakeHandler) = 0;
 
-    virtual void seek(AK::Duration timestamp) = 0;
+    virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) = 0;
 };
 
 }

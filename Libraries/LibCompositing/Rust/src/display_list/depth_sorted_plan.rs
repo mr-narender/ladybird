@@ -304,8 +304,8 @@ fn partition_command_runs_into_plane_chunks(
     let mut mappings = Vec::new();
     let mut mappings_key = None;
 
-    // A run's ink bounds already leave out clips and unbounded draws; mapping their union once per
-    // level is conservative, as it can only widen a plane's bounds.
+    // A run's ink bounds already leave out clips; mapping their union once per level is
+    // conservative, as it can only widen a plane's bounds.
     let mut chunks: Vec<CommandChunk> = Vec::new();
     for (run_index, run) in command_runs.iter().enumerate() {
         let spatial = run.context.spatial;
@@ -442,6 +442,7 @@ pub fn build_depth_sorted_replay_plan(
 
 #[cfg(test)]
 mod tests {
+    use ak::math;
     use libgfx_rust::{FloatMatrix4x4, IntRect, scale_matrix, translation_matrix};
 
     use super::*;
@@ -500,8 +501,8 @@ mod tests {
     }
 
     fn rotate_y(radians: f32) -> FloatMatrix4x4 {
-        let cosine = radians.cos();
-        let sine = radians.sin();
+        let cosine = math::cos(radians);
+        let sine = math::sin(radians);
         FloatMatrix4x4 {
             elements: [
                 [cosine, 0.0, sine, 0.0],

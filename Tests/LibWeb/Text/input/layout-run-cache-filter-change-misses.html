@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
-<script src="layout-test.js"></script>
+<script src="work-test.js"></script>
 <style>
     body { margin: 0; }
     #spacer { width: 100px; height: 50px; }
@@ -29,6 +29,7 @@
                       @viewport/block RUN (cache=bypass)
                         BlockContainer<HTML>/block RUN (cache=miss)
                           BlockContainer<DIV>#cached/block RUN (cache=miss)
+                            BlockContainer<DIV>#inner REUSE IN-FLOW SUBTREE
                 `,
             },
         ],

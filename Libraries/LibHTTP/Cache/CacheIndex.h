@@ -12,6 +12,7 @@
 #include <AK/Time.h>
 #include <AK/Types.h>
 #include <LibDatabase/Database.h>
+#include <LibHTTP/Cache/CacheKey.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibRequests/CacheSizes.h>
 
@@ -21,13 +22,12 @@ namespace HTTP {
 // the entire cache entry has been successfully written to disk.
 class CacheIndex {
     struct Entry {
-        u64 vary_key { 0 };
+        CacheDigest vary_key;
 
         String url;
         NonnullRefPtr<HeaderList> request_headers;
         NonnullRefPtr<HeaderList> response_headers;
         u64 data_size { 0 };
-        u64 associated_data_size { 0 };
         u64 serialized_request_headers_size { 0 };
         u64 serialized_response_headers_size { 0 };
 
@@ -37,7 +37,7 @@ class CacheIndex {
 
         u64 estimated_size() const
         {
-            return data_size + associated_data_size + serialized_request_headers_size + serialized_response_headers_size;
+            return data_size + serialized_request_headers_size + serialized_response_headers_size;
         }
     };
 
@@ -46,21 +46,30 @@ public:
 
     static ErrorOr<CacheIndex> create(Database::Database&, LexicalPath const& cache_directory);
 
-    ErrorOr<void> create_entry(u64 cache_key, u64 vary_key, String url, NonnullRefPtr<HeaderList> request_headers, NonnullRefPtr<HeaderList> response_headers, u64 data_size, UnixDateTime request_time, UnixDateTime response_time);
-    void remove_entry(u64 cache_key, u64 vary_key);
-    void remove_entries_exceeding_cache_limit(Function<void(u64 cache_key, u64 vary_key)> on_entry_removed);
-    void remove_entries_accessed_since(UnixDateTime, Function<void(u64 cache_key, u64 vary_key)> on_entry_removed);
+    using OnEntryRemoved = Function<void(CacheDigest const& cache_key, CacheDigest const& vary_key)>;
 
-    Optional<Entry const&> find_entry(u64 cache_key, HeaderList const& request_headers);
-    bool has_entry(u64 cache_key, u64 vary_key);
+    ErrorOr<void> create_entry(CacheDigest const& cache_key, CacheDigest const& vary_key, String url, NonnullRefPtr<HeaderList> request_headers, NonnullRefPtr<HeaderList> response_headers, u64 data_size, UnixDateTime request_time, UnixDateTime response_time);
+    void remove_entry(CacheDigest const& cache_key, CacheDigest const& vary_key);
+    void remove_entries_exceeding_cache_limit(OnEntryRemoved on_entry_removed);
+    void remove_variants_exceeding_limit(CacheDigest const& cache_key, CacheDigest const& vary_key_to_keep, OnEntryRemoved on_entry_removed);
+    void remove_entries_accessed_since(UnixDateTime, OnEntryRemoved on_entry_removed);
+    void remove_entries_accessed_before(UnixDateTime, OnEntryRemoved on_entry_removed);
+    void remove_entries_for_cache_key(CacheDigest const& cache_key, OnEntryRemoved on_entry_removed);
 
-    void update_response_headers(u64 cache_key, u64 vary_key, NonnullRefPtr<HeaderList>);
-    ErrorOr<void> update_associated_data_size(u64 cache_key, u64 vary_key, u64 associated_data_size);
-    void update_last_access_time(u64 cache_key, u64 vary_key);
+    Optional<Entry const&> find_entry(CacheDigest const& cache_key, HeaderList const& request_headers);
+    bool has_entry(CacheDigest const& cache_key, CacheDigest const& vary_key);
+
+    ErrorOr<void> update_response_headers(CacheDigest const& cache_key, CacheDigest const& vary_key, NonnullRefPtr<HeaderList>, UnixDateTime request_time, UnixDateTime response_time);
+    void update_last_access_time(CacheDigest const& cache_key, CacheDigest const& vary_key);
 
     Requests::CacheSizes estimate_cache_size_accessed_since(UnixDateTime since);
+    Vector<Requests::CacheAccessBucket> access_profile(AK::Duration granularity);
+    u64 total_estimated_size() const { return static_cast<u64>(m_total_estimated_size); }
+
+    Function<void()> on_total_estimated_size_change;
 
     void set_maximum_disk_cache_size(u64 maximum_disk_cache_size);
+    u64 maximum_disk_cache_entry_size() const { return static_cast<u64>(m_limits.maximum_disk_cache_entry_size); }
 
 private:
     struct Statements {
@@ -68,12 +77,14 @@ private:
         Database::StatementID remove_entry { 0 };
         Database::StatementID remove_entries_exceeding_cache_limit { 0 };
         Database::StatementID remove_entries_accessed_since { 0 };
+        Database::StatementID remove_entries_accessed_before { 0 };
+        Database::StatementID remove_all_entries { 0 };
         Database::StatementID select_entries { 0 };
         Database::StatementID update_response_headers { 0 };
-        Database::StatementID update_associated_data_size { 0 };
         Database::StatementID update_last_access_time { 0 };
         Database::StatementID estimate_cache_size_accessed_since { 0 };
         Database::StatementID select_total_estimated_size { 0 };
+        Database::StatementID select_access_profile { 0 };
     };
 
     struct Limits {
@@ -84,14 +95,15 @@ private:
 
     CacheIndex(Database::Database&, Statements, Limits, i64 total_estimated_size);
 
-    Optional<Entry&> get_entry(u64 cache_key, u64 vary_key);
-    void delete_entry(u64 cache_key, u64 vary_key);
+    Vector<Entry>& entries_for_cache_key(CacheDigest const& cache_key);
+    Optional<Entry&> get_entry(CacheDigest const& cache_key, CacheDigest const& vary_key);
+    void delete_entry(CacheDigest const& cache_key, CacheDigest const& vary_key);
     void adjust_total_estimated_size(i64 delta);
 
     NonnullRawPtr<Database::Database> m_database;
     Statements m_statements;
 
-    HashMap<u64, Vector<Entry>, IdentityHashTraits<u64>> m_entries;
+    HashMap<CacheDigest, Vector<Entry>> m_entries;
 
     Limits m_limits;
     i64 m_total_estimated_size { 0 };

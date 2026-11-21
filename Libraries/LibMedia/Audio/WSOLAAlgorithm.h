@@ -9,10 +9,10 @@
 #pragma once
 
 #include <AK/Vector.h>
+#include <LibAudio/SampleSpecification.h>
 #include <LibMedia/Audio/AudioBuffer.h>
 #include <LibMedia/Audio/AudioRingBuffer.h>
-#include <LibMedia/Audio/SampleSpecification.h>
-#include <LibMedia/AudioBlock.h>
+#include <LibMediaCodecs/AudioBlock.h>
 
 namespace Audio {
 
@@ -40,7 +40,6 @@ public:
     u32 sample_rate() const { return m_sample_specification.sample_rate(); }
     u8 channel_count() const { return m_sample_specification.channel_count(); }
     size_t ola_window_size() const { return m_ola_window_size; }
-    size_t ola_hop_size() const { return m_ola_hop_size; }
 
 private:
     bool run_one_wsola_iteration(float playback_rate);

@@ -22,6 +22,7 @@ class Event;
 class EventLoop;
 class EventReceiver;
 class File;
+class FileWatcher;
 class LocalServer;
 class LocalSocket;
 class MappedFile;
@@ -37,6 +38,7 @@ class Promise;
 template<typename Result, typename TError = AK::Error>
 class ThreadedPromise;
 class SocketAddress;
+class StatsLog;
 class TCPServer;
 class TCPSocket;
 class Timer;

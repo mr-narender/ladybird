@@ -9,6 +9,7 @@
 #include <AK/DistinctNumeric.h>
 #include <AK/IntrusiveList.h>
 #include <AK/RefCounted.h>
+#include <AK/kmalloc.h>
 #include <LibGC/CellAllocator.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Export.h>
@@ -103,13 +104,16 @@ public:
         // https://storage.spec.whatwg.org/#task-source
         Storage,
 
+        // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#embed-task-source
+        Embed,
+
         // !!! IMPORTANT: Keep this field last!
         // This serves as the base value of all unique task sources.
         // Some elements, such as the HTMLMediaElement, must have a unique task source per instance.
         UniqueTaskSourceStart
     };
 
-    static GC::Ref<Task> create(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps, Priority = Priority::Normal);
+    static GC::Ref<Task> create(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps, Priority = Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});
 
     virtual ~Task() override;
 
@@ -122,6 +126,7 @@ public:
     void set_timer_nesting_level(u32 nesting_level) { m_timer_nesting_level = nesting_level; }
 
     void execute();
+    void discard();
 
     DOM::Document const* document() const;
 
@@ -129,7 +134,7 @@ public:
     bool is_permanently_unrunnable() const;
 
 private:
-    Task(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps, Priority);
+    Task(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps, Priority, GC::Ptr<GC::Function<void()>> discard_steps);
 
     virtual void visit_edges(Visitor&) override;
 
@@ -138,6 +143,7 @@ private:
     Priority m_priority { Priority::Normal };
     u32 m_timer_nesting_level { 0 };
     GC::Ref<GC::Function<void()>> m_steps;
+    GC::Ptr<GC::Function<void()>> m_discard_steps;
     GC::Ptr<DOM::Document const> m_document;
 
     IntrusiveListNode<Task> m_task_queue_node;
@@ -147,6 +153,8 @@ public:
 };
 
 struct WEB_API UniqueTaskSource {
+    AK_ALLOC_WITH_KMALLOC;
+
     UniqueTaskSource();
     ~UniqueTaskSource();
 

@@ -8,6 +8,7 @@
 #include <LibTest/TestCase.h>
 
 #include <AK/Array.h>
+#include <AK/String.h>
 #include <AK/StringConversions.h>
 #include <AK/Utf16View.h>
 
@@ -433,36 +434,6 @@ TEST_CASE(parse_completely_must_be_just_floating_point)
     EXPECT_PARSE_COMPLETELY_TO_FAIL("1234567=890");
 }
 
-#define BENCHMARK_DOUBLE_PARSING(value, iterations)           \
-    do {                                                      \
-        auto data = #value##sv;                               \
-        auto true_result = value;                             \
-        for (int i = 0; i < iterations * 10'000; ++i) {       \
-            AK::taint_for_optimizer(data);                    \
-            EXPECT_EQ(data.to_number<double>(), true_result); \
-        }                                                     \
-    } while (false)
-
-BENCHMARK_CASE(one)
-{
-    BENCHMARK_DOUBLE_PARSING(1, 500);
-}
-
-BENCHMARK_CASE(long_float_without_exponent)
-{
-    BENCHMARK_DOUBLE_PARSING(1234567812345678, 400);
-}
-
-BENCHMARK_CASE(float_with_exponent)
-{
-    BENCHMARK_DOUBLE_PARSING(1.234567e20, 400);
-}
-
-BENCHMARK_CASE(inadequate_float)
-{
-    BENCHMARK_DOUBLE_PARSING(7.4109846876186981626485318930233205854758970392148714663837852375101326090531312779794975454245398856969484704316857659638998506553390969459816219401617281718945106978546710679176872575177347315553307795408549809608457500958111373034747658096871009590975442271004757307809711118935784838675653998783503015228055934046593739791790738723868299395818481660169122019456499931289798411362062484498678713572180352209017023903285791732520220528974020802906854021606612375549983402671300035812486479041385743401875520901590172592547146296175134159774938718574737870961645638908718119841271673056017045493004705269590165763776884908267986972573366521765567941072508764337560846003984904972149117463085539556354188641513168478436313080237596295773983001708984375001e-324, 4);
-}
-
 TEST_CASE(signed_integer)
 {
     auto value = AK::parse_number<int>(StringView());
@@ -743,18 +714,80 @@ TEST_CASE(float_conversion)
     DOES_CONVERT_TO(float, -11754944e-45, 1, 11754944, -45);
 }
 
-BENCHMARK_CASE(bench_float_conversion)
+TEST_CASE(decimal_conversion_trailing_zeroes)
 {
-    static constexpr auto numbers = to_array<double>({
-        123.456789,
-        0.000000123456789,
-        9876543210123456.0,
-        1.23e-7,
-        58.0,
-    });
+    // Exercise short significands across zmij's range of decimal exponents, including
+    // cases with many trailing zeroes and extra factors of two in the significand.
+    for (auto exponent : to_array({ -300, -30, -7, -1, 0, 1, 7, 30, 300 })) {
+        for (u64 fraction = 1; fraction <= 100; ++fraction) {
+            auto normalized_fraction = fraction;
+            auto normalized_exponent = exponent;
+            while (normalized_fraction % 10 == 0) {
+                normalized_fraction /= 10;
+                ++normalized_exponent;
+            }
 
-    for (size_t i = 0; i < 100'000'000; i++) {
-        auto result = AK::convert_to_decimal_exponential_form(numbers[i % numbers.size()]);
-        AK::taint_for_optimizer(result);
+            for (bool sign : { false, true }) {
+                auto text = MUST(String::formatted("{}{}e{}", sign ? "-"sv : ""sv, fraction, exponent));
+                auto expected = AK::DecimalExponentialForm { sign, normalized_fraction, normalized_exponent };
+                EXPECT_EQ(AK::convert_to_decimal_exponential_form(parse_complete_double(text.bytes_as_string_view())), expected);
+                if (exponent >= -30 && exponent <= 30)
+                    EXPECT_EQ(AK::convert_to_decimal_exponential_form(parse_complete_float(text.bytes_as_string_view())), expected);
+            }
+        }
     }
+
+    // Powers of two can have many binary trailing zeroes without any decimal ones.
+    for (int exponent = 0; exponent <= 53; ++exponent) {
+        auto fraction = 1ULL << exponent;
+        DOES_CONVERT_TO(double, fraction, false, fraction, 0);
+        if (exponent <= 23)
+            DOES_CONVERT_TO(float, fraction, false, fraction, 0);
+    }
+
+    DOES_CONVERT_TO(double, 1e23, false, 1, 23);
+    DOES_CONVERT_TO(double, bit_cast<double>(1ULL), false, 5, -324);
+    DOES_CONVERT_TO(double, bit_cast<double>(2ULL), false, 1, -323);
+    DOES_CONVERT_TO(float, bit_cast<float>(1U), false, 1, -45);
+    DOES_CONVERT_TO(float, bit_cast<float>(2U), false, 3, -45);
+    DOES_CONVERT_TO(double, 123.456789, false, 123456789, -6);
+    DOES_CONVERT_TO(double, 0.000000123456789, false, 123456789, -15);
+    DOES_CONVERT_TO(double, 9876543210123456.0, false, 9876543210123456, 0);
+    DOES_CONVERT_TO(double, 1.23e-7, false, 123, -9);
+    DOES_CONVERT_TO(double, 58.0, false, 58, 0);
+}
+
+TEST_CASE(decimal_conversion_without_removing_trailing_zeroes)
+{
+    EXPECT_EQ(AK::convert_to_decimal_exponential_form<AK::RemoveTrailingZeroes::No>(1.0),
+        (AK::DecimalExponentialForm { false, 10'000'000'000'000'000, -16 }));
+    EXPECT_EQ(AK::convert_to_decimal_exponential_form<AK::RemoveTrailingZeroes::No>(1.0f),
+        (AK::DecimalExponentialForm { false, 100'000'000, -8 }));
+
+    auto verify = [](auto value) {
+        auto normalized = AK::convert_to_decimal_exponential_form(value);
+        auto unnormalized = AK::convert_to_decimal_exponential_form<AK::RemoveTrailingZeroes::No>(value);
+
+        auto count_digits = [](u64 fraction) {
+            int count = 0;
+            do {
+                ++count;
+                fraction /= 10;
+            } while (fraction != 0);
+            return count;
+        };
+        // Precision formatting only needs this exponent, which must not depend on normalization.
+        EXPECT_EQ(unnormalized.exponent + count_digits(unnormalized.fraction), normalized.exponent + count_digits(normalized.fraction));
+
+        while (unnormalized.fraction != 0 && unnormalized.fraction % 10 == 0) {
+            unnormalized.fraction /= 10;
+            ++unnormalized.exponent;
+        }
+        EXPECT_EQ(unnormalized, normalized);
+    };
+
+    for (auto value : to_array<double>({ 0.0, -0.0, 1.0, -1.0, 0.1, 0.3, 58.0, 1e23, 1e-300, 1e300, 0x1p-1022, bit_cast<double>(1ULL), NumericLimits<double>::max() }))
+        verify(value);
+    for (auto value : to_array<float>({ 0.0f, -0.0f, 1.0f, -1.0f, 0.1f, 0.3f, 58.0f, 1e-30f, 1e30f, 0x1p-126f, bit_cast<float>(1U), NumericLimits<float>::max() }))
+        verify(value);
 }

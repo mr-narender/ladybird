@@ -9,6 +9,7 @@ use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::node_painting;
 use crate::painting::paint_order;
+use crate::painting::paint_read::GeometryRead;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -44,25 +45,15 @@ struct Verifier<'a> {
     arena: &'a LayoutNodeArena,
     expected_entries_by_root: HashMap<NodeSlotId, ExpectedEntries>,
     expected_roots: Vec<NodeSlotId>,
-    previous_label: Option<u64>,
     report: Report,
 }
 
 impl Verifier<'_> {
     fn visit(&mut self, slot: NodeSlotId, enclosing: NodeSlotId) {
         let fresh = StackingContextFacts::gather(self.arena, slot, enclosing);
-        let label = self.arena.node_pre_order_label(slot);
-        if self.previous_label.is_some_and(|previous| label <= previous) {
-            self.report.note(format_args!(
-                "pre-order label of {slot:?} is not greater than the previous label"
-            ));
-        }
-        self.previous_label = Some(label);
-
         match self.arena.paintable_visual_context_record(slot) {
             Some(record) => {
                 let stored = record.stacking_context;
-                drop(record);
                 let mut fresh_with_registered_contribution = fresh;
                 fresh_with_registered_contribution.contribution_is_registered = true;
                 if stored != fresh_with_registered_contribution {
@@ -123,19 +114,34 @@ impl Verifier<'_> {
 
         let paintable_rows = self.arena.paintable_rows();
         if node_painting::has_lines(&paintable_rows, slot)
-            && !self.arena.paintable_side_data(slot).inline_box_pieces().is_empty()
+            && !self.arena.committed_side_data(slot).inline_box_pieces().is_empty()
         {
             for (owner, recomputed_filter) in
                 crate::painting::fragment_ownership::compute_fragment_ownership_for_block(&paintable_rows, slot)
             {
-                let stored_filter = self.arena.paintable_side_data(owner).fragment_ownership.clone();
-                if stored_filter.as_ref() != Some(&recomputed_filter) {
+                let stored_filter = self.arena.committed_side_data(owner).fragment_ownership.clone();
+                if stored_filter.as_deref() != Some(&recomputed_filter) {
                     self.report.note(format_args!(
                         "fragment ownership of {owner:?} under line root {slot:?} diverges from a fresh computation"
                     ));
                 }
             }
         }
+    }
+
+    fn compare_pre_order_labels(&mut self, viewport: NodeSlotId) {
+        let arena = self.arena;
+        let report = &mut self.report;
+        let mut previous_label: Option<u64> = None;
+        arena.for_each_node_in_layout_subtree_in_pre_order(viewport, |slot| {
+            let label = arena.node_pre_order_label(slot);
+            if previous_label.is_some_and(|previous| label <= previous) {
+                report.note(format_args!(
+                    "pre-order label of {slot:?} is not greater than the previous label"
+                ));
+            }
+            previous_label = Some(label);
+        });
     }
 
     fn compare_tables(&mut self) {
@@ -146,7 +152,14 @@ impl Verifier<'_> {
                 .expect("every expected root has an expected entry set");
             expected
                 .child_contexts_with_nonzero_z_index
-                .sort_by_key(|(z_index, _)| *z_index);
+                .sort_by(|(left_z_index, left), (right_z_index, right)| {
+                    left_z_index
+                        .cmp(right_z_index)
+                        .then_with(|| self.arena.compare_order_modified_document_order(*left, *right))
+                });
+            expected
+                .stack_level_zero_boxes
+                .sort_by(|&left, &right| self.arena.compare_order_modified_document_order(left, right));
             let Some(table) = self.arena.stacking_context_entries(root) else {
                 self.report
                     .note(format_args!("establishing box {root:?} has no entries table"));
@@ -186,13 +199,9 @@ impl Verifier<'_> {
                     .note(format_args!("entries table of {root:?} is still flagged for a resort"));
             }
         }
-        let stored_table_count = self
-            .arena
-            .paintable_rows
-            .stacking_context_entries
-            .borrow()
-            .iter()
-            .filter(|table| table.is_some())
+        let tables = &self.arena.paintable_rows.stacking_context_entries;
+        let stored_table_count = (0..self.arena.paintable_row_count())
+            .filter(|index| tables.get(*index).is_some_and(Option::is_some))
             .count();
         let expected_table_count = self
             .expected_entries_by_root
@@ -215,12 +224,12 @@ pub(crate) fn verification_report(arena: &LayoutNodeArena, viewport: NodeSlotId)
         arena,
         expected_entries_by_root: HashMap::new(),
         expected_roots: Vec::new(),
-        previous_label: None,
         report: Report {
             text: String::new(),
             line_count: 0,
         },
     };
+    verifier.compare_pre_order_labels(viewport);
     verifier.visit(viewport, NodeSlotId::INVALID);
     verifier.compare_tables();
     verifier.report.text

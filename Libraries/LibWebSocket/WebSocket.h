@@ -8,6 +8,7 @@
 #pragma once
 
 #include <AK/Span.h>
+#include <AK/Time.h>
 #include <LibCore/EventReceiver.h>
 #include <LibCore/Forward.h>
 #include <LibWebSocket/ConnectionInfo.h>
@@ -42,8 +43,25 @@ class WebSocket final : public Core::EventReceiver {
     C_OBJECT(WebSocket)
 public:
     static NonnullRefPtr<WebSocket> create(ConnectionInfo, NonnullRefPtr<WebSocketImpl>);
-    virtual ~WebSocket() override = default;
+    struct ServerOptions {
+        size_t maximum_message_size { 256 * MiB };
+        size_t maximum_handshake_size { 16 * KiB };
+        AK::Duration handshake_timeout { AK::Duration::from_seconds(10) };
+    };
 
+    // The transport is already connected. start() reads the client's HTTP upgrade request.
+    static NonnullRefPtr<WebSocket> create_server(NonnullRefPtr<WebSocketImpl>, ServerOptions);
+    static ErrorOr<NonnullRefPtr<WebSocket>> accept(NonnullOwnPtr<Core::TCPSocket>, ServerOptions);
+    virtual ~WebSocket() override;
+
+    struct ClientHandshake {
+        ByteString resource_name;
+        NonnullRefPtr<HTTP::HeaderList> headers;
+    };
+    // A missing rejection status accepts the request. Protocol validation precedes this application policy callback.
+    Function<Optional<ByteString>(ClientHandshake const&)> on_client_handshake;
+
+    // The endpoint URL of a client connection. Servers receive the resource name in on_client_handshake.
     URL::URL const& url() const { return m_connection.url(); }
 
     ReadyState ready_state();
@@ -74,7 +92,9 @@ public:
     Function<void(Error)> on_error;
 
 private:
-    WebSocket(ConnectionInfo, NonnullRefPtr<WebSocketImpl>);
+    enum class Role { Client,
+        Server };
+    WebSocket(ConnectionInfo, NonnullRefPtr<WebSocketImpl>, Role = Role::Client, Optional<ServerOptions> = {});
 
     // As defined in section 5.2
     enum class OpCode : u8 {
@@ -88,8 +108,8 @@ private:
 
     void drain_read();
 
-    void send_client_handshake();
-    void read_server_handshake();
+    void read_client_handshake();
+    void reject_client_handshake(StringView status);
 
     ErrorOr<void> read_frame();
     void send_frame(OpCode, ReadonlyBytes, bool is_final);
@@ -104,8 +124,7 @@ private:
     enum class InternalState {
         NotStarted,
         EstablishingProtocolConnection,
-        SendingClientHandshake,
-        WaitingForServerHandshake,
+        WaitingForClientHandshake,
         Open,
         Closing,
         Closed,
@@ -120,24 +139,23 @@ private:
 
     ByteString m_subprotocol_in_use { ByteString::empty() };
 
-    ByteString m_websocket_key;
-    bool m_has_read_server_handshake_first_line { false };
-    bool m_has_read_server_handshake_upgrade { false };
-    bool m_has_read_server_handshake_connection { false };
-    bool m_has_read_server_handshake_accept { false };
-
     bool m_discard_connection_requested { false };
 
     u16 m_last_close_code { to_underlying(CloseStatusCode::NoStatusReceived) };
     ByteString m_last_close_message;
 
+    Role m_role { Role::Client };
+    Optional<ServerOptions> m_server_options;
     ConnectionInfo m_connection;
     RefPtr<WebSocketImpl> m_impl;
     RefPtr<Core::Timer> m_closing_handshake_timer;
+    RefPtr<Core::Timer> m_opening_handshake_timer;
 
     Vector<u8> m_buffered_data;
+    size_t m_buffered_data_offset { 0 };
     ByteBuffer m_fragmented_data_buffer;
-    WebSocket::OpCode m_initial_fragment_opcode;
+    WebSocket::OpCode m_initial_fragment_opcode { OpCode::Continuation };
+    bool m_has_fragmented_message { false };
 };
 
 }

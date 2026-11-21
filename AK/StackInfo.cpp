@@ -28,6 +28,19 @@ namespace AK {
 
 StackInfo::StackInfo()
 {
+    // Stack bounds never change; glibc queries them for the main thread by parsing /proc/self/maps.
+    struct CachedBounds {
+        FlatPtr base { 0 };
+        size_t size { 0 };
+    };
+    static thread_local CachedBounds s_cached_bounds;
+    if (s_cached_bounds.size != 0) {
+        m_base = s_cached_bounds.base;
+        m_size = s_cached_bounds.size;
+        m_top = m_base + m_size;
+        return;
+    }
+
 #ifdef AK_OS_SERENITY
     if (get_stack_bounds(&m_base, &m_size) < 0) {
         perror("get_stack_bounds");
@@ -92,6 +105,11 @@ StackInfo::StackInfo()
     ULONG_PTR high_limit = 0;
     GetCurrentThreadStackLimits(&low_limit, &high_limit);
 
+    // The stack overflows before reaching its low limit by the size reserved for handling that overflow.
+    ULONG stack_guarantee = 0;
+    SetThreadStackGuarantee(&stack_guarantee);
+    low_limit += stack_guarantee;
+
     m_base = static_cast<FlatPtr>(low_limit);
     m_size = static_cast<size_t>(high_limit - low_limit);
 #else
@@ -116,6 +134,8 @@ StackInfo::StackInfo()
         m_base = m_top - m_size;
     }
 #endif
+
+    s_cached_bounds = { m_base, m_size };
 }
 
 }

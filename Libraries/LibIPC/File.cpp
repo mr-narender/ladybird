@@ -43,6 +43,8 @@ File::File(File&& other)
 File& File::operator=(File&& other)
 {
     if (this != &other) {
+        if (m_fd != -1)
+            (void)Core::System::close(m_fd);
         m_fd = exchange(other.m_fd, -1);
     }
     return *this;
@@ -52,13 +54,6 @@ File::~File()
 {
     if (m_fd != -1)
         (void)Core::System::close(m_fd);
-}
-
-// FIXME: IPC::Files transferred over the wire always set O_CLOEXEC during decoding. Perhaps we should add an option to
-//        allow the receiver to decide whether to make it O_CLOEXEC or not. Or an attribute in the .ipc file?
-ErrorOr<void> File::clear_close_on_exec()
-{
-    return Core::System::set_close_on_exec(m_fd, false);
 }
 
 template<>

@@ -11,17 +11,18 @@
 #include <LibGC/Cell.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Rect.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Length.h>
 #include <LibWeb/CSS/Percentage.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Painting/BoxViews.h>
 
 namespace Web::CSS {
 
@@ -54,6 +55,20 @@ static bool query_container_is_eligible_for_axis(DOM::Element const& container, 
     auto style = container.computed_style();
     if (!style)
         return false;
+    if (box_kind_for_layout(container) == ElementBoxKind::NoBox)
+        return false;
+
+    auto display = style->display();
+    if (display.is_none() || display.is_contents() || display.is_table_inside() || (display.is_internal() && !display.is_table_caption()))
+        return false;
+    if (display.is_inline_outside() && display.inside() == DisplayInside::Ruby)
+        return false;
+    if (display.is_inline_outside() && display.is_flow_inside()) {
+        Layout::ForcedReadScope read { container.document() };
+        auto const* node = container.unsafe_layout_node(read);
+        if (!node || !node->is_atomic_inline())
+            return false;
+    }
 
     auto container_type = style->container_type();
     auto container_inline_axis_is_horizontal = inline_axis_is_horizontal(style->writing_mode());
@@ -69,9 +84,12 @@ static bool query_container_is_eligible_for_axis(DOM::Element const& container, 
     return container_type.is_size_container || container_type.is_inline_size_container;
 }
 
-static DOM::Element const* nearest_query_container_for_axis(DOM::Element const& subject, ContainerRelativeAxis axis)
+static DOM::Element const* nearest_query_container_for_axis(DOM::Element const& subject, ContainerRelativeAxis axis, bool subject_is_pseudo_element)
 {
-    for (auto const* container = subject.flat_tree_parent_element(); container; container = container->flat_tree_parent_element()) {
+    // https://drafts.csswg.org/css-conditional-5/#container-queries
+    // For other pseudo-elements, query containers can be established by inclusive flat tree ancestors
+    // of their originating element.
+    for (auto const* container = subject_is_pseudo_element ? &subject : subject.flat_tree_parent_element(); container; container = container->flat_tree_parent_element()) {
         if (query_container_is_eligible_for_axis(*container, axis))
             return container;
     }
@@ -91,7 +109,7 @@ static GC::Ptr<DOM::Element const> get_or_compute_query_container_for_axis(Lengt
     if (!cached_query_container.has_value()) {
         cached_query_container = nullptr;
         if (context.subject_element)
-            cached_query_container = nearest_query_container_for_axis(*context.subject_element, axis);
+            cached_query_container = nearest_query_container_for_axis(*context.subject_element, axis, context.subject_is_pseudo_element);
     }
     return cached_query_container.value();
 }
@@ -112,24 +130,14 @@ Length Length::percentage_of(Percentage const& percentage) const
     return Length { percentage.as_fraction() * raw_value(), m_unit };
 }
 
-CSSPixels Length::font_relative_length_to_px(Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics) const
-{
-    return CSSPixels::nearest_value_for(font_relative_length_to_px_without_rounding(font_metrics, root_font_metrics));
-}
-
 double Length::font_relative_length_to_px_without_rounding(Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics) const
 {
     return ratio_between_font_relative_unit_and_px(m_unit, font_metrics, root_font_metrics) * m_value;
 }
 
-CSSPixels Length::viewport_relative_length_to_px(CSSPixelRect const& viewport_rect) const
+double Length::viewport_relative_length_to_px_without_rounding(CSSPixelRect const& viewport_rect, bool inline_axis_is_horizontal) const
 {
-    return CSSPixels::nearest_value_for(viewport_relative_length_to_px_without_rounding(viewport_rect));
-}
-
-double Length::viewport_relative_length_to_px_without_rounding(CSSPixelRect const& viewport_rect) const
-{
-    return ratio_between_viewport_relative_unit_and_px(m_unit, viewport_rect) * m_value;
+    return ratio_between_viewport_relative_unit_and_px(m_unit, viewport_rect, inline_axis_is_horizontal) * m_value;
 }
 
 double Length::container_relative_length_to_px_without_rounding(ResolutionContext const& context) const
@@ -147,29 +155,38 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
         auto& subject = *context.subject_element;
         const_cast<DOM::Element&>(subject).set_style_depends_on_size_container_query();
 
-        auto query_container = get_or_compute_query_container_for_axis(context, physical_axis);
-        // A container unit asks about the container's box exactly as a size query does, so the
-        // container has to know that a resize of it is a change for something under it.
-        if (query_container)
+        // The container's box is read from the committed layout, without making its layout node.
+        auto const* arena = subject.document().layout_node_arena_if_created();
+        GC::Ptr<DOM::Element const> boxless_container;
+        Optional<double> container_length;
+        for (auto query_container = get_or_compute_query_container_for_axis(context, physical_axis); query_container;
+            query_container = nearest_query_container_for_axis(*query_container, physical_axis, false)) {
+            // A container unit asks about the container's box exactly as a size query does, so the
+            // container has to know that a resize of it is a change for something under it.
             const_cast<DOM::Element&>(*query_container).set_is_size_query_container();
-        if (!query_container) {
-            context.record_viewport_relative_length_resolution();
-            auto viewport_length = physical_axis == ContainerRelativeAxis::Width ? context.viewport_rect.width() : context.viewport_rect.height();
-            return viewport_length.to_double();
+            Layout::ForcedReadScope read { subject.document() };
+            CSSPixelSize container_size;
+            if (arena && Layout::RustFFI::layout_row_bound_committed_content_size(arena->host(), read, query_container->style_node_id().value(), &container_size)) {
+                container_length = (physical_axis == ContainerRelativeAxis::Width ? container_size.width() : container_size.height()).to_double();
+                break;
+            }
+            // A container without a box, as one under an element that is not rendered has, is not eligible: Its size
+            // queries are unknown, so the unit resolves against the next eligible container out.
+            boxless_container = query_container;
         }
 
-        auto const* layout_node = query_container->unsafe_layout_node();
-        if (!layout_node || !Painting::has_committed_box(*layout_node)) {
-            // A running partial relayout pass reports layout as up to date, but a container
-            // with no paintable yet still needs the post-layout evaluation, which routes the
-            // follow-up pass to the full layout path that resolves the container's size.
-            if (!subject.document().layout_is_up_to_date() || subject.document().is_running_update_layout())
-                const_cast<DOM::Document&>(subject.document()).set_needs_container_query_evaluation_after_layout(*query_container);
-            return 0.0;
-        }
+        // A running partial relayout pass reports layout as up to date, but a container with no
+        // paintable yet still needs the post-layout evaluation, which routes the follow-up pass to
+        // the full layout path that resolves the container's size. A container below the outermost
+        // one without a box can only get one after it does.
+        if (boxless_container && (!subject.document().layout_is_up_to_date() || subject.document().is_running_update_layout()))
+            const_cast<DOM::Document&>(subject.document()).set_needs_container_query_evaluation_after_layout(*boxless_container);
+        if (container_length.has_value())
+            return *container_length;
 
-        auto container_length = physical_axis == ContainerRelativeAxis::Width ? Painting::content_width(*layout_node) : Painting::content_height(*layout_node);
-        return container_length.to_double();
+        context.record_viewport_relative_length_resolution();
+        auto viewport_length = physical_axis == ContainerRelativeAxis::Width ? context.viewport_rect.width() : context.viewport_rect.height();
+        return viewport_length.to_double();
     };
 
     auto resolve_physical_axis_length = [&](ContainerRelativeAxis physical_axis) {
@@ -224,6 +241,7 @@ Length::ResolutionContext Length::ResolutionContext::for_element(DOM::AbstractEl
         .font_metrics_depend_on_viewport_metrics = computed_values.font_metrics_depend_on_viewport_metrics(),
         .root_font_metrics_depend_on_viewport_metrics = root_computed_values->font_metrics_depend_on_viewport_metrics(),
         .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(computed_values.writing_mode()),
+        .subject_is_pseudo_element = element.pseudo_element().has_value(),
         .subject_element = &element.element(),
     };
 }
@@ -232,7 +250,10 @@ Length::ResolutionContext Length::ResolutionContext::for_document(DOM::Document 
 {
     auto const& initial_font = document.font_computer().initial_font();
     Gfx::FontPixelMetrics const& initial_font_metrics = initial_font.pixel_metrics();
-    Length::FontMetrics font_metrics { CSSPixels { initial_font.pixel_size() }, initial_font_metrics, InitialValues::line_height() };
+    // https://drafts.csswg.org/css-values-4/#font-relative-lengths
+    // When used outside the context of an element (such as in media queries), the font-relative lengths units refer
+    // to the metrics corresponding to the initial values of the font and line-height properties.
+    Length::FontMetrics font_metrics { CSSPixels { initial_font.pixel_size() }, initial_font_metrics, normal_line_height(initial_font_metrics) };
     CSSPixelRect viewport_rect;
 
     if (document.navigable())
@@ -248,6 +269,7 @@ Length::ResolutionContext Length::ResolutionContext::for_document(DOM::Document 
 
 Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::NodeWithStyle const& node)
 {
+    auto const& read = node.held_read();
     Layout::NodeWithStyle const* root_layout_node;
     DOM::Element const* subject_element = nullptr;
 
@@ -257,8 +279,8 @@ Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Nod
         auto const* root_element = node.document().document_element();
         VERIFY(root_element);
         // NB: Called during CSS length resolution, which may happen during style recalculation.
-        VERIFY(root_element->unsafe_layout_node());
-        root_layout_node = root_element->unsafe_layout_node();
+        VERIFY(root_element->unsafe_layout_node(read));
+        root_layout_node = root_element->unsafe_layout_node(read);
     }
 
     if (auto const* dom_node = node.dom_node(); dom_node && is<DOM::Element>(*dom_node))
@@ -269,6 +291,7 @@ Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Nod
         .font_metrics = { node.font_size(), node.first_available_font().pixel_metrics(), node.line_height() },
         .root_font_metrics = { root_layout_node->font_size(), root_layout_node->first_available_font().pixel_metrics(), node.line_height() },
         .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(node.writing_mode()),
+        .subject_is_pseudo_element = node.is_generated_for_pseudo_element(),
         .subject_element = subject_element,
     };
 }
@@ -276,13 +299,6 @@ Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Nod
 CSSPixels Length::to_px(ResolutionContext const& context) const
 {
     return CSSPixels::nearest_value_for(to_px_without_rounding(context));
-}
-
-CSSPixels Length::to_px_slow_case(Layout::NodeWithStyle const& layout_node) const
-{
-    if (!layout_node.document().browsing_context())
-        return 0;
-    return to_px(ResolutionContext::for_layout_node(layout_node));
 }
 
 void Length::serialize(StringBuilder& builder, SerializationMode serialization_mode) const
@@ -321,21 +337,6 @@ void Length::serialize(Utf16StringBuilder& builder, SerializationMode serializat
     builder.append(unit_name());
 }
 
-String Length::to_string(SerializationMode serialization_mode) const
-{
-    StringBuilder builder;
-    serialize(builder, serialization_mode);
-    return builder.to_string_without_validation();
-}
-
-Optional<Length> Length::absolutize(ResolutionContext const& context) const
-{
-    if (is_px())
-        return {};
-
-    return CSS::Length::make_px(to_px_without_rounding(context));
-}
-
 Length Length::from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<Length> percentage_basis)
 {
     if (style_value->is_length())
@@ -358,13 +359,6 @@ Length Length::from_style_value(NonnullRefPtr<StyleValue const> const& style_val
     }
 
     VERIFY_NOT_REACHED();
-}
-
-LengthOrAuto LengthOrAuto::from_style_value(NonnullRefPtr<StyleValue const> const& style_value, Optional<Length> percentage_basis)
-{
-    if (style_value->has_auto())
-        return make_auto();
-    return LengthOrAuto { Length::from_style_value(style_value, percentage_basis) };
 }
 
 double ratio_between_font_relative_unit_and_px(LengthUnit font_relative_unit, Length::FontMetrics const& font_metrics, Length::FontMetrics const& root_font_metrics)
@@ -403,7 +397,7 @@ double ratio_between_font_relative_unit_and_px(LengthUnit font_relative_unit, Le
     VERIFY_NOT_REACHED();
 }
 
-double ratio_between_viewport_relative_unit_and_px(LengthUnit viewport_relative_unit, CSSPixelRect const& viewport_rect)
+double ratio_between_viewport_relative_unit_and_px(LengthUnit viewport_relative_unit, CSSPixelRect const& viewport_rect, bool inline_axis_is_horizontal)
 {
     switch (viewport_relative_unit) {
     case LengthUnit::Vw:
@@ -420,14 +414,12 @@ double ratio_between_viewport_relative_unit_and_px(LengthUnit viewport_relative_
     case LengthUnit::Svi:
     case LengthUnit::Lvi:
     case LengthUnit::Dvi:
-        // FIXME: Select the width or height based on which is the inline axis.
-        return viewport_rect.width().to_double() / 100;
+        return (inline_axis_is_horizontal ? viewport_rect.width() : viewport_rect.height()).to_double() / 100;
     case LengthUnit::Vb:
     case LengthUnit::Svb:
     case LengthUnit::Lvb:
     case LengthUnit::Dvb:
-        // FIXME: Select the width or height based on which is the block axis.
-        return viewport_rect.height().to_double() / 100;
+        return (inline_axis_is_horizontal ? viewport_rect.height() : viewport_rect.width()).to_double() / 100;
     case LengthUnit::Vmin:
     case LengthUnit::Svmin:
     case LengthUnit::Lvmin:

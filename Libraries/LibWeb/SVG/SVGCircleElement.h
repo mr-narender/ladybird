@@ -17,8 +17,6 @@ class SVGCircleElement final : public SVGGeometryElement {
 public:
     virtual ~SVGCircleElement() override = default;
 
-    virtual Gfx::Path get_path(CSSPixelSize viewport_size, CSS::ComputedValues const&) override;
-
     // AD-HOC: The spec states that the cx, cy and r IDL attributes reflect the respective computed values and their
     //         corresponding presentation attributes but other browsers reflect the attribute values instead - see
     //         https://github.com/w3c/svgwg/issues/1153
@@ -33,7 +31,16 @@ public:
     REFLECT_ANIMATED_LENGTH_ATTRIBUTE(r, Unspecified, SVGLengthValue::number(0));
 
 private:
+    virtual bool is_svg_circle_element() const final { return true; }
+
     SVGCircleElement(DOM::Document&, DOM::QualifiedName);
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGCircleElement>() const { return is_svg_circle_element(); }
 
 }

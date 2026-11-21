@@ -38,9 +38,10 @@ public:
 
     virtual DecoderErrorOr<AK::Duration> duration_of_track(Track const&) override;
     virtual DecoderErrorOr<AK::Duration> total_duration() override;
+    virtual AK::Duration earliest_possible_position() const override { return m_earliest_possible_position; }
 
     virtual DemuxerScanState const& scan_state() const LIFETIME_BOUND override;
-    virtual void set_scan_state_change_handler(Function<void()>) override;
+    virtual void set_scan_state_change_handler(ScanStateChangeHandler) override;
 
     virtual DecoderErrorOr<CodedFrame> get_next_sample_for_track(Track const&) override;
 
@@ -52,7 +53,6 @@ private:
     struct BufferedScanPayload {
         Reader reader;
         NonnullRefPtr<MediaStreamCursor> scan_cursor;
-        Vector<Track> tracks;
     };
 
     void start_buffered_scan_thread(Reader&& scan_reader);
@@ -62,6 +62,7 @@ private:
         Optional<Block> block;
         SampleIterator::Frames frames;
         size_t frame_index { 0 };
+        Optional<AK::Duration> last_keyframe_timestamp;
         bool needs_codec_configuration { true };
 
         TrackStatus(SampleIterator&& iterator)
@@ -74,6 +75,7 @@ private:
 
     NonnullRefPtr<MediaStream> m_stream;
     Reader m_reader;
+    AK::Duration m_earliest_possible_position;
     RefPtr<DemuxerScanThread<BufferedScanPayload>> m_buffered_scan_thread;
 
     mutable Mutex m_track_statuses_mutex;

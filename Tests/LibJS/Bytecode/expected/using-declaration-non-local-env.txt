@@ -1,49 +1,74 @@
-$84f4cb35 using-declaration-non-local-env.js:1:1
-  Registers: 9
-  Blocks:    3
+$52a2ae2b using-declaration-non-local-env.js:1:1
+  Registers: 7
+  Blocks:    4
   Locals:    e~0
   Constants:
     [0] = Undefined
+    [1] = <Empty>
 
 block0:
   [   0] Enter
-  [   8] GetLexicalEnvironment dst:reg4
-  [  10] Jump target:block2
+  [   1] Mov dst:reg5, src:Undefined
+  [   4] Mov dst:reg5, src:Undefined
 
 block1:
-  [  18] Catch dst:reg5
-  [  20] SetLexicalEnvironment environment:reg4
-  [  28] Mov3 c0_dst:e~0, c0_src:reg5, c1_dst:reg6, c1_src:Undefined, c2_dst:reg7, c2_src:reg6
-  [  48] End value:reg6
+  [   7] NewFunction dst:reg6, shared_function_data_index:0
+  [   e] Call call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined
+  [  15] Jump target:block3
 
 block2:
-  [  50] MovSrcUndefined dst:reg5
-  [  58] NewFunction dst:reg8, shared_function_data_index:0
-  [  70] Call dst:reg6, callee:reg8, this_value:Undefined
-  [  90] Mov2 c0_dst:reg5, c0_src:reg6, c1_dst:reg6, c1_src:reg5
-  [  a8] End value:reg6
+  [  1a] Catch value_feedback:0, dst:reg6
+  [  1e] Mov dst:reg5, src:Undefined
+  [  21] Mov dst:e~0, src:<Empty>
+  [  24] Mov dst:e~0, src:reg6
+  [  27] Jump target:block3
+
+block3:
+  [  2c] End value:reg5
 
 Exception handlers:
-  [  50 ..   b0] => handler block1
+  [   7 ..   1a] => handler block2
 
 
-$dd396d91 using-declaration-non-local-env.js:1:21
-  Registers: 8
-  Blocks:    2
+$1cfceb24 using-declaration-non-local-env.js:1:19
+  Registers: 10
+  Blocks:    6
   Constants:
     [0] = Undefined
+    [1] = Int32(0)
+    [2] = Int32(1)
 
 block0:
   [   0] Enter
-  [   8] GetLexicalEnvironment dst:reg4
-  [  10] CreateLexicalEnvironment dst:reg5, parent:reg4, capacity:1, is_catch_environment:false
-  [  28] CreateImmutableBinding environment:reg5, `x`, strict_binding:true
-  [  38] NewTypeError dst:reg6, TODO: UsingDeclaration
-  [  48] SetLexicalEnvironment environment:reg4
-  [  50] Throw src:reg6
+  [   1] GetLexicalEnvironment dst:reg4
+  [   3] CreateLexicalEnvironment dst:reg5, parent:reg4, capacity:1, is_catch_environment:false
+  [   f] CreateVariable `x`, is_immutable:true, is_global:false, is_strict:true
+  [  16] NewDisposableResourceStack dst:reg6
 
 block1:
-  [  58] NewFunction dst:reg7, shared_function_data_index:0
-  [  70] Call dst:reg6, callee:reg7, this_value:Undefined
-  [  90] SetLexicalEnvironment environment:reg4
-  [  98] End value:Undefined
+  [  18] NewObject dst:reg9
+  [  1c] AddDisposableResource stack:reg6, value:reg9, hint:0
+  [  23] InitializeLexicalBinding `x`, src:reg9
+  [  2a] NewFunction dst:reg9, shared_function_data_index:0
+  [  31] Call call_feedback:0, dst:reg9, callee:reg9, this_value:Undefined
+  [  38] Mov dst:reg7, src:Int32(0)
+  [  3b] Jump target:block3
+
+block2:
+  [  40] Catch value_feedback:0, dst:reg8
+  [  44] SetLexicalEnvironment environment:reg5
+  [  46] Mov dst:reg7, src:Int32(1)
+
+block3:
+  [  49] DisposeResources stack:reg6, completion_type:reg7, completion_value:reg8
+  [  4d] JumpStrictlyEqualsRhsInt32 arith_feedback:0, lhs:reg7, rhs:0, true_target:block5, false_target:block4
+
+block4:
+  [  5d] Throw src:reg8
+
+block5:
+  [  5f] SetLexicalEnvironment environment:reg4
+  [  61] End value:Undefined
+
+Exception handlers:
+  [  18 ..   40] => handler block2

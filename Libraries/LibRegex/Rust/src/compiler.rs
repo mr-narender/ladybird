@@ -14,6 +14,8 @@
 //! - <https://tc39.es/ecma262/#sec-compilepattern>
 use crate::ast::*;
 use crate::bytecode::*;
+use crate::parser::Error;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 /// Resolve a Unicode property name/value pair to an ICU enum ID.
@@ -31,9 +33,12 @@ pub fn resolve_property(name: &str, value: Option<&str>) -> Option<ResolvedPrope
 ///
 /// Spec entry point: `CompilePattern`.
 /// <https://tc39.es/ecma262/#sec-compilepattern>
-pub fn compile(pattern: &Pattern) -> Program {
+pub fn compile(pattern: &Pattern) -> Result<Program, Error> {
     let mut compiler = Compiler::new(pattern);
     compiler.compile_pattern(pattern);
+    if compiler.ran_out_of_stack.get() {
+        return Err(Error::TooDeeplyNested);
+    }
     compiler.program.named_groups = pattern
         .named_groups
         .iter()
@@ -42,7 +47,77 @@ pub fn compile(pattern: &Pattern) -> Program {
             index: ng.index,
         })
         .collect();
-    compiler.program
+    Ok(compiler.program)
+}
+
+const fn char_range(start: u32, end: u32) -> CharRange {
+    CharRange { start, end }
+}
+
+/// `\d`: <https://tc39.es/ecma262/#sec-compiletocharset>
+const DIGIT_RANGES: &[CharRange] = &[char_range(0x30, 0x39)];
+const NON_DIGIT_RANGES: &[CharRange] = &[char_range(0, 0x2F), char_range(0x3A, 0x10FFFF)];
+
+/// `\w` without the u and v flags is the ASCII WordCharacters: <https://tc39.es/ecma262/#sec-wordcharacters>
+const WORD_RANGES: &[CharRange] = &[
+    char_range(0x30, 0x39),
+    char_range(0x41, 0x5A),
+    char_range(0x5F, 0x5F),
+    char_range(0x61, 0x7A),
+];
+const NON_WORD_RANGES: &[CharRange] = &[
+    char_range(0, 0x2F),
+    char_range(0x3A, 0x40),
+    char_range(0x5B, 0x5E),
+    char_range(0x60, 0x60),
+    char_range(0x7B, 0x10FFFF),
+];
+
+/// `\s` is WhiteSpace and LineTerminator: <https://tc39.es/ecma262/#sec-white-space>,
+/// <https://tc39.es/ecma262/#sec-line-terminators>
+const WHITESPACE_RANGES: &[CharRange] = &[
+    char_range(0x09, 0x0D),
+    char_range(0x20, 0x20),
+    char_range(0xA0, 0xA0),
+    char_range(0x1680, 0x1680),
+    char_range(0x2000, 0x200A),
+    char_range(0x2028, 0x2029),
+    char_range(0x202F, 0x202F),
+    char_range(0x205F, 0x205F),
+    char_range(0x3000, 0x3000),
+    char_range(0xFEFF, 0xFEFF),
+];
+const NON_WHITESPACE_RANGES: &[CharRange] = &[
+    char_range(0, 0x08),
+    char_range(0x0E, 0x1F),
+    char_range(0x21, 0x9F),
+    char_range(0xA1, 0x167F),
+    char_range(0x1681, 0x1FFF),
+    char_range(0x200B, 0x2027),
+    char_range(0x202A, 0x202E),
+    char_range(0x2030, 0x205E),
+    char_range(0x2060, 0x2FFF),
+    char_range(0x3001, 0xFEFE),
+    char_range(0xFF00, 0x10FFFF),
+];
+
+/// Sorts `ranges` and merges the ones that overlap or touch, which the binary search of the VM relies on.
+fn normalize_char_ranges(ranges: &mut Vec<CharRange>) {
+    ranges.sort_by_key(|range| range.start);
+    let mut merged_count = 0;
+    for index in 0..ranges.len() {
+        let range = ranges[index].clone();
+        if merged_count > 0 {
+            let last = &mut ranges[merged_count - 1];
+            if range.start <= last.end.saturating_add(1) {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        ranges[merged_count] = range;
+        merged_count += 1;
+    }
+    ranges.truncate(merged_count);
 }
 
 struct Compiler {
@@ -55,35 +130,44 @@ struct Compiler {
     next_internal_reg: u32,
     /// True when compiling a lookbehind body (terms are reversed).
     backward: bool,
+    /// Set when a pass stopped short of a nested group or class because the stack ran low, which fails the compile.
+    ran_out_of_stack: Cell<bool>,
 }
 
 impl Compiler {
-    fn append_ascii_char_range(char_ranges: &mut Vec<CharRange>, start: u8, end: u8) {
-        char_ranges.push(CharRange {
-            start: u32::from(start),
-            end: u32::from(end),
-        });
+    /// Whether a pass has to stop short of recursing into a nested group or class, which fails the compile.
+    fn is_out_of_stack(&self) -> bool {
+        if crate::stack::is_exhausted() {
+            self.ran_out_of_stack.set(true);
+        }
+        self.ran_out_of_stack.get()
     }
 
-    fn append_builtin_class_ranges_for_legacy_positive_class(
-        char_ranges: &mut Vec<CharRange>,
-        builtin_class: BuiltinCharacterClass,
-    ) -> bool {
-        match builtin_class {
-            BuiltinCharacterClass::Digit => {
-                Self::append_ascii_char_range(char_ranges, b'0', b'9');
-                true
-            }
-            BuiltinCharacterClass::Word => {
-                // Legacy `\w` is ASCII-only: `[A-Za-z0-9_]`.
-                Self::append_ascii_char_range(char_ranges, b'0', b'9');
-                Self::append_ascii_char_range(char_ranges, b'A', b'Z');
-                Self::append_ascii_char_range(char_ranges, b'_', b'_');
-                Self::append_ascii_char_range(char_ranges, b'a', b'z');
-                true
-            }
-            _ => false,
+    /// The code point ranges of a builtin class inside a character class of a pattern without the u and v flags, if
+    /// the class can match it as plain ranges.
+    ///
+    /// Without ignore-case, every builtin is a fixed set of code points. With ignore-case, \d and \w are still exact in
+    /// a positive class, since Canonicalize never maps a code point outside them onto one inside them in non-unicode
+    /// mode. But matching a class with ranges then checks every code point that is not in them against the case
+    /// closure of each range, which would make the large ranges of \s, of the negated builtins, and of negated classes
+    /// slower than matching the builtins themselves.
+    fn legacy_builtin_class_ranges(&self, class: BuiltinCharacterClass, negated: bool) -> Option<&'static [CharRange]> {
+        if self.program.unicode || self.program.unicode_sets {
+            return None;
         }
+        if self.effective_ignore_case
+            && (negated || !matches!(class, BuiltinCharacterClass::Digit | BuiltinCharacterClass::Word))
+        {
+            return None;
+        }
+        Some(match class {
+            BuiltinCharacterClass::Digit => DIGIT_RANGES,
+            BuiltinCharacterClass::NonDigit => NON_DIGIT_RANGES,
+            BuiltinCharacterClass::Word => WORD_RANGES,
+            BuiltinCharacterClass::NonWord => NON_WORD_RANGES,
+            BuiltinCharacterClass::Whitespace => WHITESPACE_RANGES,
+            BuiltinCharacterClass::NonWhitespace => NON_WHITESPACE_RANGES,
+        })
     }
 
     fn new(pattern: &Pattern) -> Self {
@@ -106,6 +190,7 @@ impl Compiler {
             effective_dot_all: pattern.flags.dot_all,
             next_internal_reg: register_count,
             backward: false,
+            ran_out_of_stack: Cell::new(false),
         }
     }
 
@@ -223,6 +308,9 @@ impl Compiler {
     }
 
     fn class_set_expression_lengths(&self, expr: &ClassSetExpression) -> BTreeSet<usize> {
+        if self.is_out_of_stack() {
+            return BTreeSet::new();
+        }
         match expr {
             ClassSetExpression::Union(operands) => operands.iter().fold(BTreeSet::new(), |mut lengths, operand| {
                 lengths.extend(self.class_set_operand_lengths(operand));
@@ -349,29 +437,32 @@ impl Compiler {
     }
 
     /// Collect all capture group indices inside an atom (recursively).
-    fn collect_captures(atom: &Atom, out: &mut Vec<u32>) {
+    fn collect_captures(&self, atom: &Atom, out: &mut Vec<u32>) {
         match atom {
             Atom::Group(g) => {
                 out.push(g.index);
-                Self::collect_captures_in_disjunction(&g.body, out);
+                self.collect_captures_in_disjunction(&g.body, out);
             }
             Atom::NonCapturingGroup(g) => {
-                Self::collect_captures_in_disjunction(&g.body, out);
+                self.collect_captures_in_disjunction(&g.body, out);
             }
             Atom::ModifierGroup(mg) => {
-                Self::collect_captures_in_disjunction(&mg.body, out);
+                self.collect_captures_in_disjunction(&mg.body, out);
             }
             Atom::Lookaround(la) => {
-                Self::collect_captures_in_disjunction(&la.body, out);
+                self.collect_captures_in_disjunction(&la.body, out);
             }
             _ => {}
         }
     }
 
-    fn collect_captures_in_disjunction(disj: &Disjunction, out: &mut Vec<u32>) {
+    fn collect_captures_in_disjunction(&self, disj: &Disjunction, out: &mut Vec<u32>) {
+        if self.is_out_of_stack() {
+            return;
+        }
         for alt in &disj.alternatives {
             for term in &alt.terms {
-                Self::collect_captures(&term.atom, out);
+                self.collect_captures(&term.atom, out);
             }
         }
     }
@@ -381,7 +472,7 @@ impl Compiler {
     /// undefined at the start of each quantifier iteration.
     /// <https://tc39.es/ecma262/#sec-runtime-semantics-repeatmatcher-abstract-operation>
     fn emit_clear_captures(&mut self, atom: &Atom) {
-        for idx in Self::capture_registers(atom) {
+        for idx in self.capture_registers(atom) {
             self.emit(Instruction::ClearRegister(idx));
         }
     }
@@ -389,12 +480,12 @@ impl Compiler {
     /// Collect all capture register indices (start and end) for captures inside an atom.
     /// Returns empty for intrinsically zero-width atoms (lookarounds, assertions)
     /// since their captures should NOT be cleared on zero-width ProgressCheck.
-    fn capture_registers(atom: &Atom) -> Vec<u32> {
+    fn capture_registers(&self, atom: &Atom) -> Vec<u32> {
         if matches!(atom, Atom::Lookaround(_) | Atom::Assertion(_)) {
             return Vec::new();
         }
         let mut captures = Vec::new();
-        Self::collect_captures(atom, &mut captures);
+        self.collect_captures(atom, &mut captures);
         let mut regs = Vec::new();
         for idx in captures {
             regs.push(idx * 2);
@@ -404,6 +495,9 @@ impl Compiler {
     }
 
     fn disjunction_can_be_zero_width(&self, disjunction: &Disjunction) -> bool {
+        if self.is_out_of_stack() {
+            return true;
+        }
         disjunction
             .alternatives
             .iter()
@@ -450,6 +544,9 @@ impl Compiler {
     /// Lower `Disjunction` to a chain of split/jump choice points.
     /// <https://tc39.es/ecma262/#sec-compilesubpattern>
     fn compile_disjunction(&mut self, disj: &Disjunction) {
+        if self.is_out_of_stack() {
+            return;
+        }
         if let Some(term) = self.try_merge_optional_alternatives(disj) {
             self.compile_term(&term);
             return;
@@ -607,7 +704,7 @@ impl Compiler {
             if let Some(reg) = progress_reg {
                 self.emit(Instruction::ProgressCheck {
                     reg,
-                    clear_captures: Self::capture_registers(atom),
+                    clear_captures: self.capture_registers(atom),
                 });
             }
             self.emit(Instruction::RepeatCheck {
@@ -661,7 +758,7 @@ impl Compiler {
                         if let Some(reg) = progress_reg {
                             self.emit(Instruction::ProgressCheck {
                                 reg,
-                                clear_captures: Self::capture_registers(atom),
+                                clear_captures: self.capture_registers(atom),
                             });
                         }
                         let after = self.current_offset();
@@ -683,7 +780,7 @@ impl Compiler {
                         if let Some(reg) = progress_reg {
                             self.emit(Instruction::ProgressCheck {
                                 reg,
-                                clear_captures: Self::capture_registers(atom),
+                                clear_captures: self.capture_registers(atom),
                             });
                         }
                         let after = self.current_offset();
@@ -717,7 +814,7 @@ impl Compiler {
                     if can_be_zero_width {
                         self.emit(Instruction::ProgressCheck {
                             reg: progress_reg,
-                            clear_captures: Self::capture_registers(atom),
+                            clear_captures: self.capture_registers(atom),
                         });
                     }
                     self.emit(Instruction::Jump(loop_start));
@@ -739,7 +836,7 @@ impl Compiler {
                     if can_be_zero_width {
                         self.emit(Instruction::ProgressCheck {
                             reg: progress_reg,
-                            clear_captures: Self::capture_registers(atom),
+                            clear_captures: self.capture_registers(atom),
                         });
                     }
                     self.emit(Instruction::Jump(loop_start));
@@ -951,7 +1048,6 @@ impl Compiler {
                 let mut has_builtin = false;
 
                 let split_surrogates = !self.program.unicode && !self.program.unicode_sets;
-                let can_inline_builtin_ranges = !cc.negated && !self.program.unicode && !self.program.unicode_sets;
                 for r in ranges {
                     match r {
                         CharacterClassRange::Single(cp) => {
@@ -968,11 +1064,10 @@ impl Compiler {
                             char_ranges.push(CharRange { start: *lo, end: *hi });
                         }
                         CharacterClassRange::BuiltinClass(class)
-                            if can_inline_builtin_ranges
-                                && Self::append_builtin_class_ranges_for_legacy_positive_class(
-                                    &mut char_ranges,
-                                    *class,
-                                ) => {}
+                            if let Some(builtin_ranges) = self.legacy_builtin_class_ranges(*class, cc.negated) =>
+                        {
+                            char_ranges.extend_from_slice(builtin_ranges);
+                        }
                         CharacterClassRange::BuiltinClass(_) | CharacterClassRange::UnicodeProperty(_) => {
                             has_builtin = true;
                         }
@@ -984,10 +1079,10 @@ impl Compiler {
                     // individual matchers.
                     self.compile_complex_class(ranges, cc.negated);
                 } else {
-                    // Sort ranges by start code point for binary search in the VM.
-                    char_ranges.sort_by_key(|r| r.start);
+                    // Sort and merge ranges for binary search in the VM.
+                    normalize_char_ranges(&mut char_ranges);
                     self.emit(Instruction::CharClass {
-                        ranges: char_ranges,
+                        ranges: CharRanges::new(char_ranges),
                         negated: cc.negated,
                     });
                 }
@@ -1042,7 +1137,7 @@ impl Compiler {
             }
             CharacterClassRange::Range(lo, hi) => {
                 self.emit(Instruction::CharClass {
-                    ranges: vec![CharRange { start: *lo, end: *hi }],
+                    ranges: CharRanges::new(vec![CharRange { start: *lo, end: *hi }]),
                     negated: false,
                 });
             }
@@ -1059,10 +1154,13 @@ impl Compiler {
     /// a `LazyLoop`/`GreedyLoop`. Returns `None` for operands that require multi-character
     /// matching (string literals) or set operations that can't be represented as a simple test.
     fn try_simple_match_for_operand(operand: &ClassSetOperand) -> Option<SimpleMatch> {
+        if crate::stack::is_exhausted() {
+            return None;
+        }
         match operand {
             ClassSetOperand::Char(c) => Some(SimpleMatch::Char(*c)),
             ClassSetOperand::Range(lo, hi) => Some(SimpleMatch::CharClass {
-                ranges: vec![CharRange { start: *lo, end: *hi }],
+                ranges: CharRanges::new(vec![CharRange { start: *lo, end: *hi }]),
                 negated: false,
             }),
             ClassSetOperand::BuiltinClass(bc) => Some(SimpleMatch::BuiltinClass(*bc)),
@@ -1091,9 +1189,9 @@ impl Compiler {
                             _ => return None,
                         }
                     }
-                    ranges.sort_by_key(|r| r.start);
+                    normalize_char_ranges(&mut ranges);
                     Some(SimpleMatch::CharClass {
-                        ranges,
+                        ranges: CharRanges::new(ranges),
                         negated: cc.negated,
                     })
                 }
@@ -1155,11 +1253,10 @@ impl Compiler {
     /// collects plain ranges into one `CharClass` and each builtin/property into its
     /// own `SimpleMatch`, then folds them into a `Union`.
     fn try_simple_match_for_ranges(&self, ranges_vec: &[CharacterClassRange], negated: bool) -> Option<SimpleMatch> {
-        let has_complex = ranges_vec.iter().any(|r| {
-            matches!(
-                r,
-                CharacterClassRange::BuiltinClass(_) | CharacterClassRange::UnicodeProperty(_)
-            )
+        let has_complex = ranges_vec.iter().any(|r| match r {
+            CharacterClassRange::BuiltinClass(class) => self.legacy_builtin_class_ranges(*class, negated).is_none(),
+            CharacterClassRange::UnicodeProperty(_) => true,
+            CharacterClassRange::Single(_) | CharacterClassRange::Range(..) => false,
         });
 
         if !has_complex {
@@ -1175,11 +1272,17 @@ impl Compiler {
                     CharacterClassRange::Range(lo, hi) => {
                         ranges.push(CharRange { start: *lo, end: *hi });
                     }
-                    _ => return None,
+                    CharacterClassRange::BuiltinClass(class) => {
+                        ranges.extend_from_slice(self.legacy_builtin_class_ranges(*class, negated)?);
+                    }
+                    CharacterClassRange::UnicodeProperty(_) => return None,
                 }
             }
-            ranges.sort_by_key(|r| r.start);
-            return Some(SimpleMatch::CharClass { ranges, negated });
+            normalize_char_ranges(&mut ranges);
+            return Some(SimpleMatch::CharClass {
+                ranges: CharRanges::new(ranges),
+                negated,
+            });
         }
 
         if negated {
@@ -1218,9 +1321,9 @@ impl Compiler {
         }
 
         if !plain_ranges.is_empty() {
-            plain_ranges.sort_by_key(|r| r.start);
+            normalize_char_ranges(&mut plain_ranges);
             matchers.push(SimpleMatch::CharClass {
-                ranges: plain_ranges,
+                ranges: CharRanges::new(plain_ranges),
                 negated: false,
             });
         }
@@ -1235,9 +1338,9 @@ impl Compiler {
     fn try_simple_match_for_unicode_set(&self, expr: &ClassSetExpression, negated: bool) -> Option<SimpleMatch> {
         if let Some(ranges) = Self::try_extract_union_ranges(expr) {
             let mut sorted = ranges;
-            sorted.sort_by_key(|r| r.start);
+            normalize_char_ranges(&mut sorted);
             return Some(SimpleMatch::CharClass {
-                ranges: sorted,
+                ranges: CharRanges::new(sorted),
                 negated,
             });
         }
@@ -1260,6 +1363,9 @@ impl Compiler {
     }
 
     fn try_extract_union_ranges(expr: &ClassSetExpression) -> Option<Vec<CharRange>> {
+        if crate::stack::is_exhausted() {
+            return None;
+        }
         let ClassSetExpression::Union(operands) = expr else {
             return None;
         };
@@ -1308,7 +1414,7 @@ impl Compiler {
             }
         }
 
-        ranges.sort_by_key(|r| r.start);
+        normalize_char_ranges(&mut ranges);
         Some(ranges)
     }
 
@@ -1329,7 +1435,10 @@ impl Compiler {
         }
 
         if let Some(ranges) = Self::try_extract_union_ranges(expr) {
-            self.emit(Instruction::CharClass { ranges, negated });
+            self.emit(Instruction::CharClass {
+                ranges: CharRanges::new(ranges),
+                negated,
+            });
             return;
         }
 
@@ -1372,6 +1481,9 @@ impl Compiler {
     }
 
     fn compile_class_set_expression_at_length(&mut self, expr: &ClassSetExpression, length: usize) {
+        if self.is_out_of_stack() {
+            return;
+        }
         match expr {
             ClassSetExpression::Union(operands) => {
                 let filtered: Vec<&ClassSetOperand> = operands
@@ -1466,7 +1578,7 @@ impl Compiler {
                     return;
                 }
                 self.emit(Instruction::CharClass {
-                    ranges: vec![CharRange { start: *lo, end: *hi }],
+                    ranges: CharRanges::new(vec![CharRange { start: *lo, end: *hi }]),
                     negated: false,
                 });
             }

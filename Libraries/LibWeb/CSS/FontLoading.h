@@ -15,8 +15,8 @@
 
 namespace Web::CSS {
 
-bool requires_off_thread_vector_font_preparation(ByteBuffer const&, Optional<ByteString> const& mime_type_essence = {});
-ErrorOr<NonnullRefPtr<Gfx::Typeface const>> try_load_vector_font(ByteBuffer const&, Optional<ByteString> const& mime_type_essence = {});
+bool requires_off_thread_vector_font_preparation(ByteBuffer const&);
+ErrorOr<NonnullRefPtr<Gfx::Typeface const>> try_load_vector_font(ByteBuffer const&);
 void prepare_vector_font_data_off_thread(ByteBuffer, Function<void(ErrorOr<Core::AnonymousBuffer>)>&&);
 
 }

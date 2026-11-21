@@ -1,0 +1,24 @@
+light hidden:
+div.hidden.changed record 1
+  div no record
+    span.target no record
+hidden padding: 13px
+visible padding: 13px
+light visible:
+div.changed record 1
+  div record 1
+    span.target record 2
+shadow hidden:
+div.hidden.changed record 1
+  div no record
+    a no record
+      slot no record
+    span.target no record
+hidden padding: 13px
+visible padding: 13px
+shadow visible:
+div.changed record 1
+  div record 1
+    a record 2
+      slot record 3
+    span.target record 4
