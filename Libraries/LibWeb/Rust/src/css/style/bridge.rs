@@ -434,6 +434,20 @@ impl FfiFontResolutionRequest {
     pub fn font_size(&self) -> f64 {
         crate::css::css_pixels::CssPixels::from_raw(self.font_size_raw).to_double()
     }
+
+    /// The font size the lengths of the element whose values made this request scale: its
+    /// computed `font-size`, unrounded, where `computed` holds one in pixels, and the request's
+    /// otherwise.
+    pub fn font_size_for_lengths(&self, computed: Option<&crate::css::style_value::StyleValueData>) -> f64 {
+        match computed {
+            Some(crate::css::style_value::StyleValueData::Length { value, unit })
+                if *unit == crate::css::style_compute::px_length_unit() =>
+            {
+                *value
+            }
+            _ => self.font_size(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -447,6 +461,7 @@ pub struct FfiResolvedFont {
     pub descent: f32,
     pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     /// For a request naming `from-font`, the number it computes to: the request's metric of the
     /// first available font, divided by that font's size. Zero for other requests, and where the
@@ -784,6 +799,10 @@ pub mod element_construction_fact {
     pub const IS_SVG_GEOMETRY_ELEMENT: u32 = 1 << 8;
     pub const IS_HTML_SELECT_ELEMENT: u32 = 1 << 9;
     pub const IS_HTML_PROGRESS_OR_METER_ELEMENT: u32 = 1 << 10;
+    /// The element's default block-start or block-end margin is one a quirks-mode body or table cell ignores where it
+    /// collapses into the cell's or the body's own start or end.
+    pub const HAS_QUIRKY_BLOCK_START_MARGIN: u32 = 1 << 11;
+    pub const HAS_QUIRKY_BLOCK_END_MARGIN: u32 = 1 << 12;
     /// The layout algorithm a MathML element's tag name selects, as a `MathLayoutKind` in these bits.
     pub const MATHML_LAYOUT_KIND_SHIFT: u32 = 16;
     pub const MATHML_LAYOUT_KIND_MASK: u32 = 0x1f << MATHML_LAYOUT_KIND_SHIFT;

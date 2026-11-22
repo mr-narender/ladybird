@@ -934,6 +934,11 @@ impl Vm {
         self.heap.get().expect("the VM has a heap")
     }
 
+    /// The heap, unless the VM let go of it, as it does while the heap is destroyed.
+    pub(crate) fn heap_if_held(&self) -> Option<&Heap> {
+        self.heap.get()
+    }
+
     pub fn interpreter_stack(&self) -> &InterpreterStack {
         &self.head.interpreter_stack
     }
@@ -1252,6 +1257,7 @@ impl Vm {
     fn gather_roots(&self, visitor: &mut Visitor) {
         self.code_flushing.begin_pass(self);
         self.jit.trace(visitor);
+        self.trace_embedded_cells_of_running_jit_code(visitor);
         self.for_each_execution_context_top_to_bottom(|context| {
             context.trace(visitor);
             ControlFlow::Continue(())
@@ -1605,6 +1611,22 @@ impl Vm {
         });
     }
 
+    /// Keeps the cells that the JIT code which frames run embeds alive. Other JIT code holds them weakly (see
+    /// `JitCode::embedded_cells`).
+    fn trace_embedded_cells_of_running_jit_code(&self, visitor: &mut Visitor) {
+        // NB: Frames of recursive calls run the same code, which is traced once.
+        let mut traced_executables = HashSet::new();
+        self.for_each_live_execution_context(|frame| {
+            if frame.runs_jit_code.get()
+                && let Some(head) = frame.executable.get()
+                && traced_executables.insert(head.as_ptr().addr())
+            {
+                Executable::from_head(head).trace_embedded_cells_of_jit_code(self, visitor);
+            }
+            ControlFlow::Continue(())
+        });
+    }
+
     /// Clears the idle count of the executables that frames still run: they are not idle, even when no frame entered
     /// them for many collections (as in a long loop).
     fn clear_idle_collection_counts_of_running_executables(&self) {
@@ -1619,7 +1641,8 @@ impl Vm {
     /// Drops the weak cache entries of strings that died in this collection, and every entry of the caches that each
     /// collection empties.
     fn remove_dead_strings_from_weak_caches(&self, sweep: &Sweep<'_>) {
-        let is_dead = |string: Gc<PrimitiveString>| sweep.is_dead(string);
+        // NB: The caches forget strings that move.
+        let is_dead = |string: Gc<PrimitiveString>| sweep.is_dead_or_moving(string);
         for cache_slot in self.fly_string_cache.iter() {
             if cache_slot.get().is_some_and(is_dead) {
                 cache_slot.set(None);
@@ -1630,7 +1653,17 @@ impl Vm {
                 *entry = StringToAtomCacheEntry::default();
             }
         }
-        self.interned_strings.borrow_mut().retain(|_, string| !is_dead(*string));
+        let mut interned_strings = self.interned_strings.borrow_mut();
+        interned_strings.retain(|_, string| !sweep.is_dead(*string));
+        if sweep.moves_cells() {
+            // NB: The table is keyed by the identity of the fly strings, which moves of the strings do not change.
+            for string in interned_strings.values() {
+                // SAFETY: Only creating an interned string changes the table, which nothing does until the collection
+                //         is over.
+                unsafe { sweep.record_slot(string) };
+            }
+        }
+        drop(interned_strings);
         self.characters_to_atom_cache
             .borrow_mut()
             .fill_with(CharactersToAtomCacheEntry::default);
@@ -1649,6 +1682,7 @@ impl Vm {
                 return false;
             }
             executable.remove_dead_cells(sweep);
+            executable.drop_jit_code_that_lost_embedded_cells(self, sweep);
             let idle_collection_count = &executable.head.idle_collection_count;
             idle_collection_count.set(idle_collection_count.get().saturating_add(1));
             true
@@ -1658,7 +1692,7 @@ impl Vm {
         self.prototype_transition_cache.remove_dead_entries(sweep);
         self.construct_shape_cache.remove_dead_entries(sweep);
         self.keyed_property_store_cache.remove_dead_entries(sweep);
-        self.jit.dependents.remove_dead_entries(sweep);
+        self.jit.dependents.remove_dead_entries(self, sweep);
     }
 
     /// Has the JIT code that idled long enough in this collection flushed once the collection is over.

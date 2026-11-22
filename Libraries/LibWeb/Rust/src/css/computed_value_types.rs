@@ -467,6 +467,14 @@ pub struct RetainedWillChangePropertyList {
     pub length: usize,
 }
 
+/// The bits of [`MiscLayoutValues::user_agent_margin_sides`], one per physical side.
+pub mod user_agent_margin_side {
+    pub const TOP: u8 = 1 << 0;
+    pub const RIGHT: u8 = 1 << 1;
+    pub const BOTTOM: u8 = 1 << 2;
+    pub const LEFT: u8 = 1 << 3;
+}
+
 /// The non-inherited values of how a box lays out and outlines that no more specific group holds:
 /// appearance, fragmentation breaks, columns, object fitting, outlines, overflow clip margins and
 /// float shapes.
@@ -485,6 +493,9 @@ pub struct MiscLayoutValues {
     pub computed_appearance: u8,
     /// https://drafts.csswg.org/css-ui/#appearance-disabling-properties
     pub native_appearance_disabled: bool,
+    /// The physical sides whose margins the user agent's style sheet sets, as [`user_agent_margin_side`] bits.
+    /// Only a quirks-mode document records them, for its margin collapsing quirks.
+    pub user_agent_margin_sides: u8,
     pub outline_style: u8,
     pub object_fit: u8,
     pub column_height: ComputedSize,
@@ -683,6 +694,7 @@ pub struct FontValues {
     pub resolved_font_ascent: f32,
     pub resolved_font_descent: f32,
     pub resolved_font_x_height: f32,
+    pub resolved_font_cap_height: f32,
     pub resolved_font_zero_advance: f32,
     pub resolved_first_available_font: *const std::ffi::c_void,
     pub font_cascade_list: libgfx_rust::font::FontCascadeListHandle,
@@ -724,10 +736,24 @@ pub struct FirstAvailableFontMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
 }
 
 impl FontValues {
+    /// The computed font size, which `font_size` holds rounded to the nearest pixel fraction, as
+    /// the lengths relative to it read it: An em or rem length scales the size unrounded.
+    pub fn font_size_for_lengths(&self) -> f64 {
+        match self.font_size_value.style_value() {
+            Some(crate::css::style_value::StyleValueData::Length { value, unit })
+                if *unit == crate::css::style_compute::px_length_unit() =>
+            {
+                *value
+            }
+            _ => self.font_size.to_double(),
+        }
+    }
+
     /// https://drafts.csswg.org/css-fonts/#first-available-font
     /// The frozen cascade answers where the font computer published one: a load filling one of its
     /// faces in moves the answer without a new style. A cascade nobody published (a unit test's)
@@ -766,6 +792,7 @@ impl FontValues {
                     ascent: facts.ascent,
                     descent: facts.descent,
                     x_height: facts.x_height,
+                    cap_height: facts.cap_height,
                     zero_advance: facts.zero_advance,
                 }
             }
@@ -773,6 +800,7 @@ impl FontValues {
                 ascent: self.resolved_font_ascent,
                 descent: self.resolved_font_descent,
                 x_height: self.resolved_font_x_height,
+                cap_height: self.resolved_font_cap_height,
                 zero_advance: self.resolved_font_zero_advance,
             },
         }

@@ -36,6 +36,7 @@ use crate::layout::primitive_string::PrimitiveString;
 use crate::layout::realm::Realm;
 use crate::layout::shape::Shape;
 use crate::layout::value::Value;
+use crate::layout_forward::IDENTITY_HASH_STATE_OFFSET;
 use crate::runtime::array::Array;
 use crate::runtime::completion::Must;
 use crate::runtime::declarative_environment::{DECLARATIVE_ENVIRONMENT_CELL_SIZES, inline_binding_size_class};
@@ -60,17 +61,16 @@ fn address(local_free_list: Option<NonNull<*mut core::ffi::c_void>>) -> u64 {
     local_free_list.map_or(0, |list| list.as_ptr() as u64)
 }
 
-/// Gives `word` the bytes of `cell` (of `size` bytes) as u64 words, first to last, with a clear mark: cells allocated
-/// while the incremental sweep is active start out marked, but cells from local free lists never need marking.
+/// Gives `word` the bytes of `cell` (of `size` bytes) as u64 words, first to last.
 fn for_each_cell_word<T>(cell: Gc<T>, size: usize, mut word: impl FnMut(u64)) {
-    let mark = core::mem::offset_of!(CellHeader, mark);
     for start in (0..size).step_by(8) {
         let mut bytes = [0u8; 8];
         let len = (size - start).min(8);
         // SAFETY: The cell is live and has `size` bytes, of which these `len` are some, and `bytes` has room for 8.
         unsafe { core::ptr::copy_nonoverlapping(cell.as_ptr().cast::<u8>().add(start), bytes.as_mut_ptr(), len) };
-        if let Some(byte) = mark.checked_sub(start).and_then(|index| bytes.get_mut(index)) {
-            *byte = 0;
+        // NB: A copy is a new cell, which has not been hashed, whatever the identity hash state of the sample is.
+        if (start..start + len).contains(&IDENTITY_HASH_STATE_OFFSET) {
+            bytes[IDENTITY_HASH_STATE_OFFSET - start] = 0;
         }
         word(u64::from_ne_bytes(bytes));
     }
@@ -115,6 +115,7 @@ pub fn allocation_infos<'d>(
     };
 
     let object_template = Object::create(vm, realm, Some(realm.object_prototype()));
+    object_template.shape().note_in_allocation_template();
     let mut object = ObjectAllocationInfo {
         empty_object_inline_capacity: u32::from(EMPTY_PLAIN_OBJECT_INLINE_CAPACITY),
         heap: heap_address,
@@ -154,6 +155,7 @@ pub fn allocation_infos<'d>(
 
     let array_template = Array::create(vm, realm, 0, None).must();
     let array_shape = array_template.shape();
+    array_shape.note_in_allocation_template();
     // NB: Storage is only allocated inline where the heap gives the addresses of all the free lists it comes from.
     let storage_size_classes = snapshot.begin();
     let mut has_all_free_lists = true;
@@ -585,23 +587,41 @@ fn closure_template(
     if !sample.can_be_copied() {
         return None;
     }
+    sample.shape().note_in_allocation_template();
     let words = cell_words(snapshot, sample, size_of::<EcmascriptFunctionObject>());
     Some((sample, words))
 }
 
-/// The closure templates as the snapshot carries them, with their samples as cells the code embeds.
+/// The slots that hold the samples of the closure templates of JIT code, each in a box of its own, so that its address
+/// stays the same. The code passes the address of a slot to `libjs_jit_clone_function()` and keeps it in the
+/// descriptions of the closures it never allocated, rather than embedding the sample, so that the sample can move: the
+/// code keeps the slots, and visits them as owned values (see Visitor::visit_owned_values()).
+pub type SampleSlots = Vec<Box<Value>>;
+
+/// The closure templates as the snapshot carries them, with the samples in slots added to `sample_slots`. `cell` notes
+/// a cell the snapshot refers to: the samples, until the code is installed, and the cells the words refer to, which
+/// the code embeds.
 pub fn closure_template_snapshots(
     templates: ClosureTemplates,
-    mut cell: impl FnMut(Gc<EcmascriptFunctionObject>) -> CellId,
+    mut cell: impl FnMut(Gc<CellHeader>) -> CellId,
+    sample_slots: &mut SampleSlots,
     _defer_gc: &DeferGc<'_>,
     snapshot: &mut SnapshotWriter,
 ) -> List<Option<ClosureTemplateSnapshot>> {
     let rows = snapshot.begin();
     for template in templates {
-        snapshot.push(template.map(|(sample, words)| ClosureTemplateSnapshot {
-            sample: cell(sample),
-            words,
-            inline_executable: None,
+        snapshot.push(template.map(|(sample, words)| {
+            cell(sample.upcast());
+            let slot = Box::new(Value::from_object(sample.upcast::<Object>()));
+            let sample_slot = CellId(core::ptr::from_ref::<Value>(&slot).expose_provenance() as u64);
+            sample_slots.push(slot);
+            ClosureTemplateSnapshot {
+                sample_slot,
+                shape: cell(sample.shape().upcast()),
+                shared_data: cell(sample.shared_data().upcast()),
+                words,
+                inline_executable: None,
+            }
         }));
     }
     snapshot.end(rows)
@@ -642,18 +662,27 @@ pub extern "C" fn libjs_jit_allocate_array(vm: &Vm, count: u32) -> *mut Array {
     array.as_ptr()
 }
 
-/// `ECMAScriptFunctionObject* libjs_jit_clone_function(VM*, ECMAScriptFunctionObject* sample, Environment*,
+/// `ECMAScriptFunctionObject* libjs_jit_clone_function(VM*, Value const* sample_slot, Environment*,
 /// PrivateEnvironment*)`: a closure like the sample of a closure template, with the given environments.
 ///
-/// JIT code calls this with its VM, a sample it embeds and live environments (or null private environment).
+/// JIT code calls this with its VM, a slot that holds a sample, which the code keeps (see `SampleSlots`), and live
+/// environments (or null private environment).
 #[jit_abi]
 pub extern "C" fn libjs_jit_clone_function(
     vm: &Vm,
-    sample: Gc<EcmascriptFunctionObject>,
+    sample_slot: &Value,
     environment: Option<Gc<Environment>>,
     private_environment: Option<Gc<PrivateEnvironment>>,
 ) -> *mut EcmascriptFunctionObject {
-    clone_function(vm, sample, environment, private_environment).as_ptr()
+    clone_function(vm, sample_in(sample_slot), environment, private_environment).as_ptr()
+}
+
+/// The sample a slot of `SampleSlots` holds.
+pub fn sample_in(sample_slot: &Value) -> Gc<EcmascriptFunctionObject> {
+    sample_slot
+        .as_cell()
+        .downcast::<EcmascriptFunctionObject>()
+        .expect("a sample slot holds an ECMAScript function")
 }
 
 /// A closure like the sample of a closure template, with the given environments.

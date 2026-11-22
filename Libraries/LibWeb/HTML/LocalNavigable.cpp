@@ -47,6 +47,7 @@
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -2791,9 +2792,10 @@ static void create_navigation_params_by_fetching(
         //        The referenced issue suggests that it is a no-op to retrieve the browsing context scope origin.
 
         // 2. Set request's destination to navigable's container's local name.
-        // FIXME: Are there other container types? If so, we need a helper here
+        auto container_is_embed = *container_local_name == HTML::TagNames::embed;
         auto container_is_iframe = *container_local_name == HTML::TagNames::iframe;
         request->set_destination(container_is_iframe ? Web::Fetch::Infrastructure::Request::Destination::IFrame
+                : container_is_embed                 ? Web::Fetch::Infrastructure::Request::Destination::Embed
                                                      : Web::Fetch::Infrastructure::Request::Destination::Object);
 
         // 3. If sourceSnapshotParams's fetch client is navigable's container document's relevant settings object,
@@ -2803,8 +2805,8 @@ static void create_navigation_params_by_fetching(
         //        is that process's, so its resource timing is not told of the navigation.
         auto fetch_client = settings_object_of_fetch_client(source_snapshot_params->fetch_client);
         if (auto container_document = navigable->container_document(); container_document && fetch_client.ptr() == &container_document->relevant_settings_object()) {
-            // FIXME: Are there other container types? If so, we need a helper here
             request->set_initiator_type(container_is_iframe ? Web::Fetch::Infrastructure::Request::InitiatorType::IFrame
+                    : container_is_embed                    ? Web::Fetch::Infrastructure::Request::InitiatorType::Embed
                                                             : Web::Fetch::Infrastructure::Request::InitiatorType::Object);
         }
 
@@ -4948,7 +4950,7 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
 
     if (has_compositor_context()) {
         compositor_context().viewport_size_updated(
-            page().css_to_device_rect(viewport_rect()).size().to_type<int>(),
+            viewport_size_in_device_pixels(),
             page().client().device_pixel_ratio(),
             Compositing::WindowResizingInProgress::Yes);
     }
@@ -6267,9 +6269,25 @@ void LocalNavigable::schedule_hover_update_after_async_scroll()
     m_async_scroll_hover_update_timer->restart(AK::Duration::from_milliseconds(hover_update_after_async_scroll_delay_ms));
 }
 
+static bool async_scroll_node_is_in_document(DOM::Document& document, Web::AsyncScrollNodeStableID const& stable_id)
+{
+    if (stable_id.kind == Web::AsyncScrollNodeKind::Viewport || stable_id.kind == Web::AsyncScrollNodeKind::VisualViewport)
+        return stable_id.node_id == document.unique_id();
+    return element_for_async_scroll_node_stable_id(document, stable_id) != nullptr;
+}
+
 bool LocalNavigable::leave_hover_update_to_end_of_user_scroll()
 {
-    if (!any_of(m_pending_async_scroll_operations, [](auto const& pending) { return pending.trigger == ScrollTrigger::UserInput; }))
+    // A user's scroll of a document this navigable no longer shows may never be reported as ended, since its scroll
+    // node is gone: It holds back no hover of the active document.
+    auto document = active_document();
+    if (!document)
+        return false;
+    if (!any_of(m_pending_async_scroll_operations, [&](auto const& pending) {
+            if (pending.trigger != ScrollTrigger::UserInput)
+                return false;
+            return !pending.stable_node_id.has_value() || async_scroll_node_is_in_document(*document, *pending.stable_node_id);
+        }))
         return false;
     schedule_hover_update_after_async_scroll();
     return true;
@@ -7000,7 +7018,7 @@ void LocalNavigable::repaint_after_compositor_process_reconnect()
             }
         }
         compositor_context().viewport_size_updated(
-            page().css_to_device_rect(viewport_rect()).size().to_type<int>(),
+            viewport_size_in_device_pixels(),
             page().client().device_pixel_ratio(),
             Compositing::WindowResizingInProgress::No);
 
@@ -7160,7 +7178,7 @@ bool LocalNavigable::commit_frame(PaintConfig paint_config)
     // NB: Only the top-level traversable fills its canvas. A local root under a remote parent is an iframe in another
     //     process, and its canvas stays transparent like that of a same-process iframe.
     if (is_top_level_traversable() && !paint_config.canvas_fill_rect.has_value())
-        paint_config.canvas_fill_rect = Gfx::IntRect { {}, page().css_to_device_rect(viewport_rect()).size().to_type<int>() };
+        paint_config.canvas_fill_rect = Gfx::IntRect { {}, viewport_size_in_device_pixels() };
 
     // A frame is left to the next rendering update while the compositor cannot be reached.
     if (!compositor_context().ready_for_frame())
@@ -7404,7 +7422,19 @@ void LocalNavigable::paint_next_frame()
 
 Gfx::IntRect LocalNavigable::present_viewport_rect() const
 {
-    return page().css_to_device_rect(viewport_rect()).to_type<int>();
+    return { page().css_to_device_rect(viewport_rect()).location().to_type<int>(), viewport_size_in_device_pixels() };
+}
+
+// A viewport size in device pixels becomes one in CSS pixels floored to a fraction of a CSS pixel, so its product with
+// the scale lies just below the device size. Rounding gives the device size back, which the UI process gives the
+// compositor too.
+Gfx::IntSize LocalNavigable::viewport_size_in_device_pixels() const
+{
+    auto scale = page().client().device_pixels_per_css_pixel();
+    return {
+        static_cast<int>(round(m_viewport_size.width().to_double() * scale)),
+        static_cast<int>(round(m_viewport_size.height().to_double() * scale)),
+    };
 }
 
 bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_reason, LayOutFirst lay_out_first)

@@ -392,7 +392,7 @@ JS::ThrowCompletionOr<HTMLCanvasElement::HasOrCreatedContext> HTMLCanvasElement:
     if (!m_context.has<Empty>())
         return m_context.has<GC::Ref<ContextType>>() ? HasOrCreatedContext::Yes : HasOrCreatedContext::No;
 
-    auto context_attributes = TRY(WebGL::convert_value_to_context_attributes_dictionary(vm(), options));
+    auto context_attributes = TRY(WebGL::convert_to_context_attributes(vm(), options));
     TRY(throw_if_control_transferred_to_offscreen());
     // AD-HOC: Converting the options can run script that creates a context.
     if (!m_context.has<Empty>())
@@ -555,12 +555,6 @@ Optional<Compositing::CanvasId> HTMLCanvasElement::canvas_id() const
     return {};
 }
 
-void HTMLCanvasElement::notify_compositor_connection_lost()
-{
-    if (auto* webgl_context = canvas_webgl_context())
-        webgl_context->lose_context_from_compositor_loss();
-}
-
 void HTMLCanvasElement::set_canvas_content_dirty()
 {
     m_canvas_content_dirty = true;
@@ -600,10 +594,6 @@ void HTMLCanvasElement::prepare_for_compositing()
 
 void HTMLCanvasElement::notify_compositor_backing_storage_lost()
 {
-    if (auto* webgl_context = canvas_webgl_context()) {
-        webgl_context->restore_context_after_compositor_reconnect();
-        return;
-    }
     if (auto context_2d = canvas_rendering_context_2d())
         context_2d->notify_backing_storage_lost();
 }

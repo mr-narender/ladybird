@@ -93,9 +93,11 @@ struct InputFromUI final : public Web::BrowserInputData {
     u64 input_id { 0 };
 };
 
-u64 ConnectionFromUI::input_id_of(Web::BrowserInputData const& browser_data)
+Optional<u64> ConnectionFromUI::input_id_of(Web::BrowserInputData const* browser_data)
 {
-    return as<InputFromUI>(browser_data).input_id;
+    if (auto const* input_from_ui = as_if<InputFromUI>(browser_data))
+        return input_from_ui->input_id;
+    return {};
 }
 
 template<typename EventType>
@@ -450,6 +452,42 @@ void ConnectionFromUI::view_set_reports_session_history(u64 view_id, bool report
         view->set_reports_session_history(reports_session_history);
 }
 
+void ConnectionFromUI::view_set_compositor_layer_hidden(u64 view_id, u64 layer_id, bool hidden)
+{
+    if (auto* view = find_view(view_id))
+        view->set_compositor_layer_hidden(layer_id, hidden);
+}
+
+void ConnectionFromUI::view_set_selected_compositor_layers(u64 view_id, Vector<u64> layer_ids)
+{
+    if (auto* view = find_view(view_id))
+        view->set_selected_compositor_layers(move(layer_ids));
+}
+
+void ConnectionFromUI::view_set_hovered_compositor_layer(u64 view_id, Optional<u64> layer_id)
+{
+    if (auto* view = find_view(view_id))
+        view->set_hovered_compositor_layer(layer_id);
+}
+
+void ConnectionFromUI::view_show_only_compositor_layers(u64 view_id, Vector<u64> layer_ids)
+{
+    if (auto* view = find_view(view_id))
+        view->show_only_compositor_layers(layer_ids);
+}
+
+void ConnectionFromUI::view_show_all_compositor_layers(u64 view_id)
+{
+    if (auto* view = find_view(view_id))
+        view->show_all_compositor_layers();
+}
+
+void ConnectionFromUI::view_reset_compositor_layer_raster_counts(u64 view_id)
+{
+    if (auto* view = find_view(view_id))
+        view->reset_compositor_layer_raster_counts();
+}
+
 void ConnectionFromUI::view_file_picker_closed(u64 view_id, Vector<Web::HTML::SelectedFile> selected_files)
 {
     if (auto* view = find_view(view_id))
@@ -689,16 +727,20 @@ void ConnectionFromUI::stop_request(u64 request_id)
         (*request)->stop();
 }
 
-void ConnectionFromUI::check_for_updates(WebView::UpdateCheckTrigger trigger)
+void ConnectionFromUI::check_for_updates([[maybe_unused]] WebView::UpdateCheckTrigger trigger)
 {
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     if (auto* update_checker = Application::the().update_checker())
         update_checker->check(trigger);
+#endif
 }
 
-void ConnectionFromUI::skip_update_version(String version)
+void ConnectionFromUI::skip_update_version([[maybe_unused]] String version)
 {
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     if (auto* update_checker = Application::the().update_checker())
         update_checker->skip_version(version);
+#endif
 }
 
 void ConnectionFromUI::toggle_devtools_enabled()
@@ -745,6 +787,11 @@ void ConnectionFromUI::set_shows_line_box_borders(bool shows)
 void ConnectionFromUI::set_shows_caret_hit_test_debug_overlay(bool shows)
 {
     Application::the().set_shows_caret_hit_test_debug_overlay(shows);
+}
+
+void ConnectionFromUI::set_shows_compositor_layers(bool shows)
+{
+    Application::the().set_shows_compositor_layers(shows);
 }
 
 void ConnectionFromUI::dump_cookies()

@@ -281,6 +281,8 @@ public:
     // Compositor connection to pair it with.
     bool connect_video_presentation_to_compositor(WebContentClient&, IPC::TransportHandle compositor_end);
     ErrorOr<IPC::TransportHandle> connect_new_compositor_canvas_client();
+    // Counts the Compositor processes that were launched, so that a client can tell which one it is connected to.
+    u64 compositor_generation() const { return m_compositor_generation; }
     void register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     ErrorOr<void> try_register_compositor_context(WebContentClient&, Web::CompositorContextId, Optional<Web::PageId> page_id);
     void update_compositor_viewport(Web::CompositorContextId, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress = Compositing::WindowResizingInProgress::No);
@@ -339,9 +341,11 @@ public:
 
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
     virtual void display_error_dialog(StringView error_message) const;
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     virtual void display_update_check_result(UpdateCheckResult const&, UpdateCheckTrigger) { }
 
     UpdateChecker* update_checker() { return m_update_checker.ptr(); }
+#endif
 
     // FIXME: We should implement UI-agnostic platform APIs to interact with the system clipboard.
     enum class ClipboardType : u8 {
@@ -392,6 +396,8 @@ public:
     void set_blocks_pop_ups(bool);
     void set_shows_line_box_borders(bool);
     void set_shows_caret_hit_test_debug_overlay(bool);
+    bool shows_compositor_layers() const { return m_shows_compositor_layers; }
+    void set_shows_compositor_layers(bool);
 
     bool devtools_enabled() const { return m_devtools; }
     void dump_cookies() const;
@@ -640,7 +646,9 @@ private:
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
     ByteString m_instance_data_directory;
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     OwnPtr<UpdateChecker> m_update_checker;
+#endif
     struct PendingContentBlockerListUpdate {
         String identifier;
         String name;
@@ -666,6 +674,7 @@ private:
     OwnPtr<RequestServerManager> m_request_server_manager;
     OwnPtr<ImageDecoderManager> m_image_decoder_manager;
     RefPtr<CompositorClient> m_compositor_client;
+    u64 m_compositor_generation { 0 };
     RefPtr<CompositorPresentationClient> m_compositor_presentation_client;
     u64 m_compositor_presentation_id { 0 };
     // IDs are never reused, so one from before a Compositor restart names no layer of the new process.
@@ -737,6 +746,7 @@ private:
     bool m_blocks_pop_ups { true };
     bool m_shows_line_box_borders { false };
     bool m_shows_caret_hit_test_debug_overlay { false };
+    bool m_shows_compositor_layers { false };
 
     Web::Clipboard::SystemClipboardItem m_clipboard;
 

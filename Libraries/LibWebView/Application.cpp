@@ -174,8 +174,10 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
             Application::request_server_manager().disk_cache_settings_changed();
         else if (id == ConfigVariableID::DisableHighDynamicRangeSurfaces)
             Application::the().update_compositor_high_dynamic_range_surfaces();
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
         else if (id == ConfigVariableID::UpdateCheckInterval && Application::the().update_checker())
             Application::the().update_checker()->settings_changed();
+#endif
     }
 };
 
@@ -763,6 +765,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         start_content_blocker_list_update(ContentBlockerListUpdateTrigger::Automatic);
     }
 
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     // Every profile of this installation shares when it last checked for updates. A temporary profile only checks when
     // the user asks it to.
     if (!m_browser_options.headless_mode.has_value() && !m_browser_options.webdriver_browser_endpoint.has_value()) {
@@ -773,6 +776,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         if (!profile().is_temporary())
             m_update_checker->start();
     }
+#endif
 
     initialize_page_options();
 
@@ -2211,6 +2215,7 @@ ErrorOr<void> Application::launch_compositor_process()
     if (exchange(m_compositor_gpu_painting_enabled, gpu_painting_enabled) != gpu_painting_enabled)
         on_compositor_gpu_painting_changed();
     m_compositor_client = TRY(WebView::launch_compositor_process(m_compositor_launched_features));
+    ++m_compositor_generation;
     m_compositor_client->on_death = [this]() {
         handle_compositor_process_death();
     };
@@ -2411,6 +2416,7 @@ void Application::bring_up_compositor_process()
         client->replay_compositor_view_state_after_reconnect({});
     for (auto& client : clients)
         client->notify_compositor_process_reconnected({});
+    WorkerAgentManager::the().notify_compositor_process_reconnected(m_compositor_generation);
 }
 
 ErrorOr<void> Application::launch_request_server()
@@ -3021,6 +3027,15 @@ void Application::set_shows_caret_hit_test_debug_overlay(bool shows)
     send_debug_switch_to_every_view("set-caret-hit-test-debug-overlay"sv, shows);
 }
 
+void Application::set_shows_compositor_layers(bool shows)
+{
+    m_shows_compositor_layers = shows;
+    ViewImplementation::for_each_view([](ViewImplementation& view) {
+        view.update_ui_overlays();
+        return IterationDecision::Continue;
+    });
+}
+
 void Application::dump_cookies() const
 {
     m_default_session->cookie_jar->dump_cookies();
@@ -3205,8 +3220,10 @@ void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)
 
 void Application::background_networking_settings_changed(Badge<ApplicationSettingsObserver>)
 {
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
     if (m_update_checker)
         m_update_checker->settings_changed();
+#endif
 
     if (!m_settings->automatic_filter_list_updates_allowed()) {
         m_pending_content_blocker_list_updates.remove_all_matching([](auto const& update) { return update.trigger == ContentBlockerListUpdateTrigger::Automatic; });

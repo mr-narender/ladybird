@@ -281,9 +281,14 @@ pub struct OrdinaryHasInstanceSnapshot {
 /// apart from their environments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosureTemplateSnapshot {
-    /// The function object itself. Code that copies it embeds it, which
-    /// keeps everything it refers to alive.
-    pub sample: CellId,
+    /// The address of the slot that holds the sample, a function object
+    /// the closures are copies of, which is no cell: the code that copies
+    /// the sample keeps the slot, and the sample may move.
+    pub sample_slot: CellId,
+    /// The cells the words refer to, the shape and the shared function
+    /// data of the sample, which code that copies the words embeds.
+    pub shape: CellId,
+    pub shared_data: CellId,
     /// Its bytes (see `FunctionAllocationInfo`).
     pub words: List<u64>,
     /// The index in `Snapshot::executables` of the closures' executable, if
@@ -639,8 +644,8 @@ pub struct LexicalEnvironmentTemplateSnapshot {
 /// `ECMAScriptFunctionObject::inline_call_environment()`), with its final
 /// shape and room for its binding values in the cell, as JIT code allocates
 /// it: from the local free list at `allocator` (like
-/// `ObjectSizeClass::allocator`), with `words` (the cell's bytes, with a
-/// clear mark), then the pointer to its binding values, which start right
+/// `ObjectSizeClass::allocator`), with `words` (the cell's bytes), then the
+/// pointer to its binding values, which start right
 /// after `words`, at `binding_values_offset`, and the `this` value the call
 /// binds at `this_value_offset` if `binds_this`. The binding values need no
 /// initialization: the environment has none yet.
@@ -1564,7 +1569,7 @@ pub struct ArrayAllocationInfo {
 /// `RuntimeOffsets::ecmascript_function_environment` and
 /// `ecmascript_function_private_environment`. If `allocator` is 0, there is
 /// no fast path. Slow path:
-/// `ECMAScriptFunctionObject* libjs_jit_clone_function(VM*, ECMAScriptFunctionObject* sample, Environment*, PrivateEnvironment*)`.
+/// `ECMAScriptFunctionObject* libjs_jit_clone_function(VM*, Value const* sample_slot, Environment*, PrivateEnvironment*)`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FunctionAllocationInfo {
     pub allocator: u64,

@@ -58,6 +58,7 @@
 #include <UI/Qt/BookmarkDialog.h>
 #include <UI/Qt/Bookmarks.h>
 #include <UI/Qt/ChromeLayout.h>
+#include <UI/Qt/CompositorLayersWindow.h>
 #include <UI/Qt/DownloadsPage.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
 #include <UI/Qt/ExternalURLHandler.h>
@@ -83,8 +84,11 @@
 #    include <UI/Qt/MacWindow.h>
 #    include <UI/Qt/MicrophoneAuthorizerMacOS.h>
 #    include <UI/Qt/ScrollbarPreferencesMac.h>
-#    include <UI/Qt/SoftwareUpdaterMac.h>
 #    include <UI/Qt/SpellCheckerMac.h>
+#endif
+
+#if defined(LADYBIRD_HAS_SPARKLE)
+#    include <UI/Qt/SoftwareUpdaterMac.h>
 #endif
 
 #if defined(LADYBIRD_HAS_TRANSLATOR)
@@ -549,6 +553,7 @@ public:
         m_help_menu->addSeparator();
         m_help_menu->addAction(create_application_action(*m_application_widget, application.open_about_page_action(), IncludeActionIcon::No));
 
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
         auto* check_for_updates_action = make_action("Check for Updates…");
         // NB: On macOS, this moves the item into the application menu, below About Ladybird.
         check_for_updates_action->setMenuRole(QAction::ApplicationSpecificRole);
@@ -556,13 +561,18 @@ public:
             HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::UserInitiated);
         });
         m_help_menu->addAction(check_for_updates_action);
+#endif
 
+#if defined(LADYBIRD_HAS_UPDATE_CHECK) || defined(AK_OS_LINUX)
+        m_debug_menu->addSeparator();
+#endif
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
         auto* simulate_update_action = make_action("Simulate Available Update");
         QObject::connect(simulate_update_action, &QAction::triggered, this, [] {
             HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::Debug);
         });
-        m_debug_menu->addSeparator();
         m_debug_menu->addAction(simulate_update_action);
+#endif
 #if defined(AK_OS_LINUX)
         auto* simulate_replaced_installation_action = make_action("Simulate Replaced Installation");
         QObject::connect(simulate_replaced_installation_action, &QAction::triggered, this, [] {
@@ -1158,6 +1168,74 @@ Application::~Application()
     m_picture_in_picture_windows.clear();
 }
 
+static void place_beside_browser_window_or_over_its_top_right_corner(QWidget& window, QWidget const& browser_window)
+{
+    constexpr int GAP = 12;
+    auto browser_frame = browser_window.frameGeometry();
+    auto window_size = window.size();
+    auto screen = browser_window.screen()->availableGeometry();
+    auto x = browser_frame.right() + GAP;
+    if (x + window_size.width() > screen.right())
+        x = browser_frame.right() - window_size.width() - GAP;
+    window.move(x, browser_frame.top() + GAP);
+}
+
+void Application::set_shows_compositor_layers(bool shows)
+{
+    HubConnection::the().async_set_shows_compositor_layers(shows);
+    if (!shows) {
+        if (m_compositor_layers_window)
+            m_compositor_layers_window->hide();
+        return;
+    }
+    if (!m_compositor_layers_window) {
+        m_compositor_layers_window = make<CompositorLayersWindow>(CompositorLayersWindow::Source {
+            .layers_of_active_tab = [this]() -> Optional<Compositing::CompositorLayersDescription> {
+                if (auto* tab = active_tab())
+                    return tab->compositor_layers();
+                return {};
+            },
+            .set_layer_hidden_in_active_tab = [this](u64 layer_id, bool hidden) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().set_compositor_layer_hidden(layer_id, hidden); },
+            .set_selected_layers_in_active_tab = [this](Vector<u64> layer_ids) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().set_selected_compositor_layers(AK::move(layer_ids)); },
+            .set_hovered_layer_in_active_tab = [this](Optional<u64> layer_id) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().set_hovered_compositor_layer(layer_id); },
+            .show_only_layers_in_active_tab = [this](Vector<u64> layer_ids) {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().show_only_compositor_layers(AK::move(layer_ids)); },
+            .show_all_layers_in_active_tab = [this] {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().show_all_compositor_layers(); },
+            .reset_raster_counts_in_active_tab = [this] {
+                if (auto* tab = active_tab(); tab && tab->is_loaded())
+                    tab->view().reset_compositor_layer_raster_counts(); },
+            .start_picking_layer_in_active_tab = [this](CompositorLayerPicker picker) {
+                auto* tab = active_tab();
+                if (!tab || !tab->is_loaded())
+                    return false;
+                m_view_picking_compositor_layer = &tab->view();
+                tab->view().start_compositor_layer_picker(AK::move(picker));
+                return true; },
+            .stop_picking_layer_in_active_tab = [this] {
+                if (m_view_picking_compositor_layer)
+                    m_view_picking_compositor_layer->stop_compositor_layer_picker();
+                m_view_picking_compositor_layer = nullptr; },
+        });
+        m_compositor_layers_window->on_close = [] {
+            ApplicationActions::the().show_compositor_layers_action().set_checked(false);
+            HubConnection::the().async_set_shows_compositor_layers(false);
+        };
+        if (auto* browser_window = active_window_if_any())
+            place_beside_browser_window_or_over_its_top_right_corner(*m_compositor_layers_window, *browser_window);
+    }
+    m_compositor_layers_window->show();
+    m_compositor_layers_window->raise();
+}
+
 void Application::show_process_manager()
 {
     if (!m_process_manager_window) {
@@ -1226,7 +1304,7 @@ void Application::create_platform_actions()
         if (auto* hub = HubConnection::the_if_connected())
             hub->send_settings_changes(settings);
     };
-#if defined(AK_OS_MACOS)
+#if defined(LADYBIRD_HAS_SPARKLE)
     m_software_updater = SoftwareUpdater::create();
     m_software_updater->on_will_relaunch = [this] {
         m_restart = Restart::ByUpdater;
@@ -2439,6 +2517,7 @@ void Application::display_error_dialog(StringView error_message) const
     create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
 }
 
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
 void Application::display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> const& version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger)
 {
     static constexpr auto current_version = BROWSER_VERSION ""sv;
@@ -2486,9 +2565,9 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
     if (first_is_one_of(install_method, WebView::InstallMethod::DEB, WebView::InstallMethod::RPM, WebView::InstallMethod::Flatpak)) {
         text = qformatted("You have Ladybird {}. Update it with your system's software updater.", current_version);
         buttons.append({ "Remind me later", PageCard::ButtonRole::Primary, {} });
+#    if defined(LADYBIRD_HAS_SPARKLE)
     } else if (install_method == WebView::InstallMethod::MacOSApp) {
         buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
-#if defined(AK_OS_MACOS)
         buttons.append({ "Install update", PageCard::ButtonRole::Primary, [trigger] {
                             auto* software_updater = Application::the().software_updater();
                             if (!software_updater)
@@ -2498,7 +2577,7 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
                             else
                                 software_updater->install_update();
                         } });
-#endif
+#    endif
     } else {
         buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
         buttons.append({ "View release", PageCard::ButtonRole::Primary, [url = WebView::release_page_url(*version)] {
@@ -2509,6 +2588,7 @@ void Application::display_update_check_result(WebView::UpdateCheckResult::Kind k
 
     window->show_page_card(BrowserWindow::PageCardSlot::Update, qformatted("Ladybird {} is available", *version), text, move(buttons));
 }
+#endif
 
 #if defined(AK_OS_LINUX)
 // The system replaces the files of a package that it updates while Ladybird runs from the ones that it started with. The

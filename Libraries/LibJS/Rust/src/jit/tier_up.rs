@@ -9,6 +9,7 @@
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
 
+use super::allocation::SampleSlots;
 use super::code::{CompileState, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL, JitCode, SnapshotExecutable};
 use super::compile_queue::{CompileResult, Compiled};
 use super::data_memory::DataMemory;
@@ -354,10 +355,11 @@ fn install(
     compiled: Compiled,
     memory: ExecutableMemory,
     snapshot: SnapshotExecutables,
+    sample_slots: SampleSlots,
     defer_gc: &DeferGc<'_>,
 ) {
     let artifact = compiled.artifact();
-    let embedded_cells = artifact
+    let embedded_cells: Vec<Gc<CellHeader>> = artifact
         .embedded_cells()
         .map(|cell| {
             // SAFETY: The snapshot kept every cell it captured alive, and the code embeds only those.
@@ -374,6 +376,7 @@ fn install(
         snapshot,
         defer_gc,
     );
+    code.set_sample_slots(sample_slots, defer_gc);
     code.set_id(id);
     code.set_frame_offsets(compiled.site_index_frame_offset, compiled.register_dump_frame_offset);
     let dependencies = artifact.dependencies().collect::<Vec<_>>();
@@ -402,6 +405,7 @@ fn finish_compile(
     result: CompileResult,
     memory: Option<ExecutableMemory>,
     snapshot_executables: SnapshotExecutables,
+    sample_slots: SampleSlots,
     defer_gc: &DeferGc<'_>,
 ) {
     assert_eq!(executable.jit_compile_state(), CompileState::Queued);
@@ -432,7 +436,15 @@ fn finish_compile(
         eprintln!("JIT code for {}:\n{dump}", super::describe_executable(&executable));
     }
     if let Some(memory) = memory {
-        install(vm, executable, compiled, memory, snapshot_executables, defer_gc);
+        install(
+            vm,
+            executable,
+            compiled,
+            memory,
+            snapshot_executables,
+            sample_slots,
+            defer_gc,
+        );
     }
     if executable.jit_compile_state() != CompileState::Installed {
         executable.set_jit_compile_state(CompileState::None);
@@ -472,6 +484,7 @@ fn compile(
         snapshot,
         cells,
         snapshot_executables,
+        sample_slots,
     } = capture_snapshot(vm, executable, function, realm, osr_pc, &defer_gc);
     if sync {
         // NB: Nothing collects garbage while compiling on this thread, so the snapshot's cells stay alive.
@@ -495,6 +508,7 @@ fn compile(
             result,
             memory,
             snapshot_executables.into_inner(),
+            sample_slots.into_inner(),
             &defer_gc,
         );
         drop(defer_gc);
@@ -506,6 +520,7 @@ fn compile(
             executable,
             cells: cells.into_inner(),
             snapshot_executables: snapshot_executables.into_inner(),
+            sample_slots: sample_slots.into_inner(),
         },
         &defer_gc,
     );
@@ -603,6 +618,14 @@ fn install_compile_results(vm: &Vm, results: Vec<(u64, CompileResult)>, defer_gc
 
     for ((job, result), install) in finished.into_iter().zip(verdicts) {
         let memory = install.then(|| memories.next().expect("there is memory for each installed code"));
-        finish_compile(vm, job.executable, result, memory, job.snapshot_executables, defer_gc);
+        finish_compile(
+            vm,
+            job.executable,
+            result,
+            memory,
+            job.snapshot_executables,
+            job.sample_slots,
+            defer_gc,
+        );
     }
 }

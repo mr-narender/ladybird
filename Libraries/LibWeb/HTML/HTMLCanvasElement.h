@@ -13,7 +13,6 @@
 #include <LibWeb/HTML/Canvas/CanvasHost.h>
 #include <LibWeb/HTML/Canvas/CanvasSettings.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/WebGL/WebGLContextAttributes.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
@@ -53,7 +52,6 @@ public:
         Yes,
     };
     HasOrCreatedContext create_2d_context(CanvasRenderingContext2DSettings);
-    HasOrCreatedContext create_webgl_context(WebGL::WebGLContextAttributes);
     RenderingContext const& context() const { return m_context; }
 
     WebIDL::UnsignedLong width() const;
@@ -87,8 +85,6 @@ public:
     Optional<Gfx::IntSize> canvas_surface_content_size() const;
 
     void ensure_backing_storage();
-
-    void notify_compositor_connection_lost();
 
 private:
     HTMLCanvasElement(DOM::Document&, DOM::QualifiedName);
