@@ -509,10 +509,7 @@ pub(super) fn create_arguments_object(vm: &Vm, frame: &ExecutionContext, mapped:
         function,
         ecmascript_function.mapped_argument_names(),
         passed_arguments,
-        frame
-            .variable_environment
-            .get()
-            .expect("a function runs in an environment"),
+        frame.variable_environment().expect("a function runs in an environment"),
     ))
 }
 
@@ -679,7 +676,7 @@ pub(super) fn exit(vm: &Vm, root: NonNull<ExecutionContext>, code: &JitCode, ind
             vm.head.running_execution_context.get(),
             frame_of(root).caller_frame.get()
         );
-        vm.head.running_execution_context.set(root.as_ptr());
+        vm.set_running_frame_in_current_realm(root.as_ptr());
     }
     let compiled_executable = executable_of(frame_of(root));
     assert!(core::ptr::eq(
@@ -915,7 +912,7 @@ pub(super) fn materialize_call_site_frames(
                 .wrapping_sub(site.inlined_frame_bytes() as usize),
         );
     }
-    vm.head.running_execution_context.set(root.as_ptr());
+    vm.set_running_frame_in_current_realm(root.as_ptr());
 
     // NB: Nothing may collect the objects created here before the frames hold them.
     let defer_gc = DeferGc::new(vm);
@@ -941,7 +938,7 @@ pub(super) fn materialize_call_site_frames(
         callee_ref.caller_frame.set(innermost.as_ptr());
         callee_ref.caller_return_pc.set(linkage.return_pc);
         callee_ref.caller_dst_raw.set(linkage.dst);
-        vm.head.running_execution_context.set(running);
+        vm.set_running_frame_in_current_realm(running);
         stack.top.set(top);
     }
     innermost

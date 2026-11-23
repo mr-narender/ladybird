@@ -34,6 +34,7 @@
 #include <LibJS/Console.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Iterator.h>
+#include <LibJS/Runtime/NativeFunction.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/Origin.h>
 #include <LibURL/Parser.h>
@@ -466,7 +467,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         auto realm_execution_context = HTML::create_window_realm(window, *browsing_context, agent_cluster_cross_origin_isolation_mode);
 
         // 6. Set window to the global object of realmExecutionContext's Realm component.
-        window = HTML::window_from_global_object(realm_execution_context->realm->global_object());
+        window = HTML::window_from_global_object(realm_execution_context->realm()->global_object());
         VERIFY(window);
 
         // 7. Let topLevelCreationURL be creationURL.
@@ -1064,6 +1065,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_first_base_element_with_target_in_tree_order);
     visitor.visit(m_parser);
     visitor.visit(m_lazy_load_intersection_observer);
+    visitor.visit(m_video_viewport_intersection_observer);
     visitor.visit(m_visual_viewport);
     visitor.visit(m_named_timelines);
     visitor.visit(m_scripts_to_execute_when_parsing_has_finished);
@@ -1203,10 +1205,17 @@ void Document::invalidate_content_blocker_style_sheet()
 
 bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf16FlyString const* id, ReadonlySpan<Utf16FlyString> class_names)
 {
-    if (is_decoded_svg() || !content_blocking_enabled())
+    if (is_decoded_svg() || !m_content_blocker_style_sheet.has_value())
         return false;
 
-    if (!m_content_blocker_style_sheet.has_value())
+    // OPTIMIZATION: Most tokens have been checked already, which is cheaper to tell than whether content blocking is
+    //               enabled, so the policy is asked only once a token turns out to be new.
+    auto is_new_token = [](Utf16FlyString const& token, HashTable<Utf16FlyString> const& checked_tokens) {
+        return !token.is_empty() && !checked_tokens.contains(token);
+    };
+    auto has_new_token = (id && is_new_token(*id, m_content_blocker_style_sheet_checked_ids))
+        || any_of(class_names, [&](auto const& class_name) { return is_new_token(class_name, m_content_blocker_style_sheet_checked_classes); });
+    if (!has_new_token || !content_blocking_enabled())
         return false;
 
     Vector<Utf16FlyString> classes_to_check;
@@ -1221,9 +1230,6 @@ bool Document::content_blocker_style_sheet_may_need_refresh_for_class_or_id(Utf1
 
     for (auto const& class_name : class_names)
         append_new_token(class_name, m_content_blocker_style_sheet_checked_classes, classes_to_check);
-
-    if (classes_to_check.is_empty() && ids_to_check.is_empty())
-        return false;
 
     return ContentBlocker::the().has_generic_cosmetic_selectors_for_url(fallback_base_url(), classes_to_check, ids_to_check);
 }
@@ -3909,7 +3915,7 @@ WebIDL::ExceptionOr<GC::Ref<Event>> Document::create_event(Utf16FlyString const&
     } else if (interface.equals_ignoring_ascii_case("compositionevent"sv)) {
         event = UIEvents::CompositionEvent::create(String {}, {}, time_stamp);
     } else if (interface.equals_ignoring_ascii_case("customevent"sv)) {
-        event = CustomEvent::create(FlyString {}, {}, time_stamp);
+        event = create_custom_event(realm);
     } else if (interface.equals_ignoring_ascii_case("devicemotionevent"sv)) {
         event = Event::create(FlyString {}, time_stamp); // FIXME: Create DeviceMotionEvent
     } else if (interface.equals_ignoring_ascii_case("deviceorientationevent"sv)) {
@@ -3928,7 +3934,7 @@ WebIDL::ExceptionOr<GC::Ref<Event>> Document::create_event(Utf16FlyString const&
     } else if (interface.equals_ignoring_ascii_case("keyboardevent"sv)) {
         event = UIEvents::KeyboardEvent::create(Utf16FlyString {}, {}, time_stamp);
     } else if (interface.equals_ignoring_ascii_case("messageevent"sv)) {
-        event = HTML::MessageEvent::create(FlyString {}, time_stamp);
+        event = HTML::create_message_event(realm);
     } else if (interface.equals_ignoring_ascii_case("mouseevent"sv)
         || interface.equals_ignoring_ascii_case("mouseevents"sv)) {
         event = UIEvents::MouseEvent::create(FlyString {}, UIEvents::MouseEventOptions {}, 0, 0, 0, 0, time_stamp);
@@ -5075,9 +5081,9 @@ void Document::queue_navigation_timing_entry()
 
 void Document::begin_smil_time_container_once_loaded(SVG::SMILTimeContainer& time_container)
 {
-    // The timeline of an SVG document fragment should begin when the load event for its outermost svg element is
-    // triggered, but that event is not fired. Like Blink, begin the timeline once the document has completely loaded
-    // instead, or right away for a fragment that is inserted after that.
+    // AD-HOC: The timeline of an SVG document fragment should begin when the load event for its outermost svg element
+    //         is triggered. Begin it once the document has completely loaded instead, which comes after that event,
+    //         or right away for a fragment that is inserted after that.
     if (is_completely_loaded()) {
         time_container.begin();
         return;
@@ -7907,6 +7913,42 @@ void Document::stop_intersection_observing_a_lazy_loading_element(Element& eleme
     m_lazy_load_intersection_observer->unobserve(element);
 }
 
+void Document::start_observing_video_viewport_intersection(HTML::HTMLVideoElement& video)
+{
+    VERIFY(&video.document() == this);
+    if (!m_video_viewport_intersection_observer) {
+        auto options = IntersectionObserver::IntersectionObserverOptions {};
+        // Videos start decoding a little before they scroll into view, so that their frames are ready when they do.
+        options.root_margin = "250px"_utf16;
+
+        // The sinks read the observations themselves, in the rendering update that made them.
+        auto& realm = relevant_settings_object().realm();
+        auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, GC::create_function(GC::Heap::the(), [](JS::VM&) -> JS::ThrowCompletionOr<JS::Value> {
+            return JS::js_undefined();
+        }));
+        auto wrapped_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(callback, realm);
+        m_video_viewport_intersection_observer = IntersectionObserver::IntersectionObserver::create_with_implicit_root_document(wrapped_callback, options, *this).release_value_but_fixme_should_propagate_errors();
+    }
+    m_video_viewport_intersection_observer->observe(video);
+}
+
+void Document::stop_observing_video_viewport_intersection(HTML::HTMLVideoElement& video)
+{
+    if (m_video_viewport_intersection_observer)
+        m_video_viewport_intersection_observer->unobserve(video);
+}
+
+bool Document::video_intersects_viewport(HTML::HTMLVideoElement const& video) const
+{
+    if (!m_video_viewport_intersection_observer)
+        return false;
+    for (auto const& observation_target : m_video_viewport_intersection_observer->observation_targets()) {
+        if (observation_target.target.ptr().ptr() == &video)
+            return observation_target.previous_is_intersecting;
+    }
+    return false;
+}
+
 void Document::process_lazy_load_intersection_observer_entries(ReadonlySpan<GC::Ref<IntersectionObserver::IntersectionObserverEntry>> entries)
 {
     // For each entry in entries using a method of iteration which does not
@@ -8680,6 +8722,12 @@ struct CompositorAnimationUpdatePass {
     GC::RootHashTable<GC::Ref<Element>> elements_with_visibility_observation_descendants;
     Vector<Compositing::RustFFI::NodeSlotId> layout_nodes_with_stale_forced_effects_layer;
     Vector<Compositing::RustFFI::NodeSlotId> layout_nodes_with_stale_forced_background_color_frame;
+    // OPTIMIZATION: The slot indices of the stale lists above, and of the frames this pass kept, so that keeping a
+    //               frame does not scan the lists. A stale frame that this pass kept is no longer stale.
+    HashTable<u32> stale_forced_effects_layer_slots;
+    HashTable<u32> stale_forced_background_color_frame_slots;
+    HashTable<u32> kept_effects_layer_slots;
+    HashTable<u32> kept_background_color_frame_slots;
     // The target the keyframes of the compositor animation being built resolve their values against.
     Optional<AbstractElement> keyframe_target;
 
@@ -8700,9 +8748,24 @@ struct CompositorAnimationUpdatePass {
         return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? document->m_layout_nodes_with_forced_compositor_effects_layer : document->m_layout_nodes_with_forced_compositor_background_color_frame;
     }
 
-    Vector<Compositing::RustFFI::NodeSlotId>& stale_forced_frames(Animations::RustFFI::FfiCompositorFrameKind kind)
+    HashTable<u32>& stale_forced_frame_slots(Animations::RustFFI::FfiCompositorFrameKind kind)
     {
-        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? layout_nodes_with_stale_forced_effects_layer : layout_nodes_with_stale_forced_background_color_frame;
+        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? stale_forced_effects_layer_slots : stale_forced_background_color_frame_slots;
+    }
+
+    HashTable<u32>& kept_frame_slots(Animations::RustFFI::FfiCompositorFrameKind kind)
+    {
+        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? kept_effects_layer_slots : kept_background_color_frame_slots;
+    }
+
+    void take_forced_frames_as_stale()
+    {
+        layout_nodes_with_stale_forced_effects_layer = move(document->m_layout_nodes_with_forced_compositor_effects_layer);
+        layout_nodes_with_stale_forced_background_color_frame = move(document->m_layout_nodes_with_forced_compositor_background_color_frame);
+        for (auto slot : layout_nodes_with_stale_forced_effects_layer)
+            stale_forced_effects_layer_slots.set(slot.index);
+        for (auto slot : layout_nodes_with_stale_forced_background_color_frame)
+            stale_forced_background_color_frame_slots.set(slot.index);
     }
 
     bool transform_subtree_is_clipped_outside(Element const& animated_target, CSSPixelRect const& root_bounds, IntersectionObserver::IntersectionObserver const* observer = nullptr, Layout::Node const* intersection_root = nullptr) const
@@ -8782,19 +8845,14 @@ struct CompositorAnimationUpdatePass {
     static void keep_frame(void* context, Compositing::RustFFI::NodeSlotId slot, Animations::RustFFI::FfiCompositorFrameKind kind)
     {
         auto& pass = of(context);
-        auto& forced = pass.forced_frames(kind);
-        if (!any_of(forced, [&](auto forced_slot) { return forced_slot.index == slot.index; }))
-            forced.append(slot);
-        pass.stale_forced_frames(kind).remove_first_matching([&](auto stale_slot) {
-            return stale_slot.index == slot.index;
-        });
+        if (pass.kept_frame_slots(kind).set(slot.index) == HashSetResult::InsertedNewEntry)
+            pass.forced_frames(kind).append(slot);
     }
 
     static bool frame_was_kept(void* context, Compositing::RustFFI::NodeSlotId slot, Animations::RustFFI::FfiCompositorFrameKind kind)
     {
-        return any_of(of(context).stale_forced_frames(kind), [&](auto stale_slot) {
-            return stale_slot.index == slot.index;
-        });
+        auto& pass = of(context);
+        return pass.stale_forced_frame_slots(kind).contains(slot.index) && !pass.kept_frame_slots(kind).contains(slot.index);
     }
 
     static void refresh_viewport_mapping(void* context)
@@ -9164,8 +9222,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     CompositorAnimationUpdatePass pass { *this, read };
     pass.viewport_mapping = Painting::viewport_mapping(*this);
     paint_state().begin_compositor_animation_update();
-    pass.layout_nodes_with_stale_forced_effects_layer = move(m_layout_nodes_with_forced_compositor_effects_layer);
-    pass.layout_nodes_with_stale_forced_background_color_frame = move(m_layout_nodes_with_forced_compositor_background_color_frame);
+    pass.take_forced_frames_as_stale();
 
     auto index_shadow_including_element_ancestors = [](Node& node, GC::RootHashTable<GC::Ref<Element>>& index) {
         for (auto* ancestor = &node; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
@@ -9233,6 +9290,8 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     }
 
     for (auto stale_slot : pass.layout_nodes_with_stale_forced_effects_layer) {
+        if (pass.kept_effects_layer_slots.contains(stale_slot.index))
+            continue;
         auto* layout_node = layout_node_arena().node_if_live(read, stale_slot);
         if (!layout_node)
             continue;
@@ -9243,6 +9302,8 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         Painting::repaint_after_style_change(*layout_node, invalidation);
     }
     for (auto stale_slot : pass.layout_nodes_with_stale_forced_background_color_frame) {
+        if (pass.kept_background_color_frame_slots.contains(stale_slot.index))
+            continue;
         auto* layout_node = layout_node_arena().node_if_live(read, stale_slot);
         if (!layout_node)
             continue;
@@ -12066,12 +12127,12 @@ GC::Ref<HTML::DOMStringList> Document::ancestor_origins_list_creation_steps() co
     VERIFY(ancestor_origins.has_value());
 
     // 3. Let output be « ».
-    Vector<String> output;
+    Vector<Utf16String> output;
 
     // 4. For each origin of ancestorOrigins:
     for (auto const& origin : ancestor_origins.value()) {
         // 1. Append the serialization of origin to output.
-        output.append(origin.serialize());
+        output.append(Utf16String::from_utf8(origin.serialize()));
     }
 
     // 5. Return a new DOMStringList object whose associated list is output.

@@ -18,21 +18,22 @@
 use super::wire::plan_holds_more_than_compositor_decodes;
 use super::{
     BandOfPlan, BarrierCut, BarrierOfPlan, CutOfPlan, LayerIndex, LayerStack, LayeredPlan, LayeringObstacles,
-    MAXIMUM_MEDIA_LAYER_COUNT, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeOfPlan, PlacementNodeIndex,
-    WhyCompositorCannotCompositeEffect, WhyListIsOneLayer, media_name,
+    MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeOfPlan, PlacementNodeIndex, WhyCompositorCannotCompositeEffect,
+    WhyListIsOneLayer, maximum_layer_count_of_live_content_like, media_name,
 };
 use crate::display_list::animated_transform_spaces::{effect_reads_below_it, spatial_nodes_under_transform_animations};
-use crate::display_list::commands::{DisplayListCommandType, EffectNodeIndex, SpatialNodeIndex};
+use crate::display_list::builder::{bounding_rect_computed_from_payload, record_can_paint_within};
+use crate::display_list::commands::{EffectNodeIndex, SpatialNodeIndex};
 use crate::display_list::effect_geometry::{
     FiltersOfEffects, KeyframeFiltersOfEffects, backdrop_filter_read_reach, filter_may_spread_at_some_sample,
     filter_read_reach_in_device_pixels,
 };
 use crate::display_list::placement::{
-    CompositeClip, FiltersAndClipsOfList, RasterSpace, RasterSpaceAnchorKind, RasterSpaceGeometry, RasterSpaceIndex,
-    RunGroupIndex, RunGroups, enclosing_int_rect_within_extent_limit, is_finite_rect,
+    ANTIALIASING_MARGIN_IN_DEVICE_PIXELS, CompositeClip, FiltersAndClipsOfList, RasterSpace, RasterSpaceAnchorKind,
+    RasterSpaceIndex, RunGroupIndex, RunGroups, enclosing_int_rect_within_extent_limit, is_finite_rect,
 };
 use crate::display_list::reach::Reach;
-use crate::display_list::storage::{DisplayListStorage, ListPosition, ListSpan, RunIndexInList};
+use crate::display_list::storage::{DisplayListStorage, ListPosition, ListSpan, RunIndexInChunk, RunIndexInList};
 use crate::display_list::summary::{IndexedRecord, LiveContent};
 use crate::display_list::tiles::{CellRange, reaches_too_many_cells_to_follow_one_by_one, tile_coords_touching};
 use crate::visual_context::queries::{BackdropReader, NestingOfLiveEffects, backdrop_reader_by_reading_effect_index};
@@ -70,6 +71,7 @@ pub enum WhyAnimationHasNoLayer {
     ItsFilterSpreadsWhatItFilters,
     ItHoldsAnEffectThatReadsWhatIsBelowIt,
     ItHoldsRecordsThatBlendWithWhatIsBelowThem,
+    ALaterEffectReadsItAsBackdrop,
     SortedByDepthInA3DSortingContext,
     NothingBoundsWhereItMoves,
     ItCanShowOverAnEarlierCanvasOrVideo,
@@ -89,6 +91,7 @@ impl std::fmt::Display for WhyAnimationHasNoLayer {
             WhyAnimationHasNoLayer::ItHoldsRecordsThatBlendWithWhatIsBelowThem => {
                 "it holds records that blend with what is below them"
             }
+            WhyAnimationHasNoLayer::ALaterEffectReadsItAsBackdrop => "a later effect reads it as backdrop",
             WhyAnimationHasNoLayer::SortedByDepthInA3DSortingContext => "sorted by depth in a 3D sorting context",
             WhyAnimationHasNoLayer::NothingBoundsWhereItMoves => "nothing bounds where it moves",
             WhyAnimationHasNoLayer::ItCanShowOverAnEarlierCanvasOrVideo => {
@@ -107,6 +110,8 @@ pub enum WhyMediaHasNoLayer {
     MoreMediaThanLayersFor,
     SortedByDepthInA3DSortingContext,
     InsideAnEffectTheCompositorCannotComposite(WhyCompositorCannotCompositeEffect),
+    InsideAnEffectThatPushesALayerAtReplay,
+    MovesWithinItsSpace,
 }
 
 impl std::fmt::Display for WhyMediaHasNoLayer {
@@ -120,6 +125,10 @@ impl std::fmt::Display for WhyMediaHasNoLayer {
             WhyMediaHasNoLayer::InsideAnEffectTheCompositorCannotComposite(why) => {
                 return write!(formatter, "inside a {why}");
             }
+            WhyMediaHasNoLayer::InsideAnEffectThatPushesALayerAtReplay => {
+                "inside an effect that pushes a layer at replay"
+            }
+            WhyMediaHasNoLayer::MovesWithinItsSpace => "moves within its space",
         })
     }
 }
@@ -155,6 +164,14 @@ impl std::fmt::Display for WhyEffectIsComposited {
             }
         })
     }
+}
+
+// A backdrop reader that a composited effect painted before it, within its group, would get composited.
+struct BackdropReaderAnAnimationMayCut {
+    reader: EffectNodeIndex,
+    backdrop_root: EffectNodeIndex,
+    first_run_index: usize,
+    read_tiles: Reach<IntRect>,
 }
 
 /// A plan of the layers of a list: the stack the compositor composites frames from, and where the parts of the list
@@ -275,7 +292,7 @@ pub struct PlacedEffect {
     pub why_composited_regardless_of_layer_content: Option<WhyEffectIsComposited>,
 }
 
-/// A canvas, video or nested context that is a layer of its own, alone in its run.
+/// Live content that is a layer of its own, alone in its run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacedMedia {
     pub content: LiveContent,
@@ -285,6 +302,10 @@ pub struct PlacedMedia {
     pub run_index: RunIndexInList,
     /// Where it can show, in the raster coordinates of the space of its run's group.
     pub reach: IntRect,
+    /// Whether a record painted after it can show where it can, so that it cuts the tiles it touches. Where none can, it
+    /// cuts none, and the records of its band painted after it stay in the layers below it, such as the base layer,
+    /// where text takes LCD antialiasing.
+    pub cuts_band: bool,
 }
 
 /// Where each part of a list is placed at the spaces a tree offers, under the values a frame shows. What it decides
@@ -898,10 +919,9 @@ impl<'a> ListBeingPlaced<'a> {
                 Some(WhyMediaHasNoLayer::SortedByDepthInA3DSortingContext)
             } else {
                 self.why_media_has_no_layer(
-                    &self.geometries[self.space_of_run(runs, run_index as usize).0].raster,
-                    run_index,
-                    record_position,
-                    runs.reach_of_run_by_run_index[run_index as usize],
+                    runs,
+                    content,
+                    record,
                     spatial_node_is_under_transform_animation_leaving_plane
                         .get(list.run(run_index as usize).context.spatial.0 as usize)
                         .copied()
@@ -913,28 +933,41 @@ impl<'a> ListBeingPlaced<'a> {
                     let record_span = list.span_of_run(run_index as usize);
                     debug_assert_eq!(
                         record_position, record_span.begin,
-                        "a canvas, video or nested context is alone in its run"
+                        "live content with a layer is alone in its run"
                     );
+                    let reach = runs.reach_of_run_by_run_index[run_index as usize];
                     placed_media.push(PlacedMedia {
                         content,
                         ordinal: 0,
                         record_span,
                         run_index: RunIndexInList(run_index),
-                        reach: runs.reach_of_run_by_run_index[run_index as usize],
+                        reach,
+                        cuts_band: self.record_painted_after_can_show_over(runs, run_index as usize, reach),
                     });
                 }
                 Some(why_no_layer) => media_without_layers.push((content, why_no_layer)),
             }
         }
-        if placed_media.len() > MAXIMUM_MEDIA_LAYER_COUNT {
-            let nested_contexts_after_canvases_and_videos =
-                |media: &PlacedMedia| matches!(media.content, LiveContent::CompositedContext(_));
-            placed_media.sort_by_key(nested_contexts_after_canvases_and_videos);
-            for media_past_limit in placed_media.drain(MAXIMUM_MEDIA_LAYER_COUNT..) {
-                media_without_layers.push((media_past_limit.content, WhyMediaHasNoLayer::MoreMediaThanLayersFor));
+        // Past the most layers that live content of its kind gets, canvases and videos keep theirs before nested
+        // contexts, and carets before scroll bars.
+        let gives_way_to_others_of_its_kind = |media: &PlacedMedia| {
+            matches!(
+                media.content,
+                LiveContent::CompositedContext(_) | LiveContent::ScrollBar { .. }
+            )
+        };
+        placed_media.sort_by_key(gives_way_to_others_of_its_kind);
+        let mut layer_count_by_kind = [0usize; 2];
+        placed_media.retain(|media| {
+            let layer_count = &mut layer_count_by_kind[usize::from(media.content.is_drawn_by_its_record())];
+            *layer_count += 1;
+            let gets_layer = *layer_count <= maximum_layer_count_of_live_content_like(media.content);
+            if !gets_layer {
+                media_without_layers.push((media.content, WhyMediaHasNoLayer::MoreMediaThanLayersFor));
             }
-            placed_media.sort_by_key(|media| media.record_span.begin);
-        }
+            gets_layer
+        });
+        placed_media.sort_by_key(|media| media.record_span.begin);
         for index in 0..placed_media.len() {
             placed_media[index].ordinal = placed_media[..index]
                 .iter()
@@ -945,36 +978,84 @@ impl<'a> ListBeingPlaced<'a> {
     }
 
     // Under a transform animation that leaves the plane, a sample can draw the media through a matrix that is not 2D
-    // affine, whatever the tree holds.
+    // affine, whatever the tree holds. A caret or a scroll bar does not get the effects around it composited, as other
+    // live content does: it has no layer inside an effect that a replay draws into a layer of its own.
     fn why_media_has_no_layer(
         &self,
-        geometry: &RasterSpaceGeometry,
-        run_index: u32,
-        media_record_position: ListPosition,
-        reach_of_run_holding_only_media: IntRect,
+        runs: &RunGroupsPlaced,
+        content: LiveContent,
+        record: IndexedRecord,
         is_under_transform_animation_leaving_plane: bool,
     ) -> Option<WhyMediaHasNoLayer> {
-        let (header, _) = self.list.record_at(media_record_position);
-        if !matches!(
-            header.command_type,
-            DisplayListCommandType::DrawCanvas
-                | DisplayListCommandType::DrawVideoFrame
-                | DisplayListCommandType::DrawCompositedContext
-        ) {
+        let run_index = record.run_index as usize;
+        let (header, _) = self.list.record_at(record.position);
+        // Live content nested in another command is noted at the top-level record around it.
+        if !header.command_type.is_alone_in_its_run() {
             return Some(WhyMediaHasNoLayer::DrawnInsideAnotherCommand);
         }
-        let run = self.list.run(run_index as usize);
+        let run = self.list.run(run_index);
+        let geometry = &self.geometries[self.space_of_run(runs, run_index).0].raster;
         if is_under_transform_animation_leaving_plane || !geometry.world.draw_matrix(run.context.spatial).is_2d_affine()
         {
             return Some(WhyMediaHasNoLayer::UnderTransformThatIsNot2DAffine);
         }
-        if let Some(why) = self.why_compositor_cannot_composite_effect_or_effects_around(run.context.effect) {
+        if content.is_drawn_by_its_record() {
+            if !self
+                .tree
+                .content_under_effect_composites_into_root_group(run.context.effect)
+            {
+                return Some(WhyMediaHasNoLayer::InsideAnEffectThatPushesALayerAtReplay);
+            }
+            // Its reach is then wherever its fixed clips let it show.
+            if runs.run_moves_within_space_by_run_index[run_index] {
+                return Some(WhyMediaHasNoLayer::MovesWithinItsSpace);
+            }
+        } else if let Some(why) = self.why_compositor_cannot_composite_effect_or_effects_around(run.context.effect) {
             return Some(WhyMediaHasNoLayer::InsideAnEffectTheCompositorCannotComposite(why));
         }
-        if reach_of_run_holding_only_media.is_empty() {
+        if runs.reach_of_run_by_run_index[run_index].is_empty() {
             return Some(WhyMediaHasNoLayer::DrawsNothingVisible);
         }
         None
+    }
+
+    // Whether a record painted after the media alone in run `run_index`, which can show within `reach`, can show where
+    // the media can, so that the media cuts the tiles of its band that it touches. Records of other spaces go into
+    // other bands. A record of a run on the same spatial node can show where its bounds meet those of the media, and
+    // one of a run on another node wherever its run can.
+    fn record_painted_after_can_show_over(&self, runs: &RunGroupsPlaced, run_index: usize, reach: IntRect) -> bool {
+        let list = self.list;
+        let space = self.space_of_run(runs, run_index);
+        let spatial = list.run(run_index).context.spatial;
+        let (header, payload) = list.record_at(list.span_of_run(run_index).begin);
+        let Some(bounds) = bounding_rect_computed_from_payload(&header, payload) else {
+            return true;
+        };
+        let margin = ANTIALIASING_MARGIN_IN_DEVICE_PIXELS;
+        let bounds = bounds.inflated_edges(margin, margin, margin, margin);
+        (run_index + 1..list.run_count()).any(|later_run_index| {
+            if self.space_of_run(runs, later_run_index) != space
+                || runs.reach_of_run_by_run_index[later_run_index]
+                    .intersected(reach)
+                    .is_empty()
+            {
+                return false;
+            }
+            if list.run(later_run_index).context.spatial != spatial {
+                return true;
+            }
+            let (chunk_index, run_index_in_chunk) = list.chunk_of_run(later_run_index);
+            let chunk = list.chunk(chunk_index);
+            let table = chunk.record_table();
+            table
+                .records_in(table.record_indices_of_run(RunIndexInChunk(run_index_in_chunk as u32)))
+                .iter()
+                .any(|record| {
+                    let (header, payload) = chunk.record_at(record.offset);
+                    !record.bounding_rect.intersected(bounds).is_empty()
+                        && record_can_paint_within(&header, payload, bounds)
+                })
+        })
     }
 
     fn effects_composited_regardless_of_layer_content(
@@ -1046,6 +1127,11 @@ impl<'a> ListBeingPlaced<'a> {
             }
         }
 
+        let later_backdrop_readers_once_worked_out = std::cell::OnceCell::new();
+        let later_backdrop_readers = || {
+            later_backdrop_readers_once_worked_out
+                .get_or_init(|| self.backdrop_readers_an_animation_may_cut(runs, placed_media))
+        };
         let what_effects_hold_once_worked_out = std::cell::OnceCell::new();
         let what_effects_hold = || {
             what_effects_hold_once_worked_out.get_or_init(|| {
@@ -1118,6 +1204,15 @@ impl<'a> ListBeingPlaced<'a> {
                 if animated_nodes_with_layers_count == MAXIMUM_ANIMATED_NODES_WITH_LAYERS {
                     return Some(WhyAnimationHasNoLayer::MoreAnimationsThanLayersFor);
                 }
+                // NB: This scans the backdrop readers, so it comes once the animation could still get a layer.
+                if self.later_effect_reads_as_backdrop(
+                    runs,
+                    effect,
+                    later_backdrop_readers(),
+                    &why_composited_regardless_of_layer_content.composited_effects,
+                ) {
+                    return Some(WhyAnimationHasNoLayer::ALaterEffectReadsItAsBackdrop);
+                }
                 None
             })();
             if let Some(why_no_layer) = why_no_layer {
@@ -1134,6 +1229,183 @@ impl<'a> ListBeingPlaced<'a> {
             );
         }
         why_composited_regardless_of_layer_content
+    }
+
+    /// Where the effect reads the backdrop it filters or blends with, and whether its backdrop filter reads nothing
+    /// past the edge it mirrors.
+    fn backdrop_read_reach(
+        &self,
+        runs: &RunGroupsPlaced,
+        effect: EffectNodeIndex,
+        backdrop_reader: BackdropReader,
+    ) -> (Reach<IntRect>, bool) {
+        let tree = self.tree;
+        let run_group = &runs.groups[self.run_group_of_effect(effect).0];
+        let geometry = &self.geometries[run_group.raster_space_index.0];
+        let reach_of_reading_effect = self.reach_of_effect(runs, effect);
+        match backdrop_reader.effect_with_backdrop_filter {
+            Some(effect_with_backdrop_filter) => {
+                let effect_node = &tree.effect_nodes[effect_with_backdrop_filter.0 as usize];
+                let EffectNodeData::Effects(effects) = &effect_node.data else {
+                    unreachable!("a backdrop filter belongs to an effects node");
+                };
+                let backdrop_filter = effects
+                    .backdrop_filter
+                    .as_ref()
+                    .expect("a reader with a backdrop filter has one");
+                // Where a transform the compositor animates moves or scales the backdrop filter within the
+                // space, a sample can read anywhere.
+                let backdrop_read_reach = if self
+                    .tables
+                    .animation_samples_move_spatial_within_space(effect_node.spatial, run_group.raster_space_index)
+                {
+                    Reach::Anywhere
+                } else if run_group.moves_within_space {
+                    filter_read_reach_in_device_pixels(
+                        &backdrop_filter.filter,
+                        &geometry.raster.world.draw_matrix(effect_node.spatial),
+                    )
+                    .map_or(Reach::Anywhere, |read_reach_in_device_pixels| {
+                        Reach::Within(run_group.reach.inflated_edges(
+                            read_reach_in_device_pixels,
+                            read_reach_in_device_pixels,
+                            read_reach_in_device_pixels,
+                            read_reach_in_device_pixels,
+                        ))
+                    })
+                } else {
+                    backdrop_filter_read_reach(tree, &geometry.raster, effect_with_backdrop_filter)
+                };
+                (
+                    backdrop_read_reach,
+                    backdrop_filter_reads_nothing_past_mirrored_edge(&backdrop_filter.filter),
+                )
+            }
+            None => (Reach::Within(reach_of_reading_effect), true),
+        }
+    }
+
+    /// The effect whose group the effect reads the backdrop within, or None where it reads the root group.
+    fn backdrop_root_of_reader(&self, effect: EffectNodeIndex) -> Option<EffectNodeIndex> {
+        let tree = self.tree;
+        let reading_effect_node = &tree.effect_nodes[effect.0 as usize];
+        if reading_effect_node.parent.is_none() {
+            return None;
+        }
+        tree.nearest_layer_at_or_above(reading_effect_node.parent)
+            .filter(|root| tree.root_isolation_effect != Some(*root))
+    }
+
+    // The backdrop readers that a layer of an animation could get composited: those that read within a group of their
+    // own, and that nothing but a composited effect painted before them would get composited, with the tiles they read.
+    fn backdrop_readers_an_animation_may_cut(
+        &self,
+        runs: &RunGroupsPlaced,
+        placed_media: &[PlacedMedia],
+    ) -> Vec<BackdropReaderAnAnimationMayCut> {
+        let list = self.list;
+        let mut readers = Vec::new();
+        for &reader in &self.effects_in_paint_order_with_outer_before_inner {
+            let Some(backdrop_reader) = self.backdrop_reader_by_effect_index[reader.0 as usize] else {
+                continue;
+            };
+            let Some(backdrop_root) = self.backdrop_root_of_reader(reader) else {
+                continue;
+            };
+            let (backdrop_read_reach, reads_nothing_past_mirrored_edge) =
+                self.backdrop_read_reach(runs, reader, backdrop_reader);
+            if !reads_nothing_past_mirrored_edge {
+                continue;
+            }
+            let read_tiles = match backdrop_read_reach {
+                Reach::Within(rect) => Reach::Within(CellRange::touched_by(rect).rect()),
+                backdrop_read_reach => backdrop_read_reach,
+            };
+            let first_run_index = self.first_run_index_by_effect_index[reader.0 as usize];
+            let read_tiles_cut_by_earlier_media = placed_media.iter().any(|media| {
+                let effect_of_media = list.run(media.run_index.0 as usize).context.effect;
+                (media.run_index.0 as usize) < first_run_index
+                    && self
+                        .nesting_of_live_effects
+                        .is_or_is_inside(effect_of_media, backdrop_root)
+                    && read_tiles.meets(Reach::Within(media.reach))
+            });
+            if read_tiles_cut_by_earlier_media {
+                continue;
+            }
+            readers.push(BackdropReaderAnAnimationMayCut {
+                reader,
+                backdrop_root,
+                first_run_index,
+                read_tiles,
+            });
+        }
+        readers
+    }
+
+    // Whether a composited effect cuts the tiles the reader reads, so that the reader reads what its own layer does not
+    // hold, as `note_backdrop_readers` works out.
+    fn composited_effect_cuts_read_tiles_of(
+        &self,
+        runs: &RunGroupsPlaced,
+        composited: EffectNodeIndex,
+        candidate: &BackdropReaderAnAnimationMayCut,
+    ) -> bool {
+        if composited == candidate.reader
+            || self.first_run_index_by_effect_index[composited.0 as usize] >= candidate.first_run_index
+            || !self
+                .nesting_of_live_effects
+                .is_strictly_inside(composited, candidate.backdrop_root)
+            || self
+                .nesting_of_live_effects
+                .is_strictly_inside(candidate.reader, composited)
+        {
+            return false;
+        }
+        let mut reach = self.reach_of_effect(runs, composited);
+        if let Some(backdrop_reader) = self.backdrop_reader_by_effect_index[composited.0 as usize]
+            && let Reach::Within(rect) = self.backdrop_read_reach(runs, composited, backdrop_reader).0
+        {
+            reach = reach.united(rect);
+        }
+        candidate.read_tiles.meets(Reach::Within(reach))
+    }
+
+    // A layer of an animation of the effect composites the effect and every effect around it that pushes a layer. A
+    // backdrop reader painted after the effect, and outside it, that reads where one of those reaches within its own
+    // group would then be composited for reading what its own layer does not hold, and so would every effect around it,
+    // as `note_backdrop_readers` works out. A reader composited already, or that an effect composited already cuts, is
+    // composited anyway.
+    fn later_effect_reads_as_backdrop(
+        &self,
+        runs: &RunGroupsPlaced,
+        effect: EffectNodeIndex,
+        later_backdrop_readers: &[BackdropReaderAnAnimationMayCut],
+        composited_effects: &[EffectNodeIndex],
+    ) -> bool {
+        let tree = self.tree;
+        let first_run_index = self.first_run_index_by_effect_index[effect.0 as usize];
+        later_backdrop_readers.iter().any(|candidate| {
+            if candidate.first_run_index <= first_run_index
+                || self.nesting_of_live_effects.is_or_is_inside(candidate.reader, effect)
+                || composited_effects.contains(&candidate.reader)
+                || composited_effects
+                    .iter()
+                    .any(|&composited| self.composited_effect_cuts_read_tiles_of(runs, composited, candidate))
+            {
+                return false;
+            }
+            let mut composited = effect;
+            while !composited.is_none() && tree.root_isolation_effect != Some(composited) {
+                if (composited == effect || tree.effect_pushes_layer_at_replay(composited))
+                    && self.composited_effect_cuts_read_tiles_of(runs, composited, candidate)
+                {
+                    return true;
+                }
+                composited = tree.effect_nodes[composited.0 as usize].parent;
+            }
+            false
+        })
     }
 
     // What each backdrop reader reads, in paint order, and whether it reads the root group. An effect that reads what
@@ -1153,58 +1425,11 @@ impl<'a> ListBeingPlaced<'a> {
             let Some(backdrop_reader) = self.backdrop_reader_by_effect_index[effect.0 as usize] else {
                 continue;
             };
-            let run_group = &runs.groups[self.run_group_of_effect(effect).0];
-            let geometry = &self.geometries[run_group.raster_space_index.0];
-            let reach_of_reading_effect = self.reach_of_effect(runs, effect);
             let (backdrop_read_reach, reads_nothing_past_mirrored_edge) =
-                match backdrop_reader.effect_with_backdrop_filter {
-                    Some(effect_with_backdrop_filter) => {
-                        let effect_node = &tree.effect_nodes[effect_with_backdrop_filter.0 as usize];
-                        let EffectNodeData::Effects(effects) = &effect_node.data else {
-                            unreachable!("a backdrop filter belongs to an effects node");
-                        };
-                        let backdrop_filter = effects
-                            .backdrop_filter
-                            .as_ref()
-                            .expect("a reader with a backdrop filter has one");
-                        // Where a transform the compositor animates moves or scales the backdrop filter within the
-                        // space, a sample can read anywhere.
-                        let backdrop_read_reach = if self.tables.animation_samples_move_spatial_within_space(
-                            effect_node.spatial,
-                            run_group.raster_space_index,
-                        ) {
-                            Reach::Anywhere
-                        } else if run_group.moves_within_space {
-                            filter_read_reach_in_device_pixels(
-                                &backdrop_filter.filter,
-                                &geometry.raster.world.draw_matrix(effect_node.spatial),
-                            )
-                            .map_or(Reach::Anywhere, |read_reach_in_device_pixels| {
-                                Reach::Within(run_group.reach.inflated_edges(
-                                    read_reach_in_device_pixels,
-                                    read_reach_in_device_pixels,
-                                    read_reach_in_device_pixels,
-                                    read_reach_in_device_pixels,
-                                ))
-                            })
-                        } else {
-                            backdrop_filter_read_reach(tree, &geometry.raster, effect_with_backdrop_filter)
-                        };
-                        (
-                            backdrop_read_reach,
-                            backdrop_filter_reads_nothing_past_mirrored_edge(&backdrop_filter.filter),
-                        )
-                    }
-                    None => (Reach::Within(reach_of_reading_effect), true),
-                };
+                self.backdrop_read_reach(runs, effect, backdrop_reader);
             backdrop_read_reach_by_effect_index[effect.0 as usize] = backdrop_read_reach;
             let reading_effect_node = &tree.effect_nodes[effect.0 as usize];
-            let backdrop_root = if reading_effect_node.parent.is_none() {
-                None
-            } else {
-                tree.nearest_layer_at_or_above(reading_effect_node.parent)
-                    .filter(|root| tree.root_isolation_effect != Some(*root))
-            };
+            let backdrop_root = self.backdrop_root_of_reader(effect);
             let why_composited = if !reads_nothing_past_mirrored_edge {
                 Some(WhyEffectIsComposited::ItsBackdropFilterReadsPastTheEdgeOfTheFrame)
             } else if let Some(backdrop_root) = backdrop_root {
@@ -1903,12 +2128,14 @@ impl StackBeingBuilt<'_> {
                         ordinal: media.ordinal,
                         record_span: media_stretch.record_span,
                         reach: media_stretch.reach,
+                        cuts_band: media.cuts_band,
                     };
-                    (
-                        barrier_of_plan,
-                        media_stretch.record_span.begin,
-                        Reach::Within(media_stretch.reach),
-                    )
+                    let cut_reach = if media.cuts_band {
+                        Reach::Within(media_stretch.reach)
+                    } else {
+                        Reach::Nothing
+                    };
+                    (barrier_of_plan, media_stretch.record_span.begin, cut_reach)
                 }
                 BarrierBeingBuilt::NestedNodeBand {
                     band_being_built_index: nested_band_being_built_index,
@@ -2284,14 +2511,18 @@ impl InputsOfLayerPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display_list::commands::{CanvasId, ContextRef};
+    use crate::display_list::commands::{CanvasId, ContextRef, FillRoundedRectRing};
     use crate::display_list::layers::{
-        CutsOfCell, LayerIdentity, NodeNamesFromIndices, WindowServerPresentationOfMedia, media_name,
+        BarrierCut, BarrierIdentity, CutsOfCell, LayerIdentity, NodeNamesFromIndices, WindowServerPresentationOfMedia,
+        media_name,
+    };
+    use crate::display_list::layers::{
+        MAXIMUM_LAYER_COUNT_OF_LIVE_CONTENT_DRAWN_BY_ITS_RECORD, MAXIMUM_MEDIA_LAYER_COUNT,
     };
     use crate::display_list::test_fixtures::{
-        GREEN, ListOfOneChunk, VIEWPORT, animation_of, canvas, effects, fill, frosted_glass, opacity_animation_of,
-        scroll_node, scroll_record, spinning, transform, transform_animation_of, tree_with_document_scroll,
-        tree_with_root_isolation_effect,
+        GREEN, ListOfOneChunk, VIEWPORT, animation_of, canvas, caret, effects, fill, frosted_glass,
+        opacity_animation_of, scroll_bar, scroll_node, scroll_record, spinning, transform, transform_animation_of,
+        tree_with_document_scroll, tree_with_document_scroller, tree_with_root_isolation_effect,
     };
     use crate::display_list::tiles::TILE_SIZE_IN_DEVICE_PIXELS;
     use crate::node_slot_id::NodeSlotId;
@@ -2734,6 +2965,258 @@ mod tests {
         );
     }
 
+    // The cut of the band at the layer of the first drawing of `content`.
+    fn cut_of_media<'a>(stack: &'a LayerStack, content: LiveContent) -> &'a BarrierCut {
+        stack
+            .bands
+            .iter()
+            .flat_map(|band| &band.cuts)
+            .find(|cut| {
+                matches!(stack.layers[cut.layer_above_cut.0 - 1].identity,
+                    LayerIdentity::Media { content: layer_content, .. } if layer_content == content)
+            })
+            .expect("the media is a barrier of a band")
+    }
+
+    #[test]
+    fn a_caret_gets_a_layer_of_its_own() {
+        let (tree, _, document) = tree_with_document_scroll();
+        let planned = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(20, 20, 2, 16)), document)
+            .planned(&tree, &[]);
+        assert!(planned.placement.media_without_layers.is_empty());
+        assert_eq!(
+            kinds_of_layers_from_base_up_that_may_hold_content(&planned.stack),
+            ["base document band 0", "caret #0 document"]
+        );
+    }
+
+    #[test]
+    fn records_painted_after_a_caret_go_above_it_in_the_tiles_it_touches() {
+        let (tree, _, document) = tree_with_document_scroll();
+        let stack = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(20, 20, 2, 16)), document)
+            .with(fill(IntRect::new(10, 10, 100, 40), GREEN), document)
+            .with(fill(IntRect::new(10, 1500, 100, 40), GREEN), document)
+            .stack(&tree, &[]);
+        assert_eq!(
+            kinds_of_layers_from_base_up_that_may_hold_content(&stack),
+            [
+                "base document band 0",
+                "caret #0 document",
+                "painted document band 0 above L2"
+            ]
+        );
+        let layer_above_caret = stack
+            .layers
+            .iter()
+            .find(|layer| {
+                matches!(
+                    layer.identity,
+                    LayerIdentity::Painted {
+                        above_barrier: Some(BarrierIdentity::Media {
+                            content: LiveContent::Caret,
+                            ..
+                        }),
+                        ..
+                    }
+                )
+            })
+            .expect("a layer is above the caret");
+        assert!(
+            crate::display_list::tiles::TileCoord::new(0, 0)
+                .cell_rect()
+                .contains_rect(layer_above_caret.reach),
+            "only the records in the tiles the caret touches go above it"
+        );
+    }
+
+    // Text painted after a caret that it does not overlap stays in the base layer, where it takes LCD antialiasing.
+    #[test]
+    fn records_painted_after_a_caret_that_cannot_show_where_it_can_stay_below_it() {
+        let (tree, _, document) = tree_with_document_scroll();
+        let stack = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(20, 20, 2, 16)), document)
+            .with(fill(IntRect::new(10, 100, 100, 40), GREEN), document)
+            .stack(&tree, &[]);
+        assert_eq!(
+            kinds_of_layers_from_base_up_that_may_hold_content(&stack),
+            ["base document band 0", "caret #0 document"]
+        );
+        assert_eq!(cut_of_media(&stack, LiveContent::Caret).cut_reach, Reach::Nothing);
+    }
+
+    // A focused text field draws its focus ring after its caret, around it.
+    #[test]
+    fn a_focus_ring_around_a_caret_keeps_text_painted_after_both_below_the_caret() {
+        let (tree, _, document) = tree_with_document_scroll();
+        let focus_ring = FillRoundedRectRing {
+            rect: IntRect::new(-2, -2, 74, 24),
+            corner_radii: libgfx_rust::CornerRadii::uniform(4),
+            top_width: 2,
+            right_width: 2,
+            bottom_width: 2,
+            left_width: 2,
+            color: GREEN,
+        };
+        let stack = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(19, 3, 1, 14)), document)
+            .with(focus_ring, document)
+            .with(fill(IntRect::new(0, 23, 24, 16), GREEN), document)
+            .stack(&tree, &[]);
+        assert_eq!(
+            kinds_of_layers_from_base_up_that_may_hold_content(&stack),
+            ["base document band 0", "caret #0 document"]
+        );
+    }
+
+    #[test]
+    fn a_focus_ring_whose_rounded_corner_can_show_over_a_caret_goes_above_it() {
+        let (tree, _, document) = tree_with_document_scroll();
+        let focus_ring = FillRoundedRectRing {
+            rect: IntRect::new(-2, -2, 74, 24),
+            corner_radii: libgfx_rust::CornerRadii::uniform(12),
+            top_width: 2,
+            right_width: 2,
+            bottom_width: 2,
+            left_width: 2,
+            color: GREEN,
+        };
+        let stack = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(4, 3, 1, 14)), document)
+            .with(focus_ring, document)
+            .stack(&tree, &[]);
+        assert_ne!(cut_of_media(&stack, LiveContent::Caret).cut_reach, Reach::Nothing);
+    }
+
+    #[test]
+    fn carets_are_numbered_by_the_carets_painted_before_them() {
+        let (tree, _, document) = tree_with_document_scroll();
+        let stack = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(20, 20, 2, 16)), document)
+            .with(caret(IntRect::new(20, 1000, 2, 16)), document)
+            .stack(&tree, &[]);
+        assert_eq!(
+            kinds_of_layers_from_base_up_that_may_hold_content(&stack),
+            ["base document band 0", "caret #0 document", "caret #1 document"]
+        );
+    }
+
+    // Unlike a canvas, a caret does not get the effects around it composited.
+    #[test]
+    fn a_caret_inside_an_opacity_group_stays_in_the_tiles_around_it() {
+        let (mut tree, _, document) = tree_with_document_scroll();
+        let faded = tree.append_effect_node_under(document, effects(0.5, CompositingAndBlendingOperator::Normal));
+        let planned = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(caret(IntRect::new(20, 20, 2, 16)), faded)
+            .planned(&tree, &[]);
+        assert!(planned.placement.placed_media.is_empty());
+        assert_eq!(
+            planned.placement.media_without_layers,
+            [(
+                LiveContent::Caret,
+                WhyMediaHasNoLayer::InsideAnEffectThatPushesALayerAtReplay
+            )]
+        );
+        assert!(planned.stack.composited_effects.is_empty());
+    }
+
+    #[test]
+    fn a_scroll_bar_gets_a_layer_of_its_own() {
+        let (tree, _, contexts) = tree_with_document_scroller(&[IntRect::new(100, 100, 300, 200)]);
+        let (document, scroller) = (contexts[0], contexts[1]);
+        let planned = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(fill(IntRect::new(100, 100, 300, 700), GREEN), scroller)
+            .with(scroll_bar(scroller.spatial, IntRect::new(390, 100, 10, 200)), document)
+            .planned(&tree, &[]);
+        assert!(planned.placement.media_without_layers.is_empty());
+        assert_eq!(
+            kinds_of_layers_from_base_up_that_may_hold_content(&planned.stack),
+            [
+                "base document band 0",
+                "painted scroller@s2 in document band 0",
+                "vertical scroll bar #0 document"
+            ]
+        );
+    }
+
+    // Carets and scroll bars get layers past the most canvases, videos and nested contexts that do, and past the most
+    // carets and scroll bars that get layers, carets keep theirs.
+    #[test]
+    fn carets_and_scroll_bars_count_against_a_limit_of_their_own() {
+        let (tree, _, contexts) = tree_with_document_scroller(&[IntRect::new(100, 100, 300, 200)]);
+        let (document, scroller) = (contexts[0], contexts[1]);
+        let mut list = ListOfOneChunk::default().with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document);
+        for index in 0..MAXIMUM_MEDIA_LAYER_COUNT {
+            list = list.with(
+                canvas(IntRect::new(10 + index as i32 * 60, 1000, 50, 50), index as u64 + 1),
+                document,
+            );
+        }
+        for index in 0..MAXIMUM_LAYER_COUNT_OF_LIVE_CONTENT_DRAWN_BY_ITS_RECORD as i32 {
+            list = list.with(
+                scroll_bar(scroller.spatial, IntRect::new(10 + index * 12, 100, 10, 200)),
+                document,
+            );
+        }
+        let planned = list
+            .with(caret(IntRect::new(20, 400, 2, 16)), document)
+            .planned(&tree, &[]);
+        let placed_count = |is_of_kind: fn(&LiveContent) -> bool| {
+            planned
+                .placement
+                .placed_media
+                .iter()
+                .filter(|media| is_of_kind(&media.content))
+                .count()
+        };
+        assert_eq!(
+            placed_count(|content| matches!(content, LiveContent::Canvas(_))),
+            MAXIMUM_MEDIA_LAYER_COUNT
+        );
+        assert_eq!(placed_count(|content| *content == LiveContent::Caret), 1);
+        assert_eq!(
+            placed_count(|content| matches!(content, LiveContent::ScrollBar { .. })),
+            MAXIMUM_LAYER_COUNT_OF_LIVE_CONTENT_DRAWN_BY_ITS_RECORD - 1
+        );
+        assert_eq!(
+            planned.placement.media_without_layers,
+            [(
+                LiveContent::ScrollBar {
+                    scroll_node: scroller.spatial,
+                    vertical: true
+                },
+                WhyMediaHasNoLayer::MoreMediaThanLayersFor
+            )]
+        );
+    }
+
+    #[test]
+    fn a_canvas_that_no_record_painted_after_it_overlaps_cuts_no_tile() {
+        let (tree, _, document) = tree_with_document_scroll();
+        let stack = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(canvas(IntRect::new(20, 20, 100, 100), 1), document)
+            .with(fill(IntRect::new(20, 200, 100, 40), GREEN), document)
+            .stack(&tree, &[]);
+        assert_eq!(
+            kinds_of_layers_from_base_up_that_may_hold_content(&stack),
+            ["base document band 0", "canvas #0 document"]
+        );
+        assert_eq!(
+            cut_of_media(&stack, LiveContent::Canvas(CanvasId(1))).cut_reach,
+            Reach::Nothing
+        );
+    }
+
     #[test]
     fn a_fade_over_an_earlier_canvas_stays_in_the_tiles_around_it() {
         let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
@@ -2976,6 +3459,133 @@ mod tests {
                 .iter()
                 .all(|placed| placed.why_composited_regardless_of_layer_content.is_some())
         );
+    }
+
+    // An element whose opacity is animated in a group, under a later element of the group that blends with what is
+    // below it over `blending_element_rect`.
+    fn group_with_animated_element_under_blending_element(
+        blending_element_rect: IntRect,
+    ) -> (VisualContextTree, ListOfOneChunk, ContextRef) {
+        let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
+        let group = tree.append_effect_node_under(viewport, effects(0.99, CompositingAndBlendingOperator::Normal));
+        let element = tree.append_effect_node_under(group, effects(1.0, CompositingAndBlendingOperator::Normal));
+        let blending_element =
+            tree.append_effect_node_under(group, effects(1.0, CompositingAndBlendingOperator::Overlay));
+        tree.set_visual_animations(vec![played_once_after_a_delay(opacity_animation_of(
+            element.effect,
+            1.0,
+            0.0,
+        ))]);
+        let list = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 200, 200), GREEN), viewport)
+            .with(fill(ELEMENT, GREEN), element)
+            .with(fill(blending_element_rect, GREEN), blending_element);
+        (tree, list, element)
+    }
+
+    #[test]
+    fn an_animation_a_later_effect_reads_as_backdrop_has_no_layer() {
+        let (tree, list, element) = group_with_animated_element_under_blending_element(IntRect::new(0, 0, 200, 200));
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        assert!(planned.stack.composited_effects.is_empty());
+        assert_eq!(
+            planned.placement.animations_without_layers,
+            [(
+                AnimatedNode::Effect(element.effect),
+                WhyAnimationHasNoLayer::ALaterEffectReadsItAsBackdrop
+            )]
+        );
+
+        // Where the blending element reads nothing where the animated element reaches, the animation keeps its layer.
+        let (tree, list, element) = group_with_animated_element_under_blending_element(IntRect::new(0, 2000, 200, 200));
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        assert!(planned.placement.animations_without_layers.is_empty());
+        assert!(
+            whys_of_composited_effects(&planned)
+                .contains(&(element.effect, WhyEffectIsComposited::TheCompositorAnimatesIt))
+        );
+    }
+
+    #[test]
+    fn an_animation_in_a_wrapper_a_later_effect_reads_as_backdrop_has_no_layer() {
+        // The blending element reads nothing where the animated element reaches, but it reads where the wrapper around
+        // it reaches, which a layer of the animation would composite.
+        let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
+        let group = tree.append_effect_node_under(viewport, effects(0.99, CompositingAndBlendingOperator::Normal));
+        let wrapper = tree.append_effect_node_under(group, effects(0.99, CompositingAndBlendingOperator::Normal));
+        let element = tree.append_effect_node_under(wrapper, effects(1.0, CompositingAndBlendingOperator::Normal));
+        let blending_element =
+            tree.append_effect_node_under(group, effects(1.0, CompositingAndBlendingOperator::Overlay));
+        tree.set_visual_animations(vec![played_once_after_a_delay(opacity_animation_of(
+            element.effect,
+            1.0,
+            0.0,
+        ))]);
+        let list = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 200, 200), GREEN), viewport)
+            .with(fill(IntRect::new(0, 0, 800, 300), GREEN), wrapper)
+            .with(fill(ELEMENT, GREEN), element)
+            .with(fill(IntRect::new(600, 0, 150, 150), GREEN), blending_element);
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        assert!(planned.stack.composited_effects.is_empty());
+        assert_eq!(
+            planned.placement.animations_without_layers,
+            [(
+                AnimatedNode::Effect(element.effect),
+                WhyAnimationHasNoLayer::ALaterEffectReadsItAsBackdrop
+            )]
+        );
+    }
+
+    #[test]
+    fn an_animation_in_a_wrapper_that_pushes_no_layer_keeps_its_layer() {
+        // The wrapper replays straight into its group, so a layer of the animation composites only the animated element,
+        // which the blending element reads nothing of.
+        let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
+        let group = tree.append_effect_node_under(viewport, effects(0.99, CompositingAndBlendingOperator::Normal));
+        let wrapper = tree.append_effect_node_under(group, effects(1.0, CompositingAndBlendingOperator::Normal));
+        let element = tree.append_effect_node_under(wrapper, effects(1.0, CompositingAndBlendingOperator::Normal));
+        let blending_element =
+            tree.append_effect_node_under(group, effects(1.0, CompositingAndBlendingOperator::Overlay));
+        tree.set_visual_animations(vec![played_once_after_a_delay(opacity_animation_of(
+            element.effect,
+            1.0,
+            0.0,
+        ))]);
+        let list = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 200, 200), GREEN), viewport)
+            .with(fill(IntRect::new(0, 0, 800, 300), GREEN), wrapper)
+            .with(fill(ELEMENT, GREEN), element)
+            .with(fill(IntRect::new(600, 0, 150, 150), GREEN), blending_element);
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        assert!(planned.placement.animations_without_layers.is_empty());
+        assert!(
+            whys_of_composited_effects(&planned)
+                .contains(&(element.effect, WhyEffectIsComposited::TheCompositorAnimatesIt))
+        );
+    }
+
+    #[test]
+    fn an_animation_under_a_blending_element_composited_for_its_canvas_keeps_its_layer() {
+        let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
+        let group = tree.append_effect_node_under(viewport, effects(0.99, CompositingAndBlendingOperator::Normal));
+        let element = tree.append_effect_node_under(group, effects(1.0, CompositingAndBlendingOperator::Normal));
+        let blending_element =
+            tree.append_effect_node_under(group, effects(1.0, CompositingAndBlendingOperator::Overlay));
+        tree.set_visual_animations(vec![played_once_after_a_delay(opacity_animation_of(
+            element.effect,
+            1.0,
+            0.0,
+        ))]);
+        let list = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 200, 200), GREEN), viewport)
+            .with(fill(ELEMENT, GREEN), element)
+            .with(canvas(IntRect::new(0, 0, 200, 200), 1), blending_element);
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        assert!(planned.placement.animations_without_layers.is_empty());
+        let whys = whys_of_composited_effects(&planned);
+        assert!(whys.contains(&(element.effect, WhyEffectIsComposited::TheCompositorAnimatesIt)));
+        assert!(whys.iter().any(|&(effect, _)| effect == blending_element.effect));
     }
 
     #[test]

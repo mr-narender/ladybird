@@ -9,6 +9,7 @@
 
 use core::mem::MaybeUninit;
 use core::ops::Range;
+use core::ptr::NonNull;
 use std::borrow::Cow;
 
 use ak::{Utf16String, Utf16StringUnits, convert_valid_utf16_to_utf8, utf8_length_from_valid_utf16};
@@ -24,7 +25,10 @@ use libjs_rust::api::{
 use crate::ak_format::ak_formatted;
 use crate::bindings::interface::{Interface, Ref, create_dictionary_object, wrap};
 use crate::bindings::promise::WebIdlPromise;
-use crate::bindings::services::web_bindings_object_implements_interface;
+use crate::bindings::services::{
+    web_bindings_object_implements_interface, web_bindings_object_is_window_proxy,
+    web_bindings_window_proxy_object_in_realm,
+};
 use crate::bindings::{CallContext, WebIdlResult};
 
 /// A USVString, a string without lone surrogates. Its UTF-16 code units are always well-formed.
@@ -273,15 +277,21 @@ pub(crate) fn to_boolean(value: Value) -> ThrowCompletionOr<bool> {
 
 /// A JS value converted to a long, https://webidl.spec.whatwg.org/#js-long
 pub(crate) fn to_long(vm: &Vm, value: Value) -> ThrowCompletionOr<i32> {
-    // 1. Let x be ? ConvertToInt(V, 32, "signed"), which is ToInt32 without the extended attributes that change it.
+    // 1. Let x be ? ConvertToInt(V, 32, "signed").
     // 2. Return the IDL long value that represents the same numeric value as x.
     value.to_i32(vm)
 }
 
+/// A JS value converted to an unsigned short, https://webidl.spec.whatwg.org/#js-unsigned-short
+pub(crate) fn to_unsigned_short(vm: &Vm, value: Value) -> ThrowCompletionOr<u16> {
+    // 1. Let x be ? ConvertToInt(V, 16, "unsigned").
+    // 2. Return the IDL unsigned short value that represents the same numeric value as x.
+    value.to_u16(vm)
+}
+
 /// A JS value converted to an unsigned long, https://webidl.spec.whatwg.org/#js-unsigned-long
 pub(crate) fn to_unsigned_long(vm: &Vm, value: Value) -> ThrowCompletionOr<u32> {
-    // 1. Let x be ? ConvertToInt(V, 32, "unsigned"), which is ToUint32 without the extended attributes that change
-    //    it.
+    // 1. Let x be ? ConvertToInt(V, 32, "unsigned").
     // 2. Return the IDL unsigned long value that represents the same numeric value as x.
     value.to_u32(vm)
 }
@@ -1410,6 +1420,36 @@ pub(crate) fn to_cpp_interface_in_union(
         return Ok(CppInterface(value.as_object()));
     }
     throw_no_union_types_matched(vm)
+}
+
+/// The WindowProxy whose exotic object this is, if any.
+pub(crate) fn window_proxy_from_object(object: Gc<Object>) -> Option<CppInterface> {
+    // SAFETY: The object is live.
+    unsafe { web_bindings_object_is_window_proxy(object.as_ptr().cast()) }.then_some(CppInterface(object))
+}
+
+/// A WindowProxy converted from a JS value, https://webidl.spec.whatwg.org/#js-interface
+pub(crate) fn to_window_proxy(vm: &Vm, value: Value) -> ThrowCompletionOr<CppInterface> {
+    // 1. If V implements I, then return the IDL interface type value that represents a reference to that platform
+    //    object.
+    if value.is_object()
+        && let Some(window_proxy) = window_proxy_from_object(value.as_object())
+    {
+        return Ok(window_proxy);
+    }
+    // 2. Throw a TypeError.
+    vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&"WindowProxy"])
+}
+
+/// A WindowProxy converted to a JS value, as the object that scripts of the realm see for it.
+pub(crate) fn window_proxy_to_js(cx: &CallContext, window_proxy: CppInterface) -> Value {
+    // SAFETY: The object and the realm are live.
+    let object = unsafe {
+        web_bindings_window_proxy_object_in_realm(window_proxy.0.as_ptr().cast(), cx.realm().as_ptr().cast())
+    };
+    let object = NonNull::new(object.cast::<Object>()).expect("a WindowProxy has an object");
+    // SAFETY: LibWeb returns a live object.
+    Value::from_object(unsafe { Gc::from_non_null(object) })
 }
 
 /// https://webidl.spec.whatwg.org/#js-interface

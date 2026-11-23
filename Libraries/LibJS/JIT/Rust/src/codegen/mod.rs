@@ -1613,6 +1613,30 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
                 ];
                 self.emit_constant_fields(self.pinned.frame, self.pinned.scratch, &mut fields)?;
             }
+            Op::KeepOwnEnvironments => {
+                let (scratch, function, without_function) =
+                    (self.pinned.scratch, self.temp(node_id, 0), self.masm.new_label());
+                let offsets = self.runtime.offsets;
+                self.masm
+                    .load64(function, &self.frame_field(offsets.execution_context_function));
+                self.masm
+                    .branch_test64(Condition::Zero, function, u64::MAX, without_function);
+                self.emit_load_function_private_environment(scratch, function);
+                self.masm.store64(
+                    &self.frame_field(offsets.execution_context_private_environment),
+                    scratch,
+                );
+                // NB: The variable environment of a frame starts out as its lexical environment.
+                self.masm.load64(
+                    scratch,
+                    &self.frame_field(offsets.execution_context_lexical_environment),
+                );
+                self.masm.store64(
+                    &self.frame_field(offsets.execution_context_variable_environment),
+                    scratch,
+                );
+                self.masm.bind(without_function);
+            }
             Op::LeavePrivateEnvironment => {
                 let scratch = self.pinned.scratch;
                 let field = self.frame_field(self.runtime.offsets.execution_context_private_environment);
@@ -2235,14 +2259,20 @@ impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
     /// `LoadFrameField`: a field of the running execution context.
     fn emit_load_frame_field(&mut self, node_id: NodeId, field: FrameField) {
         let offsets = self.runtime.offsets;
+        let output = self.output(node_id);
         let offset = match field {
             FrameField::LexicalEnvironment => offsets.execution_context_lexical_environment,
             FrameField::VariableEnvironment => offsets.execution_context_variable_environment,
             FrameField::PrivateEnvironment => offsets.execution_context_private_environment,
-            FrameField::Realm => offsets.execution_context_realm,
+            FrameField::Function => offsets.execution_context_function,
+            // NB: The running frame runs in the current realm.
+            FrameField::Realm => {
+                self.masm
+                    .load64(output, &Address::new(self.pinned.vm, offsets.vm_current_realm as i32));
+                return;
+            }
             FrameField::Executable => offsets.execution_context_executable,
         };
-        let output = self.output(node_id);
         self.masm.load64(output, &self.frame_field(offset));
     }
 

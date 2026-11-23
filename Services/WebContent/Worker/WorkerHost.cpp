@@ -131,7 +131,7 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
 
     // 6. Let worker global scope be the global object of realm execution context's Realm component.
     // NOTE: This is the DedicatedWorkerGlobalScope or SharedWorkerGlobalScope object wrapped in the previous step.
-    auto worker_global_scope = GC::Ref { Web::Bindings::impl_from<Web::HTML::WorkerGlobalScope>(realm_execution_context->realm->global_object()) };
+    auto worker_global_scope = GC::Ref { Web::Bindings::impl_from<Web::HTML::WorkerGlobalScope>(realm_execution_context->realm()->global_object()) };
     m_worker_global_scope = worker_global_scope;
 
     // AD-HOC: The spec assumes when setting up the worker environment settings object that the URL is already set on
@@ -420,9 +420,9 @@ void WorkerHost::connect_shared_worker_impl(Web::HTML::TransferDataEncoder messa
         Web::HTML::MessageEventInit event_init {};
         event_init.data = GC::Ref { vm.empty_string() };
         event_init.ports.append(inside_port);
-        event_init.source = Web::HTML::NullableMessageEventSource { inside_port };
+        event_init.source = inside_port;
 
-        auto message_event = Web::HTML::MessageEvent::create(realm.global_object(), Web::HTML::EventNames::connect, event_init);
+        auto message_event = Web::HTML::create_message_event(realm, Web::HTML::EventNames::connect, event_init);
         worker_global_scope->dispatch_event(message_event);
     }));
 

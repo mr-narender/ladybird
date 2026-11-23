@@ -409,6 +409,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.move64(temp, callee_value);
         self.branch_on_tag(Condition::NotEqual, temp, value::OBJECT_TAG, scratch, slow);
         self.emit_unbox_cell(function_register, temp);
+        // A callee of another realm is called by the runtime, which changes
+        // the current realm.
+        self.emit_load_compressed_cell(temp, &Address::new(function_register, offsets.object_shape as i32));
+        self.emit_load_compressed_cell(temp, &Address::new(temp, layout.shape_realm as i32));
+        self.masm
+            .branch64_memory(Condition::NotEqual, &vm_field(offsets.vm_current_realm), temp, slow);
         self.masm
             .load16(temp, &Address::new(function_register, offsets.object_flags as i32));
 
@@ -644,9 +650,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
                 .store64(&field(offsets.execution_context_variable_environment), scratch);
             self.masm.bind(prepared_environment);
         }
-        self.emit_load_compressed_cell(scratch, &Address::new(function_register, offsets.object_shape as i32));
-        self.emit_load_compressed_cell(scratch, &Address::new(scratch, layout.shape_realm as i32));
-        self.masm.store64(&field(offsets.execution_context_realm), scratch);
         self.masm
             .store64(&field(offsets.execution_context_executable), executable_register);
         self.masm.store32(&field(offsets.execution_context_slot_count), temp);
@@ -937,7 +940,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         new_frame: crate::asm::Gpr,
         temp: crate::asm::Gpr,
         ecmascript: bool,
-    ) -> [super::call::ConstantField; 11] {
+    ) -> [super::call::ConstantField; 7] {
         let offsets = self.runtime.offsets;
         let field = |offset: u32| Address::new(new_frame, offset as i32);
         let argument_count_local = self.stub_local(local::ARGUMENT_COUNT);
@@ -1062,14 +1065,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.store64(&vm_field(offsets.vm_interpreter_stack_top), temp);
 
         // Fill in the frame like the interpreter's call fast path.
-        for offset in [
-            offsets.execution_context_lexical_environment,
-            offsets.execution_context_variable_environment,
-            offsets.execution_context_private_environment,
-        ] {
-            self.masm.load64(temp, &frame_field(offset));
-            self.masm.store64(&field(offset), temp);
-        }
+        self.masm
+            .load64(temp, &frame_field(offsets.execution_context_lexical_environment));
+        self.masm
+            .store64(&field(offsets.execution_context_lexical_environment), temp);
         let this_local = self.stub_local(local::THIS);
         self.masm.load64(temp, &this_local);
         self.masm.store64(&field(offsets.execution_context_this_value), temp);
@@ -1078,19 +1077,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.store64(&field(offsets.execution_context_caller_frame), frame);
         self.masm
             .store64(&field(offsets.execution_context_function), function_register);
-        self.emit_load_compressed_cell(temp, &Address::new(function_register, offsets.object_shape as i32));
-        self.emit_load_compressed_cell(temp, &Address::new(temp, layout.shape_realm as i32));
-        self.masm.store64(&field(offsets.execution_context_realm), temp);
         self.masm.store32(&field(offsets.execution_context_slot_count), count);
         self.masm
             .store32(&field(offsets.execution_context_argument_count), count);
         let mut constants = self.spare_fields.take();
         constants.clear();
         constants.extend(self.emit_stub_call_site_fields(native_frame, temp, false));
-        constants.extend([
-            (offsets.execution_context_script_or_module, 8, 0),
-            (offsets.execution_context_executable, 8, 0),
-        ]);
+        constants.extend([(offsets.execution_context_executable, 8, 0)]);
         self.emit_constant_fields_with_vector(native_frame, temp, &mut constants, Some(M::ARGUMENT_FPRS[0]), &[])?;
         self.spare_fields = constants;
         self.masm.load_effective_address(

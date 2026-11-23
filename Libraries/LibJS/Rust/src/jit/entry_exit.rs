@@ -44,7 +44,7 @@ pub fn can_enter_jit_code(vm: &Vm, executable: &Executable) -> bool {
 pub unsafe extern "C" fn libjs_jit_not_compiled_call_entry(vm: *const Vm, frame: *mut ExecutionContext) -> JitResult {
     // SAFETY: JIT code passes its live VM.
     let vm = unsafe { &*vm };
-    vm.head.running_execution_context.set(frame);
+    vm.set_running_frame_in_current_realm(frame);
     JitResult {
         value: 0,
         status: EntryStatus::Resume,
@@ -202,6 +202,8 @@ pub fn helper_enter_jit_code(vm: &Vm) -> i64 {
         return 0;
     }
     let frame = vm.running_execution_context().expect("a frame is running");
+    // NB: The interpreter's Call enters the code before the callee's Enter could bind its this value.
+    crate::interpreter::execution_context::coerce_this(vm, frame_of(frame));
     let result = enter_jit_code(vm, frame);
     match result.status {
         EntryStatus::Returned => {

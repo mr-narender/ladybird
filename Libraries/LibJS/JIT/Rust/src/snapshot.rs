@@ -62,6 +62,11 @@ impl CellId {
 /// once, so the same index can be the target of several slots.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExecutableSnapshot {
+    /// Whether frames of the executable (of the compiled one, for index 0) get their private environment from their
+    /// function rather than from the frame field, which holds an old value in them.
+    pub frames_read_private_environment_from_function: bool,
+    /// The same, for the variable environment, which is the function's `[[Environment]]`.
+    pub frames_read_variable_environment_from_function: bool,
     /// A copy of the assembled bytecode, exactly as the interpreter runs it.
     pub bytecode: List<u8>,
     /// The address of the executable's own bytecode on the main thread
@@ -664,16 +669,15 @@ pub struct EnvironmentTemplateSnapshot {
     pub cells: List<CellId>,
 }
 
-/// The words of an ECMAScript function's `[[ScriptOrModule]]`,
-/// `[[Environment]]` and private environment, which its frames start with
-/// (see `RuntimeOffsets::ecmascript_function_script_or_module` and the
-/// fields after it). They stay the same for the function's lifetime, and
-/// what they point to lives as long as the function.
+/// The words of an ECMAScript function's `[[ScriptOrModule]]` and
+/// `[[Environment]]`. Its frames start with the latter, and code inlined
+/// into a frame runs with the frame function's `[[ScriptOrModule]]`. They
+/// stay the same for the function's lifetime, and what they point to lives
+/// as long as the function.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FunctionFrameFields {
     pub script_or_module: u64,
     pub environment: u64,
-    pub private_environment: u64,
 }
 
 impl FunctionFrameFields {
@@ -1617,6 +1621,10 @@ pub struct RuntimeOffsets {
     pub execution_context_slots: u32,
     /// `VmHead::running_execution_context`.
     pub vm_running_execution_context: u32,
+    /// `VmHead::current_realm` (cell pointer), the realm of the running
+    /// frame. JIT code calls functions of another realm through the
+    /// runtime, which changes it, and compiles no call of them inline.
+    pub vm_current_realm: u32,
     /// `Vm::jit_native_stack_limit` (u64): JIT code exits at entry if the
     /// stack pointer is below it, and its calls take their slow paths,
     /// which run the callee in the interpreter.
@@ -1646,16 +1654,10 @@ pub struct RuntimeOffsets {
     pub accessor_setter: u32,
     /// `ExecutionContext::function` (cell pointer).
     pub execution_context_function: u32,
-    /// `ExecutionContext::realm` (cell pointer).
-    pub execution_context_realm: u32,
-    /// `ExecutionContext::script_or_module` (8 bytes).
-    pub execution_context_script_or_module: u32,
     /// `ExecutionContext::variable_environment` (cell pointer).
     pub execution_context_variable_environment: u32,
     /// `ExecutionContext::frame_id` (u64).
     pub execution_context_frame_id: u32,
-    /// `ExecutionContext::skip_when_determining_incumbent_counter` (u32).
-    pub execution_context_skip_when_determining_incumbent_counter: u32,
     /// `ExecutionContext::yield_continuation` (u32).
     pub execution_context_yield_continuation: u32,
     /// `ExecutionContext::yield_is_await` (bool).
@@ -1691,8 +1693,6 @@ pub struct RuntimeOffsets {
     /// `EcmascriptFunctionObjectWithRareData::private_environment` (cell
     /// pointer), of functions with the flag for it.
     pub ecmascript_function_private_environment: u32,
-    /// `SharedFunctionInstanceData::script_or_module` (8 bytes, as in `ExecutionContext`).
-    pub shared_function_script_or_module: u32,
     /// `Object::class_bits` (u8).
     pub object_class_bits: u32,
     /// The bit of `Object::class_bits` of an ECMAScript function that has

@@ -41,6 +41,7 @@ use crate::gc::root::MarkedVec;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
+use crate::layout::execution_context::ScriptOrModuleSlot;
 use crate::layout::function_object::{
     DirectGetterFunction, EcmascriptFunctionObject, FunctionObject, NativeFunction, RawNativeFunction,
 };
@@ -402,9 +403,6 @@ fn function_frame_fields(function: Gc<EcmascriptFunctionObject>) -> FunctionFram
         environment: function
             .environment()
             .map_or(0, |environment| environment.as_ptr() as u64),
-        private_environment: function
-            .private_environment()
-            .map_or(0, |environment| environment.as_ptr() as u64),
     }
 }
 
@@ -414,12 +412,9 @@ fn note_cell<T: Extends<CellHeader>>(cells: &mut Vec<Gc<CellHeader>>, cell: Gc<T
     CellId(cell.as_ptr() as u64)
 }
 
-/// Adds the environments of `function`, whose addresses its FunctionFrameFields hold, to `cells`.
+/// Adds the environment of `function`, whose address its FunctionFrameFields hold, to `cells`.
 fn note_frame_field_cells(cells: &mut Vec<Gc<CellHeader>>, function: Gc<EcmascriptFunctionObject>) {
     if let Some(environment) = function.environment() {
-        note_cell(cells, environment);
-    }
-    if let Some(environment) = function.private_environment() {
         note_cell(cells, environment);
     }
 }
@@ -437,7 +432,7 @@ impl SnapshotBuilder<'_> {
         value.0
     }
 
-    /// function_frame_fields() of `function`, whose environments are added to the cells the snapshot refers to.
+    /// function_frame_fields() of `function`, whose environment is added to the cells the snapshot refers to.
     fn frame_fields(&mut self, function: Gc<EcmascriptFunctionObject>) -> FunctionFrameFields {
         note_frame_field_cells(&mut self.cells, function);
         function_frame_fields(function)
@@ -1329,7 +1324,24 @@ impl SnapshotBuilder<'_> {
         self.environment_templates.clear();
 
         let intrinsics = realm.intrinsics();
+        // NB: The same rules as ExecutionContext::keeps_private_environment() and keeps_variable_environment().
+        let frame_function = match entry.function {
+            Some(InlinedFunction::Ecmascript(function)) => Some(function),
+            Some(InlinedFunction::Builtin(_)) => None,
+            None => self.compiled_function,
+        };
+        let keeps_own_environments = executable.keeps_own_environments();
+        let (frames_read_private_environment_from_function, frames_read_variable_environment_from_function) =
+            match frame_function {
+                Some(function) => (
+                    !keeps_own_environments,
+                    !keeps_own_environments && !function.function_environment_needed(),
+                ),
+                None => (false, false),
+            };
         ExecutableSnapshot {
+            frames_read_private_environment_from_function,
+            frames_read_variable_environment_from_function,
             bytecode: self.snapshot.add(bytecode),
             bytecode_address: bytecode.as_ptr() as u64,
             layout: FrameLayout {
@@ -1600,7 +1612,7 @@ pub fn capture_snapshot<'d>(
     let compiled_function_fields = match function {
         Some(function) => function_frame_fields(function),
         None => FunctionFrameFields {
-            script_or_module: vm.running_execution_context_ref().script_or_module.word(),
+            script_or_module: ScriptOrModuleSlot::new(vm.running_execution_context_ref().script_or_module()).word(),
             ..FunctionFrameFields::default()
         },
     };

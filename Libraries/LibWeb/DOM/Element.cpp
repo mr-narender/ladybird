@@ -180,6 +180,8 @@ extern "C" {
 FlatPtr web_dom_element_local_name(Element const*);
 FlatPtr web_dom_element_get_attribute_ns(Element const*, FlatPtr namespace_, FlatPtr name);
 void web_dom_element_set_attribute_value(Element*, FlatPtr name, FlatPtr value);
+void web_dom_element_remove_attribute(Element*, FlatPtr name);
+void web_dom_element_for_each_attribute(Element const*, void* callback, void (*on_attribute)(void*, FlatPtr name, FlatPtr value));
 void web_dom_element_attribute(Element*, ReadonlyBytes name, void* value, void (*on_value)(void*, FlatPtr));
 }
 
@@ -308,7 +310,7 @@ static void invalidate_content_blocker_style_if_needed(Element& element)
 {
     if (!element.is_connected())
         return;
-    if (!element.document().content_blocking_enabled() || !ContentBlocker::the().has_cosmetic_rules())
+    if (!ContentBlocker::the().has_cosmetic_rules())
         return;
 
     auto const& id = element.id();
@@ -1802,10 +1804,9 @@ void Element::swap_in_style_record(Layout::BegunRead const& read, Optional<CSS::
     // A new style can change the states and the text formatting the accessibility tree reports for the element.
     if (document().page().accessibility_interested())
         document().invalidate_cached_accessibility_records_after_style_change(*this);
-    auto const style_record = m_installed_style.record();
     // NB: The render side installed the record in a box it styles itself, which the box adopts.
     if (auto* layout_node = unsafe_layout_node(read))
-        layout_node->set_style_record_identity(style_record);
+        layout_node->set_style_record_identity(m_installed_style);
 }
 
 Element::CustomHighlightStyles const* Element::custom_highlight_styles() const
@@ -3813,6 +3814,15 @@ bool Element::is_actually_disabled() const
     return false;
 }
 
+// A button, input, select, or textarea element, or a form-associated custom element, that's disabled. Unlike a disabled
+// fieldset, such a control stops the mouse presses aimed at it from being dispatched.
+bool Element::is_disabled_form_control() const
+{
+    if (is<HTML::HTMLOptGroupElement>(this) || is<HTML::HTMLOptionElement>(this) || is<HTML::HTMLFieldSetElement>(this))
+        return false;
+    return is_actually_disabled();
+}
+
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#fragment-parsing-algorithm-steps
 WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode scripting_mode, HTML::FragmentFastPath fast_path, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
 {
@@ -5267,7 +5277,7 @@ void Element::replace_installed_style(Layout::BegunRead const& read, CSS::Instal
     // what it moves from, and everything below that compares against the old record is read from it, before the
     // element lets go of it. The engine keeps the old record until it takes the new one in.
     if (auto* layout_node = unsafe_layout_node(read))
-        layout_node->set_style_record_identity(m_installed_style.record());
+        layout_node->set_style_record_identity(m_installed_style);
     bool const was_display_none = !held_before || held_before.display_is_none();
     // https://drafts.csswg.org/scroll-animations-1/#timeline-scoping
     bool const timeline_declarations_changed = timeline_declarations_differ(held_before, m_installed_style);
@@ -7171,6 +7181,18 @@ FlatPtr web_dom_element_get_attribute_ns(Element const* element, FlatPtr namespa
 void web_dom_element_set_attribute_value(Element* element, FlatPtr name, FlatPtr value)
 {
     element->set_attribute_value(Utf16FlyString::from_raw(name), Utf16String::adopt_raw(value));
+}
+
+void web_dom_element_remove_attribute(Element* element, FlatPtr name)
+{
+    element->remove_attribute(Utf16FlyString::from_raw(name));
+}
+
+void web_dom_element_for_each_attribute(Element const* element, void* callback, void (*on_attribute)(void*, FlatPtr name, FlatPtr value))
+{
+    element->for_each_attribute([&](Utf16FlyString const& name, Utf16String const& value) {
+        on_attribute(callback, name.raw_identity(), value.raw_identity());
+    });
 }
 
 void web_dom_element_attribute(Element* element, ReadonlyBytes name, void* value, void (*on_value)(void*, FlatPtr))

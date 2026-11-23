@@ -146,7 +146,7 @@ fn code_to_compile(vm: &Vm) -> Option<CompileTarget> {
     let Some(function) = frame.function.get() else {
         // NB: The top-level code of a script or of a module runs once, but its loops can run long. Other code without
         //     a function, like that of eval, is not compiled.
-        let top_level_executable = match frame.script_or_module.get() {
+        let top_level_executable = match frame.script_or_module() {
             ScriptOrModule::Script(script) => script.cached_executable(),
             ScriptOrModule::Module(module) => module.downcast_ref::<SourceTextModule>()?.cached_executable(),
             _ => None,
@@ -468,11 +468,7 @@ fn compile(
     //     happens before the snapshot captures which valid sets the realm holds.
     let realm = match function {
         Some(function) => function.realm().expect("an ECMAScript function has a realm"),
-        None => vm
-            .running_execution_context_ref()
-            .realm
-            .get()
-            .expect("the frame of top-level code has a realm"),
+        None => vm.current_realm().expect("the frame of top-level code has a realm"),
     };
     realm_watchpoints::array_iterators_have_no_return(vm, realm);
     realm_watchpoints::array_iterators_have_builtin_next(vm, realm);

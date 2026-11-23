@@ -56,6 +56,10 @@ pub(crate) mod canvas_text_drawing_styles;
 #[cfg(not(test))]
 pub(crate) mod canvas_transform;
 #[cfg(not(test))]
+pub(crate) mod dom_string_list;
+#[cfg(not(test))]
+pub(crate) mod dom_string_map;
+#[cfg(not(test))]
 pub(crate) mod event_source;
 #[cfg(not(test))]
 pub(crate) mod exports;
@@ -71,6 +75,8 @@ pub(crate) mod image_bitmap_rendering_context;
 pub(crate) mod image_data;
 #[cfg(not(test))]
 pub(crate) mod message_channel;
+#[cfg(not(test))]
+pub(crate) mod message_event;
 #[cfg(not(test))]
 pub(crate) mod message_port;
 #[cfg(not(test))]

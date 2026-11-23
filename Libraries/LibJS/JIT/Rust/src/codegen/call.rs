@@ -649,7 +649,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         let fields = target.function_fields;
         constants.extend([
             (offsets.execution_context_function, 8, function.function.0),
-            (offsets.execution_context_realm, 8, function.realm.0),
             (offsets.execution_context_executable, 8, header.executable.0),
             (offsets.execution_context_slot_count, 4, u64::from(header.slot_count)),
             (
@@ -657,14 +656,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
                 4,
                 u64::from(header.argument_count),
             ),
-            (offsets.execution_context_script_or_module, 8, fields.script_or_module),
             (offsets.execution_context_lexical_environment, 8, fields.environment),
-            (offsets.execution_context_variable_environment, 8, fields.environment),
-            (
-                offsets.execution_context_private_environment,
-                8,
-                fields.private_environment,
-            ),
             (offsets.execution_context_this_value, 8, value::EMPTY),
             // NB: Frames get their id when the debugger first needs it.
             (offsets.execution_context_frame_id, 8, 0),
@@ -684,9 +676,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             function.uses_this.then_some(offsets.execution_context_this_value),
             function.uses_this.then_some(slot(THIS_VALUE_REGISTER)),
             environments.then_some(offsets.execution_context_lexical_environment),
-            environments.then_some(offsets.execution_context_variable_environment),
             target.closures.then_some(offsets.execution_context_function),
-            target.closures.then_some(offsets.execution_context_private_environment),
         ]
         .into_iter()
         .flatten()
@@ -722,11 +712,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             self.emit_load_compressed_cell(temp, &Address::new(aux, offsets.ecmascript_function_environment as i32));
             self.masm
                 .store64(&field(offsets.execution_context_lexical_environment), temp);
-            self.masm
-                .store64(&field(offsets.execution_context_variable_environment), temp);
-            self.emit_load_function_private_environment(temp, aux);
-            self.masm
-                .store64(&field(offsets.execution_context_private_environment), temp);
         }
 
         for (index, argument) in (0..).zip(&call.argument_operands) {
@@ -1458,23 +1443,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm.store64(&vm_field(offsets.vm_interpreter_stack_top), temp);
 
         // Fill in the frame like the interpreter's call fast path.
-        for (source, destination) in [
-            (
-                offsets.execution_context_lexical_environment,
-                offsets.execution_context_lexical_environment,
-            ),
-            (
-                offsets.execution_context_variable_environment,
-                offsets.execution_context_variable_environment,
-            ),
-            (
-                offsets.execution_context_private_environment,
-                offsets.execution_context_private_environment,
-            ),
-        ] {
-            self.masm.load64(temp, &frame_field(source));
-            self.masm.store64(&field(destination), temp);
-        }
+        self.masm
+            .load64(temp, &frame_field(offsets.execution_context_lexical_environment));
+        self.masm
+            .store64(&field(offsets.execution_context_lexical_environment), temp);
         self.store_call_operand(&field(offsets.execution_context_this_value), this_operand)?;
         // NB: Frames get their id when the debugger first needs it.
         self.masm.store_imm64(&field(offsets.execution_context_frame_id), 0);
@@ -1483,7 +1455,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         constants.clear();
         constants.extend(self.new_frame_constants(false));
         constants.extend([
-            (offsets.execution_context_script_or_module, 8, 0),
             (offsets.execution_context_executable, 8, 0),
             (offsets.execution_context_slot_count, 4, u64::from(argument_count)),
             (offsets.execution_context_argument_count, 4, u64::from(argument_count)),
@@ -1504,7 +1475,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             ),
         ]);
         constants.push((offsets.execution_context_function, 8, target.function.0));
-        constants.push((offsets.execution_context_realm, 8, target.realm.0));
         self.emit_constant_fields(native_frame, temp, &mut constants)?;
         self.spare_fields = constants;
         if site.is_some() {
@@ -1595,19 +1565,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             //     script or module.
             let caller_field = |offset: u32| Address::new(self.pinned.frame, offset as i32);
             let field = |offset: u32| Address::new(new_frame, offset as i32);
-            for offset in [
-                offsets.execution_context_lexical_environment,
-                offsets.execution_context_variable_environment,
-                offsets.execution_context_private_environment,
-            ] {
-                self.masm.load64(temp, &caller_field(offset));
-                self.masm.store64(&field(offset), temp);
-            }
+            self.masm
+                .load64(temp, &caller_field(offsets.execution_context_lexical_environment));
+            self.masm
+                .store64(&field(offsets.execution_context_lexical_environment), temp);
             self.masm
                 .store64(&field(offsets.execution_context_caller_frame), self.pinned.frame);
             constants.extend([
                 (offsets.execution_context_function, 8, header.function.function.0),
-                (offsets.execution_context_script_or_module, 8, 0),
                 // NB: Frames get their id when the debugger first needs it.
                 (offsets.execution_context_frame_id, 8, 0),
             ]);
@@ -1619,14 +1584,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             );
             constants.extend([
                 (offsets.execution_context_function, 8, header.function.function.0),
-                (offsets.execution_context_script_or_module, 8, fields.script_or_module),
                 (offsets.execution_context_lexical_environment, 8, fields.environment),
-                (offsets.execution_context_variable_environment, 8, fields.environment),
-                (
-                    offsets.execution_context_private_environment,
-                    8,
-                    fields.private_environment,
-                ),
                 // NB: Frames get their id when the debugger first needs it.
                 (offsets.execution_context_frame_id, 8, 0),
             ]);
@@ -1651,7 +1609,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             constants,
         );
         constants.extend([
-            (offsets.execution_context_realm, 8, header.function.realm.0),
             (offsets.execution_context_executable, 8, header.executable.0),
             (offsets.execution_context_slot_count, 4, u64::from(header.slot_count)),
             (
@@ -1671,23 +1628,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.masm
             .store64(&field(offsets.execution_context_function), function_register);
         let function_field = |offset: u32| Address::new(function_register, offset as i32);
-        let shared_data_field = function_field(self.runtime.dynamic_calls.ecmascript_function_shared_data);
-        self.emit_load_compressed_cell(temp, &shared_data_field);
-        self.masm.load64(
-            temp,
-            &Address::new(temp, offsets.shared_function_script_or_module as i32),
-        );
-        self.masm
-            .store64(&field(offsets.execution_context_script_or_module), temp);
         // NB: ECMAScript functions always have an environment.
         self.emit_load_compressed_cell(temp, &function_field(offsets.ecmascript_function_environment));
         self.masm
             .store64(&field(offsets.execution_context_lexical_environment), temp);
-        self.masm
-            .store64(&field(offsets.execution_context_variable_environment), temp);
-        self.emit_load_function_private_environment(temp, function_register);
-        self.masm
-            .store64(&field(offsets.execution_context_private_environment), temp);
         // NB: Frames get their id when the debugger first needs it.
         self.masm.store_imm64(&field(offsets.execution_context_frame_id), 0);
         self.masm
@@ -1698,18 +1642,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// not initialized, and whether its caller waits for it in native code
     /// (and so runs it in JIT code until the runtime finishes it, see
     /// `finish_direct_call`).
-    pub(super) fn new_frame_constants(&self, returns_to_native_caller: bool) -> [ConstantField; 11] {
+    pub(super) fn new_frame_constants(&self, returns_to_native_caller: bool) -> [ConstantField; 7] {
         let offsets = self.runtime.offsets;
         [
             (offsets.execution_context_program_counter, 4, 0),
-            (offsets.execution_context_skip_when_determining_incumbent_counter, 4, 0),
-            (
-                offsets.execution_context_yield_continuation,
-                4,
-                u64::from(self.runtime.no_yield_continuation),
-            ),
-            (offsets.execution_context_yield_is_await, 1, 0),
-            (offsets.execution_context_yield_value_is_iterator_result, 1, 0),
             (offsets.execution_context_caller_is_construct, 1, 0),
             (offsets.execution_context_caller_is_derived_construct, 1, 0),
             (offsets.execution_context_frame_initialized, 1, 0),

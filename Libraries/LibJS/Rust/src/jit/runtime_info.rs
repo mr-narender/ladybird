@@ -126,12 +126,13 @@ fn runtime_offsets() -> RuntimeOffsets {
     RuntimeOffsets {
         execution_context_program_counter: offset(offset_of!(ExecutionContext, program_counter)),
         execution_context_lexical_environment: offset(offset_of!(ExecutionContext, lexical_environment)),
-        execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment)),
+        execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment_in_frame)),
         execution_context_frame_initialized: offset(offset_of!(ExecutionContext, frame_initialized)),
         execution_context_executable: offset(offset_of!(ExecutionContext, executable)),
         executable_idle_collection_count: offset(offset_of!(ExecutableHead, idle_collection_count)),
         execution_context_slots: offset(size_of::<ExecutionContext>()),
         vm_running_execution_context: offset(offset_of!(VmHead, running_execution_context)),
+        vm_current_realm: offset(offset_of!(VmHead, current_realm)),
         vm_jit_native_stack_limit: offset(offset_of!(Vm, jit_native_stack_limit)),
         private_environment_outer: offset(offset_of!(PrivateEnvironment, outer)),
         object_flags: offset(offset_of!(Object, flags)),
@@ -144,14 +145,8 @@ fn runtime_offsets() -> RuntimeOffsets {
         accessor_getter: offset(offset_of!(Accessor, getter)),
         accessor_setter: offset(offset_of!(Accessor, setter)),
         execution_context_function: offset(offset_of!(ExecutionContext, function)),
-        execution_context_realm: offset(offset_of!(ExecutionContext, realm)),
-        execution_context_script_or_module: offset(offset_of!(ExecutionContext, script_or_module)),
-        execution_context_variable_environment: offset(offset_of!(ExecutionContext, variable_environment)),
+        execution_context_variable_environment: offset(offset_of!(ExecutionContext, variable_environment_in_frame)),
         execution_context_frame_id: offset(offset_of!(ExecutionContext, frame_id)),
-        execution_context_skip_when_determining_incumbent_counter: offset(offset_of!(
-            ExecutionContext,
-            skip_when_determining_incumbent_counter
-        )),
         execution_context_yield_continuation: offset(offset_of!(ExecutionContext, yield_continuation)),
         execution_context_yield_is_await: offset(offset_of!(ExecutionContext, yield_is_await)),
         execution_context_yield_value_is_iterator_result: offset(offset_of!(
@@ -181,7 +176,6 @@ fn runtime_offsets() -> RuntimeOffsets {
             EcmascriptFunctionObjectWithRareData,
             private_environment
         )),
-        shared_function_script_or_module: offset(offset_of!(SharedFunctionInstanceData, script_or_module)),
         object_class_bits: offset(offset_of!(Object, class_bits)),
         ecmascript_function_flag_has_rare_data: ecmascript_function_flags::HAS_RARE_DATA.into(),
         vm_execution_generation: offset(offset_of!(VmHead, execution_generation)),

@@ -669,6 +669,8 @@ public:
     void update_style_and_layout_once(Layout::BegunRead const&, UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
     [[nodiscard]] bool layout_is_up_to_date() const;
+    // Whether anything the document's style depends on may have moved since its last style update.
+    [[nodiscard]] bool has_style_work(Layout::BegunRead const&) const;
     [[nodiscard]] bool layout_is_known_stale() const;
     void clear_devtools_layout_inspection_data();
     void sample_animation_effects_needing_style_update();
@@ -1394,6 +1396,11 @@ public:
     void start_intersection_observing_a_lazy_loading_element(Element&);
     void stop_intersection_observing_a_lazy_loading_element(Element&);
     void process_lazy_load_intersection_observer_entries(ReadonlySpan<GC::Ref<IntersectionObserver::IntersectionObserverEntry>>);
+
+    void start_observing_video_viewport_intersection(HTML::HTMLVideoElement&);
+    void stop_observing_video_viewport_intersection(HTML::HTMLVideoElement&);
+    // Whether the last update of intersection observations found the video near enough to the viewport to be shown.
+    bool video_intersects_viewport(HTML::HTMLVideoElement const&) const;
 
     void shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::HTMLMetaElement const> meta_element = nullptr);
 
@@ -2393,6 +2400,8 @@ private:
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#lazy-load-intersection-observer
     // Each Document has a lazy load intersection observer, initially set to null but can be set to an IntersectionObserver instance.
     GC::Ptr<IntersectionObserver::IntersectionObserver> m_lazy_load_intersection_observer;
+
+    GC::Ptr<IntersectionObserver::IntersectionObserver> m_video_viewport_intersection_observer;
 
     Vector<GC::Weak<ResizeObserver::ResizeObserver>> m_resize_observers;
 
