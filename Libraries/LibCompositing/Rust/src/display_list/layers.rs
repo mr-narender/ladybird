@@ -37,7 +37,7 @@ use crate::display_list::window_server_placement::{
     WhyWindowServerCannotCompositeEffect, WhyWindowServerCannotShowMedia, WindowServerPlacement,
     WindowServerPlacementOfEffect, window_server_placement_of_effect,
 };
-use crate::visual_context::queries::{NestingOfLiveEffects, backdrop_reader_by_reading_effect_index};
+use crate::visual_context::queries::backdrop_reader_by_reading_effect_index;
 use crate::visual_context::{VisualContextTree, WorldTransforms, device_offset_for_index};
 use libgfx_rust::{AffineTransform, CornerRadii, FloatMatrix4x4, FloatPoint, IntPoint, IntRect};
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -116,7 +116,6 @@ pub enum WhyListIsOneLayer {
     EmptyDisplayList,
     SortingContext3D,
     RootIsolationEffectIsNotPlainGroup,
-    MaskDeclaredUnderEffectsItsMaskIsNotUnder,
     RecordsBlendWithWhatOtherLayersHoldBelowThem,
     EffectTheCompositorCannotCompositeIsComposited(WhyCompositorCannotCompositeEffect),
     CompositedEffectsNestTooDeep,
@@ -137,9 +136,6 @@ impl std::fmt::Display for WhyListIsOneLayer {
             WhyListIsOneLayer::EmptyDisplayList => "empty display list",
             WhyListIsOneLayer::SortingContext3D => "3D sorting context holding an effect that reads or is composited",
             WhyListIsOneLayer::RootIsolationEffectIsNotPlainGroup => "root isolation effect is not a plain group",
-            WhyListIsOneLayer::MaskDeclaredUnderEffectsItsMaskIsNotUnder => {
-                "mask content declared under effects its mask is not under"
-            }
             WhyListIsOneLayer::RecordsBlendWithWhatOtherLayersHoldBelowThem => {
                 "records blend with what other layers hold below them"
             }
@@ -647,6 +643,17 @@ fn identity_of_composited_node(
     PlacementNodeIdentity(hasher.finish())
 }
 
+// A node of a space inside a composited node is named apart from the node of the same space and clips outside it.
+fn identity_of_node_inside_composited_node(
+    composited_node_identity: PlacementNodeIdentity,
+    identity_outside_composited_nodes: PlacementNodeIdentity,
+) -> PlacementNodeIdentity {
+    let mut hasher = foldhash::fast::FixedState::with_seed(0x696e_7369_6465_636e).build_hasher();
+    hasher.write_u64(composited_node_identity.0);
+    hasher.write_u64(identity_outside_composited_nodes.0);
+    PlacementNodeIdentity(hasher.finish())
+}
+
 fn node_covers_viewport(nodes: &[PlacementNode], spaces: &[RasterSpace], node_index: PlacementNodeIndex) -> bool {
     let mut node_on_way_out = Some(node_index);
     while let Some(index) = node_on_way_out {
@@ -822,12 +829,32 @@ impl LayerStack {
         layering_obstacles: LayeringObstacles,
     ) -> Self {
         let mut nodes: Vec<PlacementNode> = Vec::with_capacity(plan.nodes.len());
+        let mut innermost_composited_node_around_by_node_index: Vec<Option<PlacementNodeIndex>> =
+            Vec::with_capacity(plan.nodes.len());
         for node in plan.nodes {
+            let innermost_composited_node_around = node.parent_index.and_then(|parent_index| {
+                if nodes[parent_index.0].composited_effect.is_some() {
+                    Some(parent_index)
+                } else {
+                    innermost_composited_node_around_by_node_index[parent_index.0]
+                }
+            });
+            innermost_composited_node_around_by_node_index.push(innermost_composited_node_around);
             let identity = match (node.composited_effect, node.parent_index) {
                 (Some(effect), Some(parent_index)) => {
                     identity_of_composited_node(nodes[parent_index.0].identity, effect)
                 }
-                _ => identity_of_node(&spaces, node.raster_space_index, &node.composite_clips),
+                _ => {
+                    let identity_outside_composited_nodes =
+                        identity_of_node(&spaces, node.raster_space_index, &node.composite_clips);
+                    match innermost_composited_node_around {
+                        Some(composited_node_index) => identity_of_node_inside_composited_node(
+                            nodes[composited_node_index.0].identity,
+                            identity_outside_composited_nodes,
+                        ),
+                        None => identity_outside_composited_nodes,
+                    }
+                }
             };
             nodes.push(PlacementNode {
                 identity,
@@ -1156,6 +1183,14 @@ impl LayerStack {
 
     pub fn layer_is_inside_composited_effects(&self, layer_index: LayerIndex) -> bool {
         self.innermost_composited_band_around_layer(layer_index).is_some()
+    }
+
+    /// The effect the compositor composites the records of the band inside: that of the innermost node at or around the
+    /// band's node that it composites inside an effect, which may be a node of another space. A replay of the band's
+    /// records leaves it out, with the effects around it and the clips it is entered within.
+    pub fn innermost_composited_effect_at_or_around_band(&self, band_index: BandIndex) -> Option<EffectNodeIndex> {
+        let composited_band = self.innermost_composited_band_at_or_around_band[band_index.0]?;
+        self.nodes[self.bands[composited_band.0].placement_node_index.0].composited_effect
     }
 
     /// The bands the layer is in, innermost first, whose nodes the compositor composites inside their effects. A plan
@@ -1643,48 +1678,14 @@ impl LayerStack {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayeringObstacles {
     pub sorts_planes_by_depth: bool,
-    pub mask_declared_under_effects_its_mask_is_not_under: bool,
 }
 
 impl LayeringObstacles {
-    pub fn of(list: &DisplayListStorage, tree: &VisualContextTree) -> Self {
-        Self::of_with_nesting_of_live_effects(list, tree, &NestingOfLiveEffects::of(tree))
-    }
-
-    pub(crate) fn of_with_nesting_of_live_effects(
-        list: &DisplayListStorage,
-        tree: &VisualContextTree,
-        nesting_of_live_effects: &NestingOfLiveEffects<'_>,
-    ) -> Self {
+    pub fn of(tree: &VisualContextTree) -> Self {
         Self {
             sorts_planes_by_depth: tree.may_sort_planes_by_depth(),
-            mask_declared_under_effects_its_mask_is_not_under: !mask_declarations_are_on_effect_chains_of_their_masks(
-                list,
-                nesting_of_live_effects,
-            ),
         }
     }
-
-    /// Whether every tile replays every record of its band, as which records can show in a tile cannot be told.
-    pub fn every_tile_replays_every_record(&self) -> bool {
-        self.mask_declared_under_effects_its_mask_is_not_under
-    }
-}
-
-// A tile replays the declaration of a mask's content along with what the mask holds, and so opens the effects the
-// declaration is under there, which draw nothing only when they are the mask's own or those around it. A list from
-// another process can name a mask that the tree does not hold as a live node. No effect is inside such a mask.
-fn mask_declarations_are_on_effect_chains_of_their_masks(
-    list: &DisplayListStorage,
-    nesting_of_live_effects: &NestingOfLiveEffects<'_>,
-) -> bool {
-    list.summary().mask_declarations.iter().all(|declaration| {
-        let mask_effect = declaration.mask_effect;
-        let declaration_effect = list.run(declaration.record.run_index as usize).context.effect;
-        declaration_effect.is_none()
-            || nesting_of_live_effects.is_or_is_inside(declaration_effect, mask_effect)
-            || nesting_of_live_effects.is_or_is_inside(mask_effect, declaration_effect)
-    })
 }
 
 fn anchors_of_layer_plans(tree: &VisualContextTree) -> Vec<SpatialNodeIndex> {

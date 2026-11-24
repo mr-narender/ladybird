@@ -4,20 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! What the compositor draws over the page of a context: the scrollbars it paints itself, and the overlays the browser
-//! asks for. They are recorded as display list records and played through the same painter as the page.
+//! What the compositor draws over the page of a context: the overlays the browser asks for. They are recorded as display
+//! list records and played through the same painter as the page.
 
-use crate::frame_inputs::ScrollbarOfFrame;
 use libcompositing_rust::display_list::builder::{DisplayListBuilder, HEADER_SIZE, PendingInlineClip};
 use libcompositing_rust::display_list::commands::{
     ContextRef, DisplayListCommand, DisplayListDataSpan, DisplayListGlyph, DisplayListPaintStyle, DrawGlyphRun,
     FillPath, FillRect, FontResourceId, OptionalFloatRect, PathPaintKind, ReplayLayer, StrokePath,
 };
 use libcompositing_rust::display_list::ffi_bytes::FfiBytes;
-use libcompositing_rust::display_list::replay::{
-    ListReplay, RecordsContext, ReplayFrame, ReplayPainter, replay_records,
-};
-use libcompositing_rust::host::PresentedScrollbar;
+use libcompositing_rust::display_list::replay::{RecordsContext, ReplayFrame, ReplayPainter, replay_records};
 use libcompositing_rust::overlays::{
     PausedDebuggerOverlayGeometry, paused_debugger_overlay_geometry, picture_in_picture_controls_geometry,
     scaled_overlay_length,
@@ -27,8 +23,8 @@ use libcompositing_rust::time::MonotonicTime;
 use libcompositing_rust::visual_context::{TransformData, TransformDataRole, VisualContextTree};
 use libgfx_rust::path::Path;
 use libgfx_rust::{
-    CapStyle, Color, CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, IntRect, IntSize,
-    JoinStyle, Orientation, ShouldAntiAlias, WindingRule, enclosing_int_rect,
+    CapStyle, Color, CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, GlyphRunOrientation,
+    IntRect, IntSize, JoinStyle, ShouldAntiAlias, WindingRule, enclosing_int_rect,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,29 +182,15 @@ impl ContextOverlays {
         Some(picture_in_picture_controls_geometry(viewport_size, device_pixel_ratio).buttons_bounds())
     }
 
-    /// What the overlays draw over a frame of the page, with the scrollbars the frame shows.
+    /// What the overlays draw over a frame of the page.
     pub fn picture_of_frame(
         &mut self,
-        scrollbars: &[ScrollbarOfFrame],
         viewport_size: IntSize,
         device_pixel_ratio: f64,
         label_shaper: &dyn OverlayLabelShaper,
     ) -> OverlayPicture {
         let viewport_rect = IntRect::new(0, 0, viewport_size.width, viewport_size.height);
         let mut bounds = IntRect::default();
-        let mut presented_scrollbars = Vec::new();
-        for scrollbar in scrollbars.iter().filter(|scrollbar| scrollbar.is_painted_by_compositor) {
-            presented_scrollbars.push(presented_compositor_scrollbar(scrollbar));
-            if scrollbar.opacity <= 0.0 {
-                continue;
-            }
-            // The thumb's outline is drawn around the gutter, which grows into the expanded gutter as it is hovered.
-            bounds = bounds.united(
-                enclosing_int_rect(scrollbar.gutter_rect)
-                    .united(scrollbar.thin_and_expanded_gutter_rect)
-                    .inflated(2, 2),
-            );
-        }
 
         let mut ui_overlay_records = DisplayListBuilder::new();
         if let Some(paused_debugger) = self.ui_overlays.paused_debugger.clone() {
@@ -241,7 +223,6 @@ impl ContextOverlays {
             bounds = viewport_rect;
         }
         OverlayPicture {
-            scrollbars: presented_scrollbars,
             ui_overlay_records: AlignedRecords::new(&ui_overlay_records.finish().bytes),
             picture_in_picture_controls,
             bounds: bounds.intersected(viewport_rect),
@@ -311,7 +292,6 @@ struct PictureInPictureControlsPicture {
 
 /// What the overlays draw over one frame, in the order they are drawn, and the part of the viewport they cover.
 pub struct OverlayPicture {
-    scrollbars: Vec<PresentedScrollbar>,
     ui_overlay_records: AlignedRecords,
     picture_in_picture_controls: Option<PictureInPictureControlsPicture>,
     pub bounds: IntRect,
@@ -353,10 +333,9 @@ impl OverlayRecords {
 
 fn replay_overlay_records(records: &AlignedRecords, painter: &mut impl ReplayPainter) {
     OVERLAY_TREE.with(|tree| {
-        let list = ListReplay::new(tree);
         let frame = ReplayFrame::unscrolled(0);
         let context = RecordsContext {
-            list_replay: &list,
+            tree,
             frame: &frame,
             to_root_matrix_of_inline_clip_space: &|_| None,
         };
@@ -379,20 +358,12 @@ impl OverlayPicture {
                 _ => false,
             };
         self.bounds == other.bounds
-            && self.scrollbars == other.scrollbars
             && self.ui_overlay_records.as_bytes() == other.ui_overlay_records.as_bytes()
             && picture_in_picture_controls_draw_the_same
     }
 
-    /// Paints the overlays over a frame: the scrollbars the compositor paints, and unless they are left out, the
-    /// overlays of the browser.
-    pub fn paint(&self, painter: &mut impl ReplayPainter, paints_ui_overlays: bool) {
-        for scrollbar in &self.scrollbars {
-            painter.paint_scrollbar(scrollbar);
-        }
-        if !paints_ui_overlays {
-            return;
-        }
+    /// Paints the overlays over a frame.
+    pub fn paint(&self, painter: &mut impl ReplayPainter) {
         replay_overlay_records(&self.ui_overlay_records, painter);
         if let Some(controls) = &self.picture_in_picture_controls {
             painter.push_layer(&ReplayLayer {
@@ -414,18 +385,6 @@ impl OverlayPicture {
             painter.pop();
         }
     }
-}
-
-fn presented_compositor_scrollbar(scrollbar: &ScrollbarOfFrame) -> PresentedScrollbar {
-    libcompositing_rust::display_list::replay::presented_scrollbar_with_colors(
-        scrollbar.gutter_rect,
-        scrollbar.thumb_rect,
-        scrollbar.expansion,
-        scrollbar.opacity,
-        scrollbar.thumb_color,
-        scrollbar.thumb_outline_color,
-        scrollbar.track_color,
-    )
 }
 
 /// The records of one overlay, with the payload of each command laid out after the command as the painter reads it.
@@ -590,7 +549,7 @@ impl OverlayRecorder<'_> {
                 translation: FloatPoint::default(),
                 scale,
                 color,
-                orientation: Orientation::Horizontal,
+                orientation: GlyphRunOrientation::Horizontal,
                 font_smoothing: 0,
             },
             &inline_data,

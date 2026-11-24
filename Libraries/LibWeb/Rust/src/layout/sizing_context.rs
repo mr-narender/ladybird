@@ -2106,6 +2106,9 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         if !self.has_children(node) {
             return CssPixels::default();
         }
+        // NB: Both sizes can have saturated, and every measurement below lays the content out against them.
+        let other_axis_size = clamp_to_max_dimension_value(other_axis_size);
+        let transferred_size = clamp_to_max_dimension_value(transferred_size);
         if axis == SizingAxis::Inline {
             return self
                 .measure_intrinsic_inline_size(
@@ -2717,21 +2720,6 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             percentage_block_size_dependency_its_layout_would_report,
         );
         contributions
-    }
-
-    pub(crate) fn outer_inline_contributions_of_legend_whose_fit_content_size_ignores_its_limits(
-        &self,
-        sized: SizedBox<'_>,
-        available_block_size: AvailableSize,
-        constraints: ContainingBlockConstraints,
-    ) -> OuterInlineContributions {
-        let legend = sized.node;
-        let content_sizes = self.content_inline_sizes(sized, constraints, None).sizes;
-        OuterInlineContributions {
-            min_content_inline_size: content_sizes.min,
-            max_content_inline_size: content_sizes.max,
-            ..self.outer_inline_contributions(legend, available_block_size, constraints)
-        }
     }
 
     pub(crate) fn block_level_table_wrapper_outer_inline_contributions(

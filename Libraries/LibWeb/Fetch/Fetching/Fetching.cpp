@@ -319,6 +319,19 @@ static void store_response_in_cache(HTTP::MemoryCache& http_cache, Infrastructur
 }
 
 // https://fetch.spec.whatwg.org/#concept-fetch
+// NB: The WebSocket opening handshake does not go through fetch yet, so it runs this step on its own.
+void append_accept_language_header_if_missing(Infrastructure::Request& request, LoaderConfig const& loader_config)
+{
+    if (!request.header_list()->contains("Accept-Language"sv)) {
+        StringBuilder accept_language;
+        accept_language.join(","sv, loader_config.preferred_languages);
+
+        auto header = HTTP::Header::isomorphic_encode("Accept-Language"sv, accept_language.string_view());
+        request.header_list()->append(move(header));
+    }
+}
+
+// https://fetch.spec.whatwg.org/#concept-fetch
 GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure::Request& request, Infrastructure::FetchAlgorithms const& algorithms, UseParallelQueue use_parallel_queue, CreateResponseBodyTransferLease create_response_body_transfer_lease)
 {
     dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'fetch' with: request @ {}", &request);
@@ -498,13 +511,7 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
 
     // 12. If request’s header list does not contain `Accept-Language`, then user agents should append
     //     (`Accept-Language, an appropriate header value) to request’s header list.
-    if (!request.header_list()->contains("Accept-Language"sv)) {
-        StringBuilder accept_language;
-        accept_language.join(","sv, fetch_params->loader_config().preferred_languages);
-
-        auto header = HTTP::Header::isomorphic_encode("Accept-Language"sv, accept_language.string_view());
-        request.header_list()->append(move(header));
-    }
+    append_accept_language_header_if_missing(request, fetch_params->loader_config());
 
     // 13. If request’s internal priority is null, then use request’s priority, initiator, destination, and
     //     render-blocking in an implementation-defined manner to set request’s internal priority to an
@@ -2892,6 +2899,11 @@ static Engine::Event::NetworkActivity::RequestStarted network_request_started(Lo
     };
 }
 
+Utf16String network_request_failed_error_message(Optional<StringView> error_message)
+{
+    return Utf16String::formatted("Load failed: {}", error_message.value_or("Unknown error"sv));
+}
+
 // https://fetch.spec.whatwg.org/#concept-http-network-fetch
 // Drop-in replacement for 'HTTP-network fetch', but obviously non-standard :^)
 // It also handles file:// URLs since those can also go through ResourceLoader.
@@ -3090,7 +3102,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
                 engine_record->event_sink().handle_event(Engine::Event::RequestTransmissionEnded { move(network_phases) });
             body_pump->handle_network_complete(Infrastructure::is_http_or_https_scheme(request->current_url().scheme()) ? Optional<i64>(timing_info.encoded_body_size) : Optional<i64> {});
         } else {
-            auto error = Utf16String::formatted("Load failed: {}", error_message.value_or("Unknown error"sv));
+            auto error = network_request_failed_error_message(error_message);
             body_pump->handle_network_error(error.to_utf8_but_should_be_ported_to_utf16());
 
             if (!pending_response->is_resolved())

@@ -510,7 +510,7 @@ impl ContextLayers {
                 of_list_and_tree.obstacles
             }
             _ => {
-                let obstacles = LayeringObstacles::of(display_list.storage(), tree);
+                let obstacles = LayeringObstacles::of(tree);
                 self.layering_obstacles_of_frames_not_drawn_as_planned = Some(LayeringObstaclesOfListAndTree {
                     display_list: Rc::downgrade(display_list),
                     tree_copy_number: tree.copy.number(),
@@ -1113,7 +1113,6 @@ impl ContextPresenting {
                 ..compositing_of_layer(stack, layer_index, &composite_offsets, &spaces_to_frame)
             })
             .collect();
-        let scrollbars = frame.frame_inputs.scrollbars_shown_for_the_page();
         let live_content_versions = LiveContentVersionsOfFrame {
             live_content,
             nested_contexts: env.nested_contexts,
@@ -1123,7 +1122,7 @@ impl ContextPresenting {
             tree,
             stack,
             FrameStateReadByReplay {
-                scrollbars: &scrollbars,
+                scrollbars: &frame.frame_inputs.scrollbars,
                 time_ns: frame.frame_inputs.painted_at.nanoseconds(),
                 live_content: &live_content_versions,
             },
@@ -1693,7 +1692,7 @@ impl ContextPresenting {
                     record_spans,
                     clips_left_to_composite: (!geometry.clips_left_to_composite.is_empty())
                         .then_some(&geometry.clips_left_to_composite[..]),
-                    composited_effect: stack.nodes[layer.placement_node_index.0].composited_effect,
+                    composited_effect: stack.innermost_composited_effect_at_or_around_band(layer.band_index),
                     allows_lcd_text,
                     frame_edge_backdrop_blurs_mirror_at: frame_rect_in_layer_space.map(IntRect::to_float),
                     raster_root: stack.spaces[raster_space_index.0].raster_root(),
@@ -1831,8 +1830,10 @@ impl ContextPresenting {
                 replay_into(env, surface, frame, selection_painting_straight);
                 raster.restore_to_count(surface, save_count);
             }
-            self.apply_raster_transform(raster, surface);
-            self.paint_overlays(env, surface, frame.frame_inputs, paints_ui_overlays);
+            if paints_ui_overlays {
+                self.apply_raster_transform(raster, surface);
+                self.paint_overlays(env, surface, frame.frame_inputs);
+            }
         }
         raster.restore_to_count(surface, save_count);
     }
@@ -2199,13 +2200,9 @@ mod tests {
             .as_mut()
             .expect("the obstacles of the list and the tree are kept")
             .obstacles
-            .mask_declared_under_effects_its_mask_is_not_under = true;
+            .sorts_planes_by_depth = false;
         let stack_of_next_frame = layers.one_layer_stack_of_frame(&display_list, &tree, VIEWPORT, not_as_planned);
-        assert!(
-            stack_of_next_frame
-                .layering_obstacles
-                .mask_declared_under_effects_its_mask_is_not_under
-        );
+        assert!(!stack_of_next_frame.layering_obstacles.sorts_planes_by_depth);
         let another_tree = Arc::new((*tree).clone());
         let stack_of_another_tree =
             layers.one_layer_stack_of_frame(&display_list, &another_tree, VIEWPORT, not_as_planned);

@@ -269,6 +269,10 @@ public:
     bool enable_primary_paste() const { return m_enable_primary_paste; }
     void set_enable_primary_paste(bool b) { m_enable_primary_paste = b; }
 
+    // Whether the UI process replaces self-signed certificate error pages with trust prompts.
+    bool offers_to_trust_self_signed_certificates() const { return m_offers_to_trust_self_signed_certificates; }
+    void set_offers_to_trust_self_signed_certificates(bool b) { m_offers_to_trust_self_signed_certificates = b; }
+
     u64 wheel_event_listener_state_generation() const { return m_wheel_event_listener_state_generation; }
     u64 keyboard_scroll_state_generation() const { return m_keyboard_scroll_state_generation; }
     void invalidate_compositor_wheel_event_listener_state(DOM::Document&);
@@ -291,6 +295,9 @@ public:
 
     GC::Ptr<HTML::LocalNavigable> hover_reporting_navigable() const { return m_hover_reporting_navigable.ptr(); }
     void set_hover_reporting_navigable(Badge<EventHandler>, GC::Ptr<HTML::LocalNavigable>);
+    void set_middle_button_scrolling_navigable(Badge<EventHandler>, GC::Ptr<HTML::LocalNavigable>);
+    GC::Ptr<HTML::LocalNavigable> middle_button_scrolling_navigable() const { return m_middle_button_scrolling_navigable.ptr(); }
+    bool press_ends_a_middle_button_scroll() const { return m_press_ends_a_middle_button_scroll; }
 
     Gfx::Cursor current_cursor() const { return m_cursor->current(); }
     PageCursor& cursor() { return *m_cursor; }
@@ -582,6 +589,11 @@ private:
     // once passed through, e.g.) leaves the report standing.
     GC::Weak<HTML::LocalNavigable> m_hover_reporting_navigable;
 
+    // The navigable whose middle button scroll is running. It hears of every mouse event, wherever the pointer is.
+    GC::Weak<HTML::LocalNavigable> m_middle_button_scrolling_navigable;
+    // Whether the press being handled ends a middle button scroll, and so has no default actions.
+    bool m_press_ends_a_middle_button_scroll { false };
+
     GC::Ptr<HTML::Navigable> m_top_level_traversable;
     OwnPtr<Compositor::CompositorContextHandle> m_retired_page_compositor_context;
     Vector<GC::Ref<HTML::Navigable>> m_navigables_being_destroyed;
@@ -602,6 +614,7 @@ private:
     bool m_should_block_pop_ups { true };
     bool m_enable_autoscroll { true };
     bool m_enable_primary_paste { true };
+    bool m_offers_to_trust_self_signed_certificates { false };
     u64 m_wheel_event_listener_state_generation { 0 };
     u64 m_keyboard_scroll_state_generation { 0 };
     bool m_keyboard_scroll_state_is_current { false };
@@ -836,6 +849,7 @@ public:
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_update_editing_history_state(bool, bool) { }
     virtual void page_did_set_text_fragment_indication_visibility(bool) { }
+    virtual void page_did_request_certificate_warning(URL::URL const&, HTML::CrossProcessId) { }
     virtual void page_did_request_resize_window(Gfx::IntSize, u64) { }
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64) { }
     virtual void page_did_request_restore_window() { }

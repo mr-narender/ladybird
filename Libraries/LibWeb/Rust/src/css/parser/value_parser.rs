@@ -5251,6 +5251,12 @@ fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> Pa
     let mut font_variant = None;
     let mut font_weight = None;
     let mut font_width = None;
+    // https://quirks.spec.whatwg.org/#the-unitless-length-quirk
+    // The font-size longhand accepts quirky lengths, but the font shorthand does not.
+    let size_context = ParseContext {
+        in_quirks_mode: false,
+        ..*context
+    };
     let mut normal_count = 0;
     let mut index = 0;
     while index < components.len() {
@@ -5284,7 +5290,7 @@ fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> Pa
             index += 1;
             continue;
         }
-        if let Some(font_size) = parse_component_for_property(context, property_id::FONT_SIZE, component) {
+        if let Some(font_size) = parse_component_for_property(&size_context, property_id::FONT_SIZE, component) {
             index += 1;
             let line_height = if components.get(index).is_some_and(|value| value.is_delim(b'/')) {
                 index += 1;
@@ -5874,6 +5880,22 @@ fn parse_animation_transition_shorthand(
         ),
         _ => return ParseOutcome::NotHandled,
     };
+    // https://drafts.csswg.org/css-values-4/#custom-idents
+    // When parsing positionally-ambiguous keywords in a property value, a <custom-ident> production can only claim the
+    // keyword if no other unfulfilled production can claim it.
+    // NB: So the longhand whose value is a <custom-ident> is tried last: "transition: ease" sets the timing function,
+    //     rather than naming a property "ease".
+    let custom_ident_longhand = if property == property_id::ANIMATION {
+        property_id::ANIMATION_NAME
+    } else {
+        property_id::TRANSITION_PROPERTY
+    };
+    let parse_order = parsed_longhands
+        .iter()
+        .copied()
+        .filter(|&longhand| longhand != custom_ident_longhand)
+        .chain([custom_ident_longhand])
+        .collect::<Vec<_>>();
     let layers = values.split(ComponentValue::is_comma).collect::<Vec<_>>();
     let mut coordinated = vec![Vec::with_capacity(layers.len()); parsed_longhands.len()];
     for layer in &layers {
@@ -5881,12 +5903,16 @@ fn parse_animation_transition_shorthand(
         if components.is_empty() {
             return ParseOutcome::Invalid;
         }
-        let mut parsed = vec![None; parsed_longhands.len()];
-        if !assign_shorthand_components(context, &components, parsed_longhands, 0, &mut parsed) {
+        let mut parsed = vec![None; parse_order.len()];
+        if !assign_shorthand_components(context, &components, &parse_order, 0, &mut parsed) {
             return ParseOutcome::Invalid;
         }
         for (index, &longhand) in parsed_longhands.iter().enumerate() {
-            let Some(value) = parsed[index]
+            let parsed_index = parse_order
+                .iter()
+                .position(|&parsed_longhand| parsed_longhand == longhand)
+                .expect("every longhand is in the parse order");
+            let Some(value) = parsed[parsed_index]
                 .take()
                 .or_else(|| coordinating_initial_item(context, longhand))
             else {

@@ -338,7 +338,6 @@ impl Encode for WhyListIsOneLayer {
             WhyListIsOneLayer::EmptyDisplayList => 1,
             WhyListIsOneLayer::SortingContext3D => 2,
             WhyListIsOneLayer::RootIsolationEffectIsNotPlainGroup => 3,
-            WhyListIsOneLayer::MaskDeclaredUnderEffectsItsMaskIsNotUnder => 4,
             WhyListIsOneLayer::RecordsBlendWithWhatOtherLayersHoldBelowThem => 5,
             WhyListIsOneLayer::EffectTheCompositorCannotCompositeIsComposited(_) => 6,
             WhyListIsOneLayer::FrameIsNotDrawnAsPlanned => 7,
@@ -364,7 +363,6 @@ impl Decode for WhyListIsOneLayer {
             1 => WhyListIsOneLayer::EmptyDisplayList,
             2 => WhyListIsOneLayer::SortingContext3D,
             3 => WhyListIsOneLayer::RootIsolationEffectIsNotPlainGroup,
-            4 => WhyListIsOneLayer::MaskDeclaredUnderEffectsItsMaskIsNotUnder,
             5 => WhyListIsOneLayer::RecordsBlendWithWhatOtherLayersHoldBelowThem,
             6 => WhyListIsOneLayer::EffectTheCompositorCannotCompositeIsComposited(decoder.decode()?),
             7 => WhyListIsOneLayer::FrameIsNotDrawnAsPlanned,
@@ -625,16 +623,18 @@ fn check_nodes(
         if node.parent_index.is_some_and(|parent_index| parent_index.0 >= index) {
             return Err("a node is not after the node it is in");
         }
-        // A node that is not composited is in the node of the space its space is in, and a composited node is in a node
-        // of its own space. So nodes nest no deeper than spaces, plus composited effects, which nest as the tree nests
-        // them.
+        // A node that is not composited is in the node of the space its space is in, or in a composited node of its own
+        // space, composited within clips the composited node is not. A composited node is in a node of its own space.
+        // So nodes nest no deeper than twice the spaces, plus composited effects, which nest as the tree nests them.
         let parent = node.parent_index.map(|parent_index| &nodes[parent_index.0]);
         let is_in_node_a_plan_puts_it_in = match (node.composited_effect, parent) {
             (None, None) => node.raster_space_index == RasterSpaceIndex::VIEWPORT,
             (None, Some(parent)) => {
-                node.raster_space_index != RasterSpaceIndex::VIEWPORT
-                    && parent.composited_effect.is_none()
-                    && parent.raster_space_index == spaces[node.raster_space_index.0].parent_index
+                (node.raster_space_index != RasterSpaceIndex::VIEWPORT
+                    && parent.raster_space_index == spaces[node.raster_space_index.0].parent_index)
+                    || (parent.composited_effect.is_some()
+                        && parent.raster_space_index == node.raster_space_index
+                        && parent.composite_clips != node.composite_clips)
             }
             (Some(_), Some(parent)) => parent.raster_space_index == node.raster_space_index,
             (Some(_), None) => return Err("a composited node is in no other node"),
@@ -870,7 +870,7 @@ fn validated_stack(
     viewport_rect: IntRect,
 ) -> Result<LayerStack, &'static str> {
     let nesting_of_live_effects = NestingOfLiveEffects::of(tree);
-    let layering_obstacles = LayeringObstacles::of_with_nesting_of_live_effects(list, tree, &nesting_of_live_effects);
+    let layering_obstacles = LayeringObstacles::of(tree);
     match stack {
         StackOnWire::OneLayer(why_list_is_one_layer) => {
             check_viewport_rect(viewport_rect)?;
@@ -929,9 +929,7 @@ pub fn compositor_takes_plans_within(viewport_rect: IntRect) -> bool {
 mod tests {
     use super::*;
     use crate::display_list::builder::DisplayListBuilder;
-    use crate::display_list::commands::{
-        ClipNodeIndex, ContextRef, DeclareMaskContent, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX,
-    };
+    use crate::display_list::commands::{ClipNodeIndex, ContextRef, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX};
     use crate::display_list::layers::planning::{LayerStackInputs, PlannedLayers, plan_layer_stack};
     use crate::display_list::layers::{
         BandIndex, CutsOfCell, LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS, LayerIndex,
@@ -1760,7 +1758,6 @@ mod tests {
             WhyListIsOneLayer::EmptyDisplayList,
             WhyListIsOneLayer::SortingContext3D,
             WhyListIsOneLayer::RootIsolationEffectIsNotPlainGroup,
-            WhyListIsOneLayer::MaskDeclaredUnderEffectsItsMaskIsNotUnder,
             WhyListIsOneLayer::RecordsBlendWithWhatOtherLayersHoldBelowThem,
             WhyListIsOneLayer::CompositedEffectsNestTooDeep,
             WhyListIsOneLayer::FrameIsNotDrawnAsPlanned,
@@ -2492,65 +2489,6 @@ mod tests {
             }
         }
         bytes
-    }
-
-    // Decoding a tree checks the parent of no dead node, and a mask declaration can name any node.
-    #[test]
-    fn a_mask_declared_for_a_dead_effect_node_lets_no_record_replay_alone_in_its_tiles() {
-        let (mut tree, _, contexts) = tree_with_document_scroller(&[]);
-        let document = contexts[0];
-        let effect_to_kill = tree.append_effect(
-            effects(0.5, CompositingAndBlendingOperator::Normal),
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        let list_declaring_content_of_mask = |mask_effect: EffectNodeIndex| {
-            let mut builder = DisplayListBuilder::new();
-            builder.append(&fill(IntRect::new(0, 0, 800, 2600), GREEN), &[], document);
-            builder.append(&canvas(IntRect::new(100, 100, 200, 100), 1), &[], document);
-            let declaration = builder.begin_group::<DeclareMaskContent>(Vec::new());
-            builder.append(&fill(IntRect::new(0, 0, 10, 10), GREEN), &[], document);
-            let content = builder.group_content_span(&declaration);
-            builder.finish_group(
-                declaration,
-                &DeclareMaskContent {
-                    rect: IntRect::new(0, 0, 10, 10),
-                    effect: mask_effect,
-                    content,
-                },
-                document,
-            );
-            DisplayListStorage::of_builder(&builder)
-        };
-        let page_with_live_mask = Page {
-            tree: tree.clone(),
-            list: list_declaring_content_of_mask(document.effect),
-        };
-        assert!(!page_with_live_mask.planned().stack.replays_whole_list());
-        for parent_of_dead_node in [effect_to_kill, EffectNodeIndex(1000)] {
-            let mut tree_with_dead_node = tree.clone();
-            tree_with_dead_node.effect_nodes[effect_to_kill.0 as usize].data = EffectNodeData::Dead;
-            tree_with_dead_node.effect_nodes[effect_to_kill.0 as usize].parent = parent_of_dead_node;
-            let page_with_dead_mask = Page {
-                tree: VisualContextTree::from_bytes(&tree_with_dead_node.to_bytes())
-                    .expect("a dead node may have any parent"),
-                list: list_declaring_content_of_mask(effect_to_kill),
-            };
-            let one_layer = LayerStack::one_layer_replaying_whole_list(
-                VIEWPORT,
-                page_with_dead_mask.list.whole_span(),
-                Some(WhyListIsOneLayer::EmptyViewport),
-                LayeringObstacles::default(),
-            );
-            for stack in [
-                page_with_dead_mask.validated(one_layer),
-                page_with_dead_mask.validated_plan(page_with_live_mask.planned_plan()),
-            ] {
-                let stack = stack.expect("the stack passes its checks");
-                assert!(stack.layering_obstacles.every_tile_replays_every_record());
-            }
-        }
     }
 
     // A candidate turned away takes no space, so candidates after it still get one, however many are turned away.

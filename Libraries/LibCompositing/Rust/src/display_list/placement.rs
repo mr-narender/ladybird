@@ -20,7 +20,9 @@ use crate::display_list::effect_clip_plan::EffectClipPlan;
 use crate::display_list::effect_geometry::{Extent, FiltersOfEffects, changed_extent_through_filters};
 use crate::display_list::reach::Reach;
 use crate::visual_context::queries::TreeCullingScratch;
-use crate::visual_context::world_transforms::translation_on_whole_device_pixels;
+use crate::visual_context::world_transforms::{
+    bounds_of_projected_rect_if_corners_in_front_of_eye, translation_on_whole_device_pixels,
+};
 use crate::visual_context::{
     ClipNodeData, CompositorScrollNodeRecord, EffectNodeData, RasterRoot, SpatialData, StickyData, VisualContextTree,
     WorldTransforms,
@@ -815,31 +817,6 @@ impl RasterSpaces {
     }
 }
 
-fn bounds_of_projected_rect_if_corners_in_front_of_eye(matrix: FloatMatrix4x4, rect: FloatRect) -> Option<FloatRect> {
-    const SMALLEST_W_IN_FRONT_OF_EYE: f32 = 0.00001;
-    let corners = [
-        (rect.x, rect.y),
-        (rect.right(), rect.y),
-        (rect.x, rect.bottom()),
-        (rect.right(), rect.bottom()),
-    ]
-    .map(|(x, y)| matrix.map_vector4([x, y, 0.0, 1.0]));
-    if corners.iter().any(|corner| corner[3] <= SMALLEST_W_IN_FRONT_OF_EYE) {
-        return None;
-    }
-    let xs = corners.map(|corner| corner[0] / corner[3]);
-    let ys = corners.map(|corner| corner[1] / corner[3]);
-    let (left, right) = (
-        xs.into_iter().fold(f32::INFINITY, f32::min),
-        xs.into_iter().fold(f32::NEG_INFINITY, f32::max),
-    );
-    let (top, bottom) = (
-        ys.into_iter().fold(f32::INFINITY, f32::min),
-        ys.into_iter().fold(f32::NEG_INFINITY, f32::max),
-    );
-    Some(FloatRect::new(left, top, right - left, bottom - top))
-}
-
 pub(crate) fn is_finite_rect(rect: FloatRect) -> bool {
     rect.x.is_finite() && rect.y.is_finite() && rect.width.is_finite() && rect.height.is_finite()
 }
@@ -1178,8 +1155,13 @@ pub struct RunGroups {
     group_is_sorted_by_depth: Vec<bool>,
 }
 
-// By the tree's structure rather than effect values, so that groups stay put while an opacity animates.
-fn outermost_grouping_effects(tree: &VisualContextTree) -> Vec<EffectNodeIndex> {
+// By the tree's structure rather than effect values, so that groups stay put while an opacity animates. An effect that
+// `effect_leaves_its_runs_ungrouped_by_effect_index` marks groups nothing, which holds only where no effect around it
+// groups.
+fn outermost_grouping_effects(
+    tree: &VisualContextTree,
+    effect_leaves_its_runs_ungrouped_by_effect_index: &[bool],
+) -> Vec<EffectNodeIndex> {
     let mut outermost_grouping_effect_of_effect = vec![EffectNodeIndex::NONE; tree.effect_nodes.len()];
     tree.visit_effect_nodes_parents_first(|index| {
         let node = &tree.effect_nodes[index];
@@ -1188,7 +1170,13 @@ fn outermost_grouping_effects(tree: &VisualContextTree) -> Vec<EffectNodeIndex> 
         } else {
             outermost_grouping_effect_of_effect[node.parent.0 as usize]
         };
-        let is_grouping = node.data.pushes_layer() && tree.root_isolation_effect != Some(EffectNodeIndex(index as u32));
+        let leaves_its_runs_ungrouped = effect_leaves_its_runs_ungrouped_by_effect_index
+            .get(index)
+            .copied()
+            .unwrap_or(false);
+        let is_grouping = node.data.pushes_layer()
+            && tree.root_isolation_effect != Some(EffectNodeIndex(index as u32))
+            && !leaves_its_runs_ungrouped;
         outermost_grouping_effect_of_effect[index] = if !outermost_of_parent.is_none() {
             outermost_of_parent
         } else if is_grouping {
@@ -1245,9 +1233,20 @@ impl RunGroups {
         tree: &VisualContextTree,
         command_runs: impl IntoIterator<Item = &'a DisplayListCommandRun>,
     ) -> Self {
+        Self::new_leaving_runs_of_effects_ungrouped(tree, command_runs, &[])
+    }
+
+    /// As `new`, but the runs of each effect that `effect_leaves_its_runs_ungrouped_by_effect_index` marks are grouped
+    /// only as the effects inside it group them. No effect around a marked effect may group its runs.
+    pub fn new_leaving_runs_of_effects_ungrouped<'a>(
+        tree: &VisualContextTree,
+        command_runs: impl IntoIterator<Item = &'a DisplayListCommandRun>,
+        effect_leaves_its_runs_ungrouped_by_effect_index: &[bool],
+    ) -> Self {
         let roots_of_contexts_sorting_planes_by_depth = tree.roots_of_contexts_sorting_planes_by_depth();
         let mut sorting_context_of_run = Vec::new();
-        let outermost_grouping_effects = outermost_grouping_effects(tree);
+        let outermost_grouping_effects =
+            outermost_grouping_effects(tree, effect_leaves_its_runs_ungrouped_by_effect_index);
         let mut effect_chain_holds_mask = vec![false; tree.effect_nodes.len()];
         tree.visit_effect_nodes_parents_first(|index| {
             let node = &tree.effect_nodes[index];

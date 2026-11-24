@@ -32,6 +32,7 @@
 #include <LibGfx/Point.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibJS/Forward.h>
+#include <LibJS/SourceCode.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibUnicode/Forward.h>
@@ -733,8 +734,10 @@ public:
     void capture_events();
     void release_events();
 
-    Utf16String const& source() const { return m_source; }
-    void set_source(Utf16String source) { m_source = move(source); }
+    // NB: The source is kept as source code, which LibJS compresses while nothing reads it.
+    Utf16String source() const { return m_source ? m_source->code() : Utf16String {}; }
+    size_t source_length_in_code_units() const { return m_source ? m_source->length_in_code_units() : 0; }
+    void set_source(Utf16String);
 
     HTML::EnvironmentSettingsObject& relevant_settings_object() const;
 
@@ -1632,6 +1635,9 @@ public:
     [[nodiscard]] bool is_at_style_stabilization_bound(Layout::BegunRead const& read) const;
     // How many times an element's animated custom properties moved in this style stabilization epoch, counting this one.
     [[nodiscard]] u64 note_animated_custom_properties_moved_in_stabilization_epoch(CSS::StyleNodeID);
+    // Whether the dependents of a size container whose box moved are computed again, as they are for its first few
+    // moves in a style stabilization epoch.
+    [[nodiscard]] bool note_size_container_moved_in_stabilization_epoch(CSS::StyleNodeID);
     void end_style_stabilization_epoch();
     void note_style_stabilization_has_style_reactions()
     {
@@ -2060,7 +2066,7 @@ private:
     bool m_has_been_destroyed { false };
     bool m_observers_consider_document_fully_active { false };
 
-    Utf16String m_source;
+    RefPtr<JS::SourceCode const> m_source;
 
     GC::Ptr<Element> m_pending_parsing_blocking_script;
 
@@ -2132,6 +2138,7 @@ private:
 
     HashMap<CSS::StyleNodeID, u64> m_animated_custom_property_changes_in_stabilization_epoch;
     u64 m_animated_custom_property_moves_in_stabilization_epoch { 0 };
+    HashMap<CSS::StyleNodeID, u64> m_size_container_moves_in_stabilization_epoch;
     bool m_created_for_appropriate_template_contents { false };
     GC::Ptr<Document> m_associated_inert_template_document;
     GC::Ptr<Document> m_appropriate_template_contents_owner_document;
