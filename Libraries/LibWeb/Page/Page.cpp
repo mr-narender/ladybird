@@ -218,7 +218,9 @@ void Page::notify_document_about_user_activation(HTML::CrossProcessId document_i
             continue;
 
         // 5.1. Set window's last activation timestamp to the current high resolution time.
-        // 5.2. Notify the close watcher manager about user activation given window.
+        // 5.2. Set window's has history-action activation to true.
+        // 5.3. Set window's has sticky activation to true.
+        // 5.4. Notify the close watcher manager about user activation given window.
         document->window()->notify_about_user_activation();
         return;
     }
@@ -780,7 +782,7 @@ void Page::keyboard_scroll_editability_changed(DOM::Document& document)
         invalidate_compositor_keyboard_scroll_state();
 }
 
-Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor(u64 visual_context_tree_structural_epoch)
+Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor()
 {
     if (!has_local_traversable() || !local_traversable()->has_compositor_context())
         return {};
@@ -791,7 +793,6 @@ Compositing::KeyboardScrollState Page::take_keyboard_scroll_state_for_compositor
     m_keyboard_scroll_focus_is_editable = document && document->active_input_events_target();
     auto state = snapshot.state;
     state.generation = m_keyboard_scroll_state_generation;
-    state.visual_context_tree_structural_epoch = visual_context_tree_structural_epoch;
     m_keyboard_scroll_state_is_scrollable = state.target.has_value();
     m_keyboard_scroll_state_is_current = true;
     return state;

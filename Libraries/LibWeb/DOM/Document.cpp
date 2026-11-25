@@ -898,7 +898,7 @@ Layout::NodeArena& Document::layout_node_arena()
         Layout::RustFFI::document_host_set_paint_preparation_host(m_layout_node_arena->host(), paint_preparation_host_callbacks());
         Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
             .context = this,
-            .shell_style_changed = [](void*, void* shell, u64 record, void const* payloads, bool derived, bool attach_resources) { as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, derived, attach_resources); },
+            .shell_style_changed = [](void*, void* shell, u64 record, CSS::ComputedValuesFFI::StyleRecordGroups const* payloads, bool derived, bool attach_resources) { as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, derived, attach_resources); },
             .shell_style_damaged = [](void*, void* shell, u32 damage) { Painting::repaint_after_style_change(*static_cast<Layout::Node*>(shell), CSS::decode_style_invalidation(damage)); },
         };
         Layout::RustFFI::document_host_set_style_record_host_callbacks(m_layout_node_arena->host(), style_record_host_callbacks);
@@ -4974,7 +4974,7 @@ void Document::scroll_to_the_beginning_of_the_document()
 {
     // FIXME: Actually implement this algorithm
     if (auto navigable = this->navigable())
-        navigable->perform_scroll_of_viewport_scrolling_box({ 0, 0 });
+        navigable->store_scroll_offset({ .node_id = unique_id(), .kind = Web::AsyncScrollNodeKind::Viewport }, { 0, 0 }, Painting::CompositorScrollRequest::ProgrammaticJump);
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#update-the-current-document-readiness

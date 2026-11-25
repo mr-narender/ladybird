@@ -59,6 +59,7 @@
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/DOM/StaticNodeList.h>
 #include <LibWeb/DOM/SubtreeInsertionScope.h>
+#include <LibWeb/DOM/UserSelect.h>
 #include <LibWeb/DOM/XMLDocument.h>
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
@@ -234,22 +235,27 @@ CSS::UserSelect Node::user_select_used_value() const
         element = flat_tree_parent_element();
     }
 
-    auto const* values = element ? element->style_group<CSS::ComputedValues::MiscInteractionValues>() : nullptr;
+    return element ? used_user_select_for_element(*element) : CSS::UserSelect::None;
+}
+
+CSS::UserSelect used_user_select_for_element(Element const& element, UsedUserSelect inherited)
+{
+    auto const* values = element.style_group<CSS::ComputedValues::MiscInteractionValues>();
     if (!values)
         return CSS::UserSelect::None;
 
     // The used value is the same as the computed value, except:
     auto computed_value = static_cast<CSS::UserSelect>(values->user_select);
 
-    auto* form_control = as_if<HTML::FormAssociatedTextControlElement>(*element);
-    if (element->is_editing_host() || (form_control && form_control->text_control_to_html_element().is_mutable()))
+    auto* form_control = as_if<HTML::FormAssociatedTextControlElement>(element);
+    if (element.is_editing_host() || (form_control && form_control->text_control_to_html_element().is_mutable()))
         return CSS::UserSelect::Contain;
 
     if (computed_value != CSS::UserSelect::Auto)
         return computed_value;
 
-    if (auto parent_element = element->element_to_inherit_style_from({})) {
-        auto parent_used_value = parent_element->user_select_used_value();
+    if (auto parent_element = element.element_to_inherit_style_from({})) {
+        auto parent_used_value = parent_element == inherited.element ? inherited.value : parent_element->user_select_used_value();
         if (parent_used_value == CSS::UserSelect::All || parent_used_value == CSS::UserSelect::None)
             return parent_used_value;
     }
@@ -1134,15 +1140,8 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
     children_changed(metadata);
     invalidate_html_collection_caches_in_ancestors(affects_elements);
 
-    // OPTIMIZATION: Disconnected subtrees cannot have post-connection steps to run. If any root is connected,
-    //               collect all nodes, since a callback could connect one of the initially detached subtrees.
-    //               Unless some tree changed since the insertion steps began, the nodes to collect are the ones those
-    //               steps ran for, so without one that has post-connection steps there is nothing to run.
-    auto tree_changed_since_insertion_steps = s_last_tree_version != tree_version_before_insertion_steps;
-    if ((any_node_has_post_connection_steps || tree_changed_since_insertion_steps)
-        && any_of(nodes, [](auto const& node) { return node->is_connected(); }))
-        run_post_connection_steps(nodes);
-
+    // NB: The marks are set before the post-connection steps, since those can run script that reads layout geometry
+    //     and must find the inserted nodes waiting for their boxes.
     auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !may_have_layout_box();
     if (is_connected() && !is_boxless_style_element) {
         // NB: Called during DOM insertion, layout is not up to date. The element's installed style is read.
@@ -1157,6 +1156,15 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
             inserted_node->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
         }
     }
+
+    // OPTIMIZATION: Disconnected subtrees cannot have post-connection steps to run. If any root is connected,
+    //               collect all nodes, since a callback could connect one of the initially detached subtrees.
+    //               Unless some tree changed since the insertion steps began, the nodes to collect are the ones those
+    //               steps ran for, so without one that has post-connection steps there is nothing to run.
+    auto tree_changed_since_insertion_steps = s_last_tree_version != tree_version_before_insertion_steps;
+    if ((any_node_has_post_connection_steps || tree_changed_since_insertion_steps)
+        && any_of(nodes, [](auto const& node) { return node->is_connected(); }))
+        run_post_connection_steps(nodes);
 
     // AD-HOC: An inserted list item can renumber the list-item counter for its list owner's whole list.
     //         Appending to a forward counter does not change any existing counter value.
