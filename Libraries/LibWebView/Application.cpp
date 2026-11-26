@@ -821,14 +821,6 @@ ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> 
     m_profile = TRY(Profile::create(profile_selection, profile_roots));
 #endif
 
-    auto const& paths = m_profile->paths();
-    auto root_for_tests = m_web_content_options.is_test_mode == IsTestMode::Yes ? m_browser_options.local_file_root_for_tests : Optional<ByteString> {};
-    m_local_file_grant_policy = LocalFileGrantPolicy {
-        Core::StandardPaths::home_directory(),
-        { paths.config, paths.data, paths.cache, paths.runtime, paths.identity, m_instance_data_directory },
-        move(root_for_tests),
-    };
-
     return {};
 }
 
@@ -862,7 +854,12 @@ void Application::create_mach_port_server([[maybe_unused]] ByteString const& pro
                 m_event_loop->deferred_invoke([this, transport = move(transport.ports)]() mutable {
                     if (!m_on_browser_process_transport)
                         return;
-                    m_on_browser_process_transport(make<IPC::Transport>(move(transport.receive_right), move(transport.send_right)));
+                    auto browser_process_transport = IPC::Transport::create(move(transport.receive_right), move(transport.send_right));
+                    if (browser_process_transport.is_error()) {
+                        warnln("Unable to accept a Browser process's transport: {}", browser_process_transport.error());
+                        return;
+                    }
+                    m_on_browser_process_transport(browser_process_transport.release_value());
                 });
             });
     };
@@ -2246,6 +2243,7 @@ ErrorOr<void> Application::launch_compositor_process()
     m_compositor_presentation_client = adopt_ref(*new CompositorPresentationClient(move(transport)));
     m_compositor_presentation_id = presentation.presentation_id();
     m_compositor_presentation_client->async_set_scrollbar_track_press_jumps(platform_scrollbar_track_press_jumps());
+    platform_scrollbar_visibility_changed();
     m_compositor_presentation_client->on_death = [this, presentation_client = m_compositor_presentation_client->make_weak_ptr<CompositorPresentationClient>()] {
         // NB: This runs on a later turn, by which time a new Compositor can have replaced the one this belonged to.
         if (!presentation_client || presentation_client.ptr() != m_compositor_presentation_client.ptr())
@@ -2287,6 +2285,12 @@ void Application::platform_scrollbar_track_press_behavior_changed()
 {
     if (m_compositor_presentation_client)
         m_compositor_presentation_client->async_set_scrollbar_track_press_jumps(platform_scrollbar_track_press_jumps());
+}
+
+void Application::platform_scrollbar_visibility_changed()
+{
+    if (m_compositor_presentation_client)
+        m_compositor_presentation_client->async_set_scrollbars_always_shown(m_settings->appearance().always_show_scrollbars || platform_scrollbars_always_shown());
 }
 
 void Application::notify_compositor_gpu_presentation_unavailable()
@@ -2652,7 +2656,16 @@ Optional<Process&> Application::find_process(pid_t pid)
     return m_process_manager->find_process(pid);
 }
 
-void Application::process_did_exit(Process&& process, Optional<int>)
+static bool exited_on_its_own_without_error(int exit_status)
+{
+#if defined(AK_OS_WINDOWS)
+    return exit_status == 0;
+#else
+    return WIFEXITED(exit_status) && WEXITSTATUS(exit_status) == 0;
+#endif
+}
+
+void Application::process_did_exit(Process&& process, Optional<int> exit_status)
 {
 #if defined(AK_OS_MACOS)
     // A helper that exits before it fetches its transport leaves its ports registered. Holding them would keep the
@@ -2688,6 +2701,7 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         break;
     case ProcessType::VideoDecoderServer:
         // The MediaServer it served asks for a new one once its decoders notice the loss.
+        video_decoder_server_exited(process.child_id(), exit_status.has_value() && !exited_on_its_own_without_error(*exit_status));
         break;
     case ProcessType::WebRTCClient:
         // The WebContent process it served asks for a new one the next time it needs one.
@@ -3219,6 +3233,7 @@ void Application::update_website_color_scheme()
 void Application::appearance_changed(Badge<ApplicationSettingsObserver>)
 {
     update_website_color_scheme();
+    platform_scrollbar_visibility_changed();
 }
 
 void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)

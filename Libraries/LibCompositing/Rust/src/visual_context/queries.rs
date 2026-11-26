@@ -10,7 +10,6 @@ use super::{
     IncludeVisualViewportTransform, SpatialData, SpatialNodeIndex, StickyData, TransformDataRole,
     VISUAL_VIEWPORT_NODE_INDEX, VisualContextTree, WorldTransforms, device_offset_for_index,
 };
-use ak::math;
 use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, IntPoint, IntRect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,12 +18,6 @@ pub enum ClipBehavior {
     /// Transform the point without rejecting it against clip rects and clip paths. Used when searching for the
     /// closest caret position within a scope the point may lie entirely outside of.
     Ignore,
-}
-
-impl ClipBehavior {
-    pub fn from_respect_clip(respect_clip: bool) -> Self {
-        if respect_clip { Self::Respect } else { Self::Ignore }
-    }
 }
 
 pub fn should_cull_back_face(accumulated_matrix: FloatMatrix4x4, plane_root_matrix: FloatMatrix4x4) -> bool {
@@ -485,16 +478,6 @@ impl VisualContextTree {
         }
     }
 
-    pub fn effect_is_isolated_by_layer(&self, mut effect: EffectNodeIndex) -> bool {
-        while !effect.is_none() {
-            if self.effect_pushes_layer_at_replay(effect) {
-                return true;
-            }
-            effect = self.effect_nodes[effect.0 as usize].parent;
-        }
-        false
-    }
-
     pub fn nearest_layer_at_or_above(&self, mut effect: EffectNodeIndex) -> Option<EffectNodeIndex> {
         while !effect.is_none() {
             if self.effect_pushes_layer_at_replay(effect) {
@@ -551,17 +534,6 @@ impl VisualContextTree {
             reads_backdrop(&node.data)
                 && (parent_of_reader().is_none()
                     || content_composites_into_root_group_by_effect_index[parent_of_reader().0 as usize])
-        })
-    }
-
-    /// A blend mode or a backdrop filter reads what the canvas holds outside the effect's own layer.
-    pub fn has_unisolated_destination_reading_effect(&self) -> bool {
-        self.effect_nodes.iter().any(|node| {
-            matches!(
-                &node.data,
-                EffectNodeData::Effects(effects)
-                    if effects.blend_mode != CompositingAndBlendingOperator::Normal || effects.backdrop_filter.is_some()
-            ) && !self.effect_is_isolated_by_layer(node.parent)
         })
     }
 }
@@ -759,43 +731,6 @@ impl VisualContextTree {
         command_runs: impl IntoIterator<Item = &'a crate::display_list::commands::DisplayListCommandRun>,
     ) -> bool {
         command_runs.into_iter().all(|run| self.context_is_valid(run.context))
-    }
-
-    /// Bounds every possible angle, rather than just the current sample: content outside the viewport now may rotate
-    /// into it later. Repeatedly enclosing rectangles also conservatively handles nested rotations.
-    pub fn rect_with_rotation_bounds_to_viewport(
-        &self,
-        mut index: SpatialNodeIndex,
-        mut rect: FloatRect,
-        rotating_nodes: &[bool],
-        scroll_offsets: &[FloatPoint],
-    ) -> Option<FloatRect> {
-        loop {
-            if rotating_nodes[index.0 as usize] {
-                let SpatialData::Transform(transform) = &self.spatial_nodes[index.0 as usize].data else {
-                    return None;
-                };
-                let origin = transform.origin;
-                let dx = (rect.x - origin.x).abs().max((rect.right() - origin.x).abs());
-                let dy = (rect.y - origin.y).abs().max((rect.bottom() - origin.y).abs());
-                let radius = math::hypot(dx, dy);
-                rect = FloatRect::new(origin.x - radius, origin.y - radius, 2.0 * radius, 2.0 * radius);
-            } else {
-                let matrix = self.local_transform(index, scroll_offsets).matrix;
-                // Projecting a rectangle at each ancestor would discard depth needed by later 3D transforms.
-                if !matrix.is_2d_affine() {
-                    return None;
-                }
-                rect = matrix.extract_2d_affine().map_rect(rect);
-            }
-            if !rect.x.is_finite() || !rect.y.is_finite() || !rect.width.is_finite() || !rect.height.is_finite() {
-                return None;
-            }
-            if index == VISUAL_VIEWPORT_NODE_INDEX {
-                return Some(rect);
-            }
-            index = self.spatial_nodes[index.0 as usize].parent;
-        }
     }
 
     pub fn spatial_nodes_in_subtrees_of(&self, roots: &[SpatialNodeIndex]) -> Vec<bool> {
@@ -1064,120 +999,6 @@ mod tests {
         }));
         assert!(tree.tombstone_effect_slot(effect));
         assert!(!tree.context_is_valid(context));
-    }
-
-    #[test]
-    fn a_context_is_isolated_by_an_effects_or_mask_ancestor_or_self() {
-        let mut tree = identity_tree();
-        let outer_clip = tree.append_clip(
-            clip(FloatRect::new(0.0, 0.0, 10.0, 10.0), ClipMode::Intersect),
-            ClipNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-        );
-        let clip_context = ContextRef {
-            clip: outer_clip,
-            effect: EffectNodeIndex::NONE,
-            ..ContextRef::default()
-        };
-        let effect = tree.append_effect(
-            effects(0.5, CompositingAndBlendingOperator::Normal),
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            outer_clip,
-        );
-        let effects_context = ContextRef {
-            clip: outer_clip,
-            effect,
-            ..ContextRef::default()
-        };
-        let nested_clip = tree.append_clip(
-            clip(FloatRect::new(0.0, 0.0, 5.0, 5.0), ClipMode::Intersect),
-            outer_clip,
-            VISUAL_VIEWPORT_NODE_INDEX,
-        );
-        let nested_clip_context = ContextRef {
-            clip: nested_clip,
-            effect,
-            ..ContextRef::default()
-        };
-        let marker = tree.append_effect(
-            EffectNodeData::BackgroundColorAnimation,
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        let marker_context = ContextRef {
-            clip: ClipNodeIndex::NONE,
-            effect: marker,
-            ..ContextRef::default()
-        };
-        assert!(!tree.effect_is_isolated_by_layer(EffectNodeIndex::NONE));
-        assert!(!tree.effect_is_isolated_by_layer(clip_context.effect));
-        assert!(tree.effect_is_isolated_by_layer(effects_context.effect));
-        assert!(tree.effect_is_isolated_by_layer(nested_clip_context.effect));
-        assert!(!tree.effect_is_isolated_by_layer(marker_context.effect));
-    }
-
-    #[test]
-    fn a_destination_reading_effect_counts_as_unisolated_only_without_a_layer_ancestor() {
-        let mut tree = identity_tree();
-        assert!(!tree.has_unisolated_destination_reading_effect());
-        let opacity_effect = tree.append_effect(
-            effects(0.5, CompositingAndBlendingOperator::Normal),
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        tree.append_effect(
-            effects(1.0, CompositingAndBlendingOperator::Multiply),
-            opacity_effect,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        assert!(!tree.has_unisolated_destination_reading_effect());
-        tree.append_effect(
-            effects(1.0, CompositingAndBlendingOperator::Multiply),
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        assert!(tree.has_unisolated_destination_reading_effect());
-
-        // A backdrop filter reads outside its own layer, so only an enclosing layer isolates it.
-        let backdrop_effects = || {
-            EffectNodeData::Effects(EffectsData {
-                isolation: false,
-                opacity: 1.0,
-                blend_mode: CompositingAndBlendingOperator::Normal,
-                filter: None,
-                backdrop_filter: Some(crate::visual_context::BackdropFilterData {
-                    filter: std::sync::Arc::new(vec![1]),
-                    region: IntRect::new(0, 0, 10, 10),
-                    corner_radii: libgfx_rust::CornerRadii::default(),
-                }),
-            })
-        };
-        let mut tree = identity_tree();
-        let opacity_effect = tree.append_effect(
-            effects(0.5, CompositingAndBlendingOperator::Normal),
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        tree.append_effect(
-            backdrop_effects(),
-            opacity_effect,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        assert!(!tree.has_unisolated_destination_reading_effect());
-        tree.append_effect(
-            backdrop_effects(),
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        assert!(tree.has_unisolated_destination_reading_effect());
     }
 
     #[test]

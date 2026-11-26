@@ -802,6 +802,7 @@ Hub::UIInfo Application::current_ui_info() const
     info.reports_scroll_momentum = platform_reports_scroll_momentum();
     info.scrolls_elastically = platform_scrolls_elastically();
     info.scrollbar_track_press_jumps = platform_scrollbar_track_press_jumps();
+    info.scrollbars_always_shown = platform_scrollbars_always_shown();
     info.prefers_reduced_motion = platform_prefers_reduced_motion();
     info.prefers_more_contrast = platform_prefers_more_contrast();
     info.preferred_languages = platform_preferred_languages();
@@ -911,6 +912,8 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         // The Hub may receive startup messages before it has constructed its transport.
         IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
 
+        auto transport = TRY(IPC::Transport::create(move(port_a_recv), move(port_b_send)));
+
         Optional<Core::Process> spawned_process;
         {
             MutexLocker child_registration_locker(hub_bootstrap->server.child_registration_lock());
@@ -918,8 +921,6 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
             hub_bootstrap->server.register_child_transport(spawned_process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
         }
         auto process = spawned_process.release_value();
-
-        auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
 #    else
         int socket_fds[2] {};
         TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_fds));
@@ -1389,6 +1390,10 @@ void Application::did_create_event_loop(Core::EventLoop& event_loop)
         if (auto* hub = HubConnection::the_if_connected())
             hub->async_ui_info_changed(Application::the().current_ui_info());
     });
+    Ladybird::on_scrollbar_visibility_change([] {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_ui_info_changed(Application::the().current_ui_info());
+    });
 #endif
     static_cast<EventLoopImplementationQt&>(event_loop.impl()).set_main_loop();
 }
@@ -1437,6 +1442,15 @@ bool Application::platform_scrollbar_track_press_jumps() const
     return scrollbar_track_press_jumps();
 #else
     return false;
+#endif
+}
+
+bool Application::platform_scrollbars_always_shown() const
+{
+#if defined(AK_OS_MACOS)
+    return scrollbars_always_shown();
+#else
+    return true;
 #endif
 }
 

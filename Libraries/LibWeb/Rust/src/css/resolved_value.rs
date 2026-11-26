@@ -29,7 +29,7 @@ use crate::css::serialize::color_function_has_missing_component;
 use crate::css::serialize::transform_function;
 use crate::css::style_compute::map_logical_alias_to_physical;
 use crate::css::style_value::{
-    ColorBase, ColorFunctionPayload, CssString, FILTER_KIND_DROP_SHADOW, RetainedStyleValueData,
+    ColorBase, ColorFunctionPayload, CssString, FILTER_KIND_DROP_SHADOW, FunctionPayload, RetainedStyleValueData,
     RetainedStyleValueDataList, ShadowPayload, StyleValueBox, StyleValueData, TransformationPayload,
     shared_style_value, value_depends_on_current_color,
 };
@@ -140,6 +140,49 @@ fn resolve_color_style_value(
     }
 
     color_value(computed_color)
+}
+
+// https://drafts.csswg.org/css-color-4/#resolving-color-values
+// The resolved value of a <color> is its used value, here for each color of a gap decoration color list.
+fn resolve_gap_decoration_color_style_value(value: &StyleValueArc, style: &ColorResolutionInput) -> StyleValueArc {
+    let resolve_list = |values: &RetainedStyleValueDataList| {
+        RetainedStyleValueDataList::from_retained_values(
+            values
+                .as_slice()
+                .iter()
+                .map(|item| {
+                    RetainedStyleValueData::from_arc(resolve_gap_decoration_color_style_value(
+                        &item.clone().into_arc(),
+                        style,
+                    ))
+                })
+                .collect(),
+        )
+    };
+    match &**value {
+        StyleValueData::ValueList {
+            values,
+            separator,
+            collapsible,
+        } => StyleValueArc::new(StyleValueData::ValueList {
+            values: resolve_list(values),
+            separator: *separator,
+            collapsible: *collapsible,
+        }),
+        StyleValueData::Function(function_payload) => {
+            StyleValueArc::new(StyleValueData::Function(StyleValueBox::new(FunctionPayload {
+                name: function_payload.name.clone(),
+                value: RetainedStyleValueData::from_arc(resolve_gap_decoration_color_style_value(
+                    &function_payload.value.clone().into_arc(),
+                    style,
+                )),
+            })))
+        }
+        _ => match to_color(value, style) {
+            Some(color) => resolve_color_style_value(value, color, Some(style)),
+            None => value.clone(),
+        },
+    }
 }
 
 // https://drafts.csswg.org/css-color-4/#resolving-color-values
@@ -397,6 +440,63 @@ fn transformation_value(transform_function: u8, parameters: &[f32]) -> StyleValu
             matrix_values: RetainedStyleValueDataList::from_retained_values(Vec::new()),
         },
     )))
+}
+
+/// The resolved value of transform, with percentages resolved against the box that `reference_box` gives.
+fn resolved_transform(
+    transform_values: &TransformValues,
+    reference_box: impl FnOnce() -> CssPixelRect,
+) -> StyleValueArc {
+    if transform_values.transformations.pointer.is_null() {
+        return keyword_value(keyword::NONE);
+    }
+
+    // https://drafts.csswg.org/css-transforms-2/#serialization-of-the-computed-value
+    // The transform property is a resolved value special case property. [CSSOM]
+    // When the computed value is a <transform-list>, the resolved value is one <matrix()> function or one
+    // <matrix3d()> function computed by the following algorithm:
+    // 1. Let transform be a 4x4 matrix initialized to the identity matrix.
+    //    The elements m11, m22, m33 and m44 of transform must be set to 1; all other elements of transform must be
+    //    set to 0.
+    // 2. Post-multiply all <transform-function>s in <transform-list> to transform.
+    //    NB: The resolved transforms start with those of the translate, rotate and scale properties.
+    let individual_transform_count = [
+        &transform_values.translate,
+        &transform_values.rotate,
+        &transform_values.scale,
+    ]
+    .iter()
+    .filter(|handle| !handle.pointer.is_null())
+    .count();
+    let resolved_transforms = &transform_values.resolved_transforms;
+    // SAFETY: The list holds `length` transforms while the style lives.
+    let entries =
+        unsafe { ak::slice_from_raw_parts(resolved_transforms.pointer.cast_const(), resolved_transforms.length) };
+    let transform = multiply_transform_functions(
+        libgfx_rust::FloatMatrix4x4::identity(),
+        entries.get(individual_transform_count..).unwrap_or_default(),
+        reference_box(),
+    );
+    let m = &transform.elements;
+
+    // 3. Chose between <matrix()> or <matrix3d()> serialization:
+    // -> If transform is a 2D matrix
+    //        Serialize transform to a <matrix()> function.
+    if is_2d_matrix(&transform) {
+        return transformation_value(
+            transform_function::MATRIX,
+            &[m[0][0], m[1][0], m[0][1], m[1][1], m[0][3], m[1][3]],
+        );
+    }
+    // -> Otherwise
+    //        Serialize transform to a <matrix3d()> function.
+    transformation_value(
+        transform_function::MATRIX3D,
+        &[
+            m[0][0], m[1][0], m[2][0], m[3][0], m[0][1], m[1][1], m[2][1], m[3][1], m[0][2], m[1][2], m[2][2], m[3][2],
+            m[0][3], m[1][3], m[2][3], m[3][3],
+        ],
+    )
 }
 
 /// What the host names for the box of the element whose resolved value is read.
@@ -679,59 +779,15 @@ impl ResolvedValueBox<'_> {
     }
 
     fn resolved_transform(&self) -> StyleValueArc {
-        let transform_values = self.style.transform();
-        if transform_values.transformations.pointer.is_null() {
-            return keyword_value(keyword::NONE);
-        }
-
-        // https://drafts.csswg.org/css-transforms-2/#serialization-of-the-computed-value
-        // The transform property is a resolved value special case property. [CSSOM]
-        // When the computed value is a <transform-list>, the resolved value is one <matrix()> function or one
-        // <matrix3d()> function computed by the following algorithm:
-        // 1. Let transform be a 4x4 matrix initialized to the identity matrix.
-        //    The elements m11, m22, m33 and m44 of transform must be set to 1; all other elements of transform must be
-        //    set to 0.
-        // 2. Post-multiply all <transform-function>s in <transform-list> to transform.
-        //    NB: The resolved transforms start with those of the translate, rotate and scale properties.
-        assert!(has_committed_box(self.host, self.node));
-        let reference_box = transform_reference_box(self.host, self.node);
-        let individual_transform_count = [
-            &transform_values.translate,
-            &transform_values.rotate,
-            &transform_values.scale,
-        ]
-        .iter()
-        .filter(|handle| !handle.pointer.is_null())
-        .count();
-        let resolved_transforms = &transform_values.resolved_transforms;
-        // SAFETY: The list holds `length` transforms while the style lives.
-        let entries =
-            unsafe { ak::slice_from_raw_parts(resolved_transforms.pointer.cast_const(), resolved_transforms.length) };
-        let transform = multiply_transform_functions(
-            libgfx_rust::FloatMatrix4x4::identity(),
-            entries.get(individual_transform_count..).unwrap_or_default(),
-            reference_box,
-        );
-        let m = &transform.elements;
-
-        // 3. Chose between <matrix()> or <matrix3d()> serialization:
-        // -> If transform is a 2D matrix
-        //        Serialize transform to a <matrix()> function.
-        if is_2d_matrix(&transform) {
-            return transformation_value(
-                transform_function::MATRIX,
-                &[m[0][0], m[1][0], m[0][1], m[1][1], m[0][3], m[1][3]],
-            );
-        }
-        // -> Otherwise
-        //        Serialize transform to a <matrix3d()> function.
-        transformation_value(
-            transform_function::MATRIX3D,
-            &[
-                m[0][0], m[1][0], m[2][0], m[3][0], m[0][1], m[1][1], m[2][1], m[3][1], m[0][2], m[1][2], m[2][2],
-                m[3][2], m[0][3], m[1][3], m[2][3], m[3][3],
-            ],
-        )
+        resolved_transform(self.style.transform(), || {
+            assert!(has_committed_box(self.host, self.node));
+            // NB: A non-transformable element resolves its transform against a 0x0 box.
+            //     https://github.com/w3c/csswg-drafts/issues/9121
+            if !crate::painting::ffi::render_state_paintable_is_transformable(self.host, self.node) {
+                return CssPixelRect::default();
+            }
+            transform_reference_box(self.host, self.node)
+        })
     }
 
     fn reference_box_if_used(&self) -> Option<CssPixelRect> {
@@ -846,7 +902,14 @@ impl ResolvedValueBox<'_> {
             property_id::FILL | property_id::FLOOD_COLOR | property_id::STOP_COLOR | property_id::STROKE => {
                 resolve_svg_color_style_value(&self.computed(property), &color_input)
             }
-            property_id::COLUMN_RULE_COLOR => self.resolved_color(property, style.column_rule_color()),
+            property_id::COLUMN_RULE_COLOR
+                if !matches!(&*self.computed(property), StyleValueData::ValueList { .. }) =>
+            {
+                self.resolved_color(property, style.column_rule_color())
+            }
+            property_id::COLUMN_RULE_COLOR | property_id::ROW_RULE_COLOR => {
+                resolve_gap_decoration_color_style_value(&self.computed(property), &color_input)
+            }
             property_id::OUTLINE_COLOR => self.resolved_color(property, style.outline_color()),
             property_id::TEXT_DECORATION_COLOR => self.resolved_color(property, style.text_decoration_color()),
             property_id::TEXT_SHADOW => {
@@ -1120,7 +1183,12 @@ pub unsafe extern "C" fn rust_resolved_value_of_style(
         property_id::BORDER_LEFT_COLOR => used_color(border.border_left.color.resolve(current_color)),
         property_id::BORDER_RIGHT_COLOR => used_color(border.border_right.color.resolve(current_color)),
         property_id::BORDER_TOP_COLOR => used_color(border.border_top.color.resolve(current_color)),
-        property_id::COLUMN_RULE_COLOR => used_color(misc_layout.column_rule_color.resolve(current_color)),
+        property_id::COLUMN_RULE_COLOR if !matches!(&*computed(), StyleValueData::ValueList { .. }) => {
+            used_color(misc_layout.column_rule_color.resolve(current_color))
+        }
+        property_id::COLUMN_RULE_COLOR | property_id::ROW_RULE_COLOR => {
+            resolve_gap_decoration_color_style_value(&computed(), &color_input)
+        }
         property_id::OUTLINE_COLOR => used_color(misc_layout.outline_color.resolve(current_color)),
         property_id::TEXT_DECORATION_COLOR => used_color(text_reset.text_decoration_color.resolve(current_color)),
         property_id::_WEBKIT_TEXT_FILL_COLOR => used_color(text.webkit_text_fill_color),
@@ -1139,6 +1207,13 @@ pub unsafe extern "C" fn rust_resolved_value_of_style(
             style_value_for_shadow(SHADOW_TYPE_TEXT, shadows, current)
         }
         property_id::BACKDROP_FILTER | property_id::FILTER => resolve_filter_style_value(&computed(), current),
+        // https://drafts.csswg.org/css-transforms-2/#serialization-of-the-computed-value
+        // NB: An element without a box resolves its transform against a 0x0 box.
+        //     https://github.com/w3c/csswg-drafts/issues/9121
+        // AD-HOC: For web compatibility, an element that display keeps out of the box tree resolves its transform to
+        //         none instead, as sites expect.
+        property_id::TRANSFORM if query.generates_no_box => keyword_value(keyword::NONE),
+        property_id::TRANSFORM => resolved_transform(transform, CssPixelRect::default),
         // https://drafts.csswg.org/cssom/#resolved-value
         // line-height: The resolved value is normal if the computed value is normal, or the used value otherwise.
         // NB: Without a box, the used value of a number is that number times the computed font size.

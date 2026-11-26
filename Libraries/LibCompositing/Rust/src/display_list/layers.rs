@@ -27,12 +27,13 @@ pub use crate::display_list::placement::{
     CompositeClip, RasterSpace, RasterSpaceAnchorKind, RasterSpaceIndex, RunGroupIndex, raster_space_anchors,
 };
 use crate::display_list::placement::{
-    EXTENT_LIMIT_IN_DEVICE_PIXELS, enclosing_int_rect_within_extent_limit, space_and_ancestors_below_viewport,
-    spatial_nodes_that_move_on_their_own,
+    EXTENT_LIMIT_IN_DEVICE_PIXELS, MAXIMUM_RASTER_SPACE_COUNT, enclosing_int_rect_within_extent_limit,
+    space_and_ancestors_below_viewport, spatial_nodes_that_move_on_their_own,
 };
 use crate::display_list::reach::Reach;
 use crate::display_list::storage::{DisplayListStorage, ListPosition, ListSpan};
 use crate::display_list::summary::LiveContent;
+use crate::display_list::tiles::CellRange;
 use crate::display_list::window_server_placement::{
     WhyWindowServerCannotCompositeEffect, WhyWindowServerCannotShowMedia, WindowServerPlacement,
     WindowServerPlacementOfEffect, window_server_placement_of_effect,
@@ -40,13 +41,14 @@ use crate::display_list::window_server_placement::{
 use crate::visual_context::queries::backdrop_reader_by_reading_effect_index;
 use crate::visual_context::{VisualContextTree, WorldTransforms, device_offset_for_index};
 use libgfx_rust::{AffineTransform, CornerRadii, FloatMatrix4x4, FloatPoint, IntPoint, IntRect};
+use libipc_rust::wire::{Decode, Encode};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
 
 pub mod planning;
 mod wire;
 
-pub use wire::{LayerPlan, UnvalidatedLayerPlan, compositor_takes_plans_within};
+pub use wire::{LayerPlan, StackOnWire, UnvalidatedLayerPlan, ValidatedLayerPlan, compositor_takes_plans_within};
 
 // Twice the extent limit of a plan, which leaves room for the margins that planning adds past the extent of a space.
 // The rects of a stack from another process are within it, and so are the offsets a frame composites spaces at, so that
@@ -81,7 +83,7 @@ pub(crate) fn media_name(content: LiveContent) -> &'static str {
 }
 
 /// Why the compositor cannot composite an effect, which keeps what it holds from having layers of its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum WhyCompositorCannotCompositeEffect {
     FilterMovesWhatItFilters,
     FilterReadsFartherThanTilesAreFollowed,
@@ -99,7 +101,7 @@ impl std::fmt::Display for WhyCompositorCannotCompositeEffect {
 }
 
 /// Why a list is painted in a single layer that replays all of it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum WhyListIsOneLayer {
     EmptyViewport,
     EmptyDisplayList,
@@ -236,6 +238,33 @@ impl SpaceToFrame {
     }
 }
 
+fn within_coordinate_limit(value: i64) -> i64 {
+    let limit = i64::from(COORDINATE_LIMIT_IN_DEVICE_PIXELS);
+    value.clamp(-limit, limit)
+}
+
+// The edges are kept within the coordinate limit, so that the size between them still fits in an `IntRect`.
+fn rect_at_raster_scale(rect: IntRect, factor: i32) -> IntRect {
+    let at_raster_scale = |coordinate: i64| within_coordinate_limit(coordinate * i64::from(factor));
+    let (left, top) = (at_raster_scale(i64::from(rect.x)), at_raster_scale(i64::from(rect.y)));
+    let right = at_raster_scale(i64::from(rect.x) + i64::from(rect.width));
+    let bottom = at_raster_scale(i64::from(rect.y) + i64::from(rect.height));
+    IntRect::new(left as i32, top as i32, (right - left) as i32, (bottom - top) as i32)
+}
+
+fn corner_radii_at_raster_scale(radii: CornerRadii, factor: i32) -> CornerRadii {
+    let scaled = |radius: libgfx_rust::CornerRadius| libgfx_rust::CornerRadius {
+        horizontal_radius: radius.horizontal_radius.saturating_mul(factor),
+        vertical_radius: radius.vertical_radius.saturating_mul(factor),
+    };
+    CornerRadii {
+        top_left: scaled(radii.top_left),
+        top_right: scaled(radii.top_right),
+        bottom_right: scaled(radii.bottom_right),
+        bottom_left: scaled(radii.bottom_left),
+    }
+}
+
 /// A transform of a space and its inverse, or none for a transform that shows nothing of the space: one with a value
 /// that is not finite, or one without an inverse of finite values.
 fn transform_and_inverse_that_show_space(transform: AffineTransform) -> Option<(AffineTransform, AffineTransform)> {
@@ -245,7 +274,7 @@ fn transform_and_inverse_that_show_space(transform: AffineTransform) -> Option<(
 }
 
 /// The index of a node in `LayerStack::nodes`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct PlacementNodeIndex(pub usize);
 
 /// The index of a band in `LayerStack::bands`.
@@ -387,6 +416,17 @@ pub struct StackLayer {
     pub reach: IntRect,
 }
 
+/// Where content whose pixels an animation of the tree changes can show, in the raster coordinates of a space. Content
+/// of a space whose anchor the compositor animates is told in the space that space is in, wherever the animation takes
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnimatedContentReach {
+    /// The index of the animation among the visual animations of the tree.
+    pub animation_index: u32,
+    pub raster_space_index: RasterSpaceIndex,
+    pub reach: IntRect,
+}
+
 /// An effect that the compositor composites the layers of its content inside.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompositedEffect {
@@ -447,8 +487,14 @@ pub struct LayerStack {
     /// Per raster space whose anchor the compositor animates and that holds content, where that content can show in
     /// the raster coordinates of the space it is in wherever the animation takes it.
     pub swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
+    /// Per animation of the tree and raster space, where content whose pixels the animation changes can show, sorted by
+    /// animation and space, or none where the plan cannot tell.
+    pub reach_of_animated_content: Option<Vec<AnimatedContentReach>>,
     /// Per band, the innermost band at or around it whose node the compositor composites inside its effect.
     innermost_composited_band_at_or_around_band: Vec<Option<BandIndex>>,
+    /// How many raster pixels each device pixel of the plan is: 1 for a stack as planned, and the power of two a stack
+    /// from `at_raster_scale` is at.
+    pub raster_scale: i32,
 }
 
 /// What a window server composites by itself of the layers of a frame, besides the canvases and videos it shows.
@@ -663,41 +709,50 @@ fn node_covers_viewport(nodes: &[PlacementNode], spaces: &[RasterSpace], node_in
 /// What a plan says of a stack of more than one layer, each thing once: the nodes without their identities, and the
 /// bands in the order of a walk that enters the first band, and at each cut whose barrier is a nested band, the next
 /// band, each band with what only it knows of its layers. `LayerStack::of_layered_plan` works out the rest.
-#[derive(Clone, Debug)]
-struct LayeredPlan {
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct LayeredPlan {
+    #[ipc(max_size = wire::MAXIMUM_NODE_COUNT_OF_RECEIVED_STACK)]
     nodes: Vec<NodeOfPlan>,
+    #[ipc(max_size = wire::MAXIMUM_BAND_COUNT_OF_RECEIVED_STACK)]
     bands: Vec<BandOfPlan>,
+    #[ipc(max_size = MAXIMUM_RASTER_SPACE_COUNT)]
     tiles_hold_content_moving_within_space_by_space_index: Vec<bool>,
+    #[ipc(max_size = MAXIMUM_RASTER_SPACE_COUNT)]
     swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
+    #[ipc(max_size = wire::MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK)]
+    reach_of_animated_content: Option<Vec<AnimatedContentReach>>,
 }
 
 /// A placement node without its identity, which the stack works out of the node, the node it is in and the spaces.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 struct NodeOfPlan {
     raster_space_index: RasterSpaceIndex,
+    #[ipc(max_size = MAXIMUM_RASTER_SPACE_COUNT)]
     composite_clips: Vec<CompositeClip>,
     composited_effect: Option<EffectNodeIndex>,
     parent_index: Option<PlacementNodeIndex>,
     reach_in_parent_node: Reach<IntRect>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 struct BandOfPlan {
     placement_node_index: PlacementNodeIndex,
     /// In paint order.
+    #[ipc(max_size = wire::MAXIMUM_SPAN_COUNT_OF_RECEIVED_BAND)]
     record_spans: Vec<ListSpan>,
     reach_of_layer_below_all_cuts: IntRect,
     /// In paint order.
+    #[ipc(max_size = wire::MAXIMUM_CUT_COUNT_OF_RECEIVED_BAND)]
     cuts: Vec<CutOfPlan>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 struct CutOfPlan {
     barrier: BarrierOfPlan,
     reach_of_layer_above_cut: IntRect,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 enum BarrierOfPlan {
     /// Live content that is a layer of its own, the `ordinal`th drawing of its content in paint order. Where `cuts_band`
     /// is set, it cuts the tiles its reach touches, and otherwise no tile, as no record of the band painted after it can
@@ -744,7 +799,8 @@ fn painted_layer_of_band(
 }
 
 impl LayerStack {
-    /// One layer that replays the whole list, which is always correct.
+    /// One layer that replays the whole list, which is always correct. It cannot tell where animated content shows,
+    /// but in an empty viewport or of an empty list, where none does.
     pub fn one_layer_replaying_whole_list(
         viewport_rect: IntRect,
         whole_list_span: ListSpan,
@@ -772,6 +828,11 @@ impl LayerStack {
             may_hold_content: true,
             reach: viewport_rect,
         }];
+        let reach_of_animated_content = matches!(
+            why_list_is_one_layer,
+            Some(WhyListIsOneLayer::EmptyViewport | WhyListIsOneLayer::EmptyDisplayList)
+        )
+        .then(Vec::new);
         Self {
             layers,
             bands: vec![PlacementNodeBand {
@@ -790,7 +851,9 @@ impl LayerStack {
             layering_obstacles,
             tiles_hold_content_moving_within_space_by_space_index: vec![true],
             swept_reach_in_parent_space_by_space_index: vec![None],
+            reach_of_animated_content,
             innermost_composited_band_at_or_around_band: Vec::new(),
+            raster_scale: 1,
         }
         .with_lookups()
     }
@@ -989,9 +1052,59 @@ impl LayerStack {
             tiles_hold_content_moving_within_space_by_space_index: plan
                 .tiles_hold_content_moving_within_space_by_space_index,
             swept_reach_in_parent_space_by_space_index: plan.swept_reach_in_parent_space_by_space_index,
+            reach_of_animated_content: plan.reach_of_animated_content,
             innermost_composited_band_at_or_around_band: Vec::new(),
+            raster_scale: 1,
         }
         .with_lookups()
+    }
+
+    /// The stack as frames that raster its spaces at `factor` raster pixels per device pixel of the plan draw it, where
+    /// `factor` is a power of two, which keeps whole pixels whole. Its rects in raster coordinates are `factor` times
+    /// larger, and a barrier cuts the tiles of every cell of the plan it cuts, so that each tile, a part of one cell of
+    /// the plan, takes the records the planner put in that cell.
+    pub fn at_raster_scale(&self, factor: i32) -> LayerStack {
+        debug_assert!(factor >= 1 && (factor as u32).is_power_of_two());
+        if factor == 1 {
+            return self.clone();
+        }
+        let scaled = |rect: IntRect| rect_at_raster_scale(rect, factor);
+        let scaled_reach = |reach: Reach<IntRect>| match reach {
+            Reach::Within(rect) => Reach::Within(scaled(rect)),
+            reach => reach,
+        };
+        let mut stack = self.clone();
+        stack.raster_scale = self.raster_scale.saturating_mul(factor);
+        for space in &mut stack.spaces {
+            space.extent = scaled(space.extent);
+            if let RasterSpaceAnchorKind::AnimatedTransform { raster_scale } = &mut space.anchor_kind {
+                *raster_scale *= factor as f32;
+            }
+        }
+        for node in &mut stack.nodes {
+            node.reach_in_parent_node = scaled_reach(node.reach_in_parent_node);
+            for clip in &mut node.composite_clips {
+                clip.rect = scaled(clip.rect);
+                clip.corner_radii = corner_radii_at_raster_scale(clip.corner_radii, factor);
+            }
+        }
+        for band in &mut stack.bands {
+            for cut in &mut band.cuts {
+                if let Reach::Within(cut_rect) = cut.cut_reach {
+                    cut.cut_reach = Reach::Within(rect_at_raster_scale(CellRange::touched_by(cut_rect).rect(), factor));
+                }
+            }
+        }
+        for layer in &mut stack.layers {
+            layer.reach = scaled(layer.reach);
+        }
+        for swept_reach in stack.swept_reach_in_parent_space_by_space_index.iter_mut().flatten() {
+            *swept_reach = scaled(*swept_reach);
+        }
+        for animated_content in stack.reach_of_animated_content.iter_mut().flatten() {
+            animated_content.reach = scaled(animated_content.reach);
+        }
+        stack
     }
 
     pub fn replays_whole_list(&self) -> bool {
@@ -1030,6 +1143,12 @@ impl LayerStack {
         self.nodes[self.layers[layer_index.0].placement_node_index.0].raster_space_index
     }
 
+    /// What a raster of several tiles of the space at once stays within: the extent of the viewport's space, which no
+    /// frame drawn with the stack shows past, and nothing for the other spaces.
+    pub fn rect_rasters_of_space_stay_within(&self, raster_space_index: RasterSpaceIndex) -> Option<IntRect> {
+        (raster_space_index == RasterSpaceIndex::VIEWPORT).then(|| self.spaces[RasterSpaceIndex::VIEWPORT.0].extent)
+    }
+
     // An offset past the coordinate limit shows nothing of the space, and is kept within the limit so that a rect of the
     // stack offset by it still fits in an `IntRect`.
     fn composite_offset_of_space(
@@ -1044,16 +1163,16 @@ impl LayerStack {
                 let anchor_translation = space_or_ancestor.anchor_translation_on_whole_device_pixels(
                     device_offset_for_index(scroll_offsets, space_or_ancestor.anchor),
                 );
+                let raster_scale = i64::from(self.raster_scale);
                 (
-                    x_so_far + i64::from(anchor_translation.x),
-                    y_so_far + i64::from(anchor_translation.y),
+                    x_so_far + i64::from(anchor_translation.x) * raster_scale,
+                    y_so_far + i64::from(anchor_translation.y) * raster_scale,
                 )
             },
         );
-        let limit = i64::from(COORDINATE_LIMIT_IN_DEVICE_PIXELS);
         IntPoint {
-            x: x.clamp(-limit, limit) as i32,
-            y: y.clamp(-limit, limit) as i32,
+            x: within_coordinate_limit(x) as i32,
+            y: within_coordinate_limit(y) as i32,
         }
     }
 
@@ -1063,6 +1182,31 @@ impl LayerStack {
         (0..self.spaces.len())
             .map(|space_index| self.composite_offset_of_space(RasterSpaceIndex(space_index), scroll_offsets))
             .collect()
+    }
+
+    /// Whether content whose pixels an animation that `animation_is_running` takes changes can show within `rect` of
+    /// the viewport, where the frame composites each space at its offset of `composite_offsets`. A stack that cannot
+    /// tell where animated content shows answers yes.
+    pub fn running_animations_can_show_within(
+        &self,
+        animation_is_running: impl Fn(u32) -> bool,
+        composite_offsets: &[IntPoint],
+        rect: IntRect,
+    ) -> bool {
+        let Some(reach_of_animated_content) = &self.reach_of_animated_content else {
+            return true;
+        };
+        reach_of_animated_content
+            .iter()
+            .filter(|animated_content| animation_is_running(animated_content.animation_index))
+            .any(|animated_content| {
+                let offset = composite_offsets[animated_content.raster_space_index.0];
+                !animated_content
+                    .reach
+                    .translated(offset.x, offset.y)
+                    .intersected(rect)
+                    .is_empty()
+            })
     }
 
     /// Per raster space, by its index, how the frame composites its rasters: at `composite_offsets`, or for a space
@@ -1216,11 +1360,9 @@ impl LayerStack {
                 *read_reach_by_composited_node_index[node_index.0]
                     .get_or_insert_with(|| read_reach_of_composited_node(node_index, effect))
             });
-            summed_read_reach_by_band_index.push(
-                summed_around
-                    .saturating_add(read_reach_of_node)
-                    .min(LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS),
-            );
+            summed_read_reach_by_band_index.push(summed_around.saturating_add(read_reach_of_node).min(
+                LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS.saturating_mul(self.raster_scale),
+            ));
         }
         self.layers
             .iter()

@@ -45,6 +45,16 @@ pub enum SurfaceBlend {
     SourceOver,
 }
 
+/// How a surface drawn into another is sampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SurfaceSampling {
+    /// For a surface drawn at whole pixels of the target, at its own size.
+    Nearest,
+    /// For a surface drawn scaled, or at a fraction of a pixel of the target.
+    Linear,
+}
+
 /// Whose resources a painting draws with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -260,6 +270,8 @@ pub struct FfiSublayer {
     pub group: FfiSublayerGroup,
     /// Of a tile or a fill, in the pixels of the group it is in.
     pub rect: IntRect,
+    /// Of a tile, what of its surface shows at `rect`.
+    pub rect_in_surface: IntRect,
     pub color: Color,
     /// Of a tile.
     pub every_pixel_is_opaque: bool,
@@ -278,6 +290,7 @@ impl FfiSublayer {
             placement: FfiSublayerPlacement::default(),
             group: FfiSublayerGroup::default(),
             rect: IntRect::default(),
+            rect_in_surface: IntRect::default(),
             color: Color::TRANSPARENT,
             every_pixel_is_opaque: false,
             backdrop: FfiSublayerBackdrop::default(),
@@ -346,10 +359,16 @@ pub struct FfiRasterHost {
     pub surface_scale: unsafe extern "C" fn(*const PaintingSurface, f32, f32),
     pub surface_clip_rect: unsafe extern "C" fn(*const PaintingSurface, IntRect),
     pub surface_clear: unsafe extern "C" fn(*const PaintingSurface, Color),
-    /// Arguments: the target, the source, the rect of the source drawn, the rect of the target it is drawn into, and
-    /// how it is blended.
-    pub surface_draw_surface:
-        unsafe extern "C" fn(*const PaintingSurface, *const PaintingSurface, IntRect, IntRect, SurfaceBlend),
+    /// Arguments: the target, the source, the rect of the source drawn, the rect of the target it is drawn into, how
+    /// it is blended, and how it is sampled.
+    pub surface_draw_surface: unsafe extern "C" fn(
+        *const PaintingSurface,
+        *const PaintingSurface,
+        IntRect,
+        IntRect,
+        SurfaceBlend,
+        SurfaceSampling,
+    ),
     pub flush_surface: unsafe extern "C" fn(*const PaintingSurface),
 
     /// Arguments: the host, the context, the surface, whose resources it draws with, whether it allows LCD text,
@@ -357,8 +376,6 @@ pub struct FfiRasterHost {
     pub begin_painting:
         unsafe extern "C" fn(*mut c_void, u64, *const PaintingSurface, PaintingResources, bool, *mut FfiRasterPainter),
     pub end_painting: unsafe extern "C" fn(*mut c_void),
-    /// Lets the raster caches of the context's page drop what the frames before the one that starts did not use.
-    pub start_raster_cache_frame: unsafe extern "C" fn(*mut c_void, u64),
 
     /// Makes a store of the context, writing what it made. Answers false where none could be made.
     /// Arguments: the context, the kind and size of the store, the window server that shows it, if one does, and where
@@ -444,6 +461,12 @@ pub struct FfiRasterHost {
     /// Arguments: the context, and the ids of the fonts that its display list draws, which are the fonts the host
     /// keeps for it.
     pub set_drawn_fonts: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>),
+    /// Arguments: the context, and the identities of the paths that the clips of its visual context tree clip to,
+    /// which are the clip paths the host keeps for it.
+    pub set_drawn_clip_paths: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>),
+    /// Arguments: the context, and the keys of the layers of its visual context tree that hold a filter or a backdrop
+    /// filter, which are the layer filters the host keeps for it.
+    pub set_drawn_layer_filters: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>),
     /// Arguments: the context, and the ids of the fonts that a display list draws. Answers whether the host holds all
     /// of them for the context.
     pub context_holds_fonts: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>) -> bool,
@@ -655,11 +678,6 @@ impl RasterHost {
         }
     }
 
-    pub fn start_raster_cache_frame(&self, context_id: CompositorContextId) {
-        // SAFETY: The host outlives this.
-        unsafe { (self.0.start_raster_cache_frame)(self.host(), context_id.0) };
-    }
-
     pub fn save(&self, surface: &Rc<PaintingSurface>) -> i32 {
         // SAFETY: The surface is live.
         unsafe { (self.0.surface_save)(Rc::as_ptr(surface)) }
@@ -697,10 +715,18 @@ impl RasterHost {
         source_rect: IntRect,
         target_rect: IntRect,
         blend: SurfaceBlend,
+        sampling: SurfaceSampling,
     ) {
         // SAFETY: Both surfaces are live.
         unsafe {
-            (self.0.surface_draw_surface)(Rc::as_ptr(target), Rc::as_ptr(source), source_rect, target_rect, blend);
+            (self.0.surface_draw_surface)(
+                Rc::as_ptr(target),
+                Rc::as_ptr(source),
+                source_rect,
+                target_rect,
+                blend,
+                sampling,
+            );
         }
     }
 
@@ -1041,6 +1067,16 @@ impl RasterHost {
     pub fn set_drawn_fonts(&self, context_id: CompositorContextId, font_ids: &[u64]) {
         // SAFETY: The host outlives this, and reads the ids during the call.
         unsafe { (self.0.set_drawn_fonts)(self.host(), context_id.0, ak::Span::new(font_ids)) };
+    }
+
+    pub fn set_drawn_clip_paths(&self, context_id: CompositorContextId, path_identities: &[u64]) {
+        // SAFETY: The host outlives this, and reads the identities during the call.
+        unsafe { (self.0.set_drawn_clip_paths)(self.host(), context_id.0, ak::Span::new(path_identities)) };
+    }
+
+    pub fn set_drawn_layer_filters(&self, context_id: CompositorContextId, layer_filter_cache_keys: &[u64]) {
+        // SAFETY: The host outlives this, and reads the keys during the call.
+        unsafe { (self.0.set_drawn_layer_filters)(self.host(), context_id.0, ak::Span::new(layer_filter_cache_keys)) };
     }
 
     pub fn context_holds_fonts(&self, context_id: CompositorContextId, font_ids: &[u64]) -> bool {

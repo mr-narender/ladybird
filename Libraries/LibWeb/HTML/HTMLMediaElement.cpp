@@ -976,10 +976,7 @@ GC::Ref<TextTrack> HTMLMediaElement::add_text_track(Bindings::TextTrackKind kind
     //    textTracks attribute's TextTrackList object, using TrackEvent, with the track attribute initialized to the new
     //    text track's TextTrack object.
     queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(text_track), [](auto& text_track, HTMLMediaElement& self) {
-        Bindings::TrackEventInit event_init {};
-        event_init.track = text_track;
-
-        auto event = TrackEvent::create(HTML::EventNames::addtrack, move(event_init), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(self)));
+        auto event = create_track_event(HTML::relevant_realm(self), HTML::EventNames::addtrack, text_track);
         self.m_text_tracks->dispatch_event(event);
     }));
 
@@ -2500,10 +2497,7 @@ void HTMLMediaElement::on_audio_track_added(Media::Track const& track)
         audio_track->set_enabled(true);
 
     // 7. Fire an event named addtrack at this AudioTrackList object, using TrackEvent, with the track attribute initialized to the new AudioTrack object.
-    TrackEventInit event_init {};
-    event_init.track = audio_track;
-
-    auto event = TrackEvent::create(EventNames::addtrack, move(event_init), event_time_stamp_for_element(*this));
+    auto event = create_track_event(relevant_realm(*this), EventNames::addtrack, audio_track);
     m_audio_tracks->dispatch_event(event);
 }
 
@@ -2541,10 +2535,7 @@ void HTMLMediaElement::on_video_track_added(Media::Track const& track)
         video_track->set_selected(true);
 
     // 7. Fire an event named addtrack at this VideoTrackList object, using TrackEvent, with the track attribute initialized to the new VideoTrack object.
-    TrackEventInit event_init {};
-    event_init.track = video_track;
-
-    auto event = TrackEvent::create(HTML::EventNames::addtrack, move(event_init), event_time_stamp_for_element(*this));
+    auto event = create_track_event(relevant_realm(*this), HTML::EventNames::addtrack, video_track);
     m_video_tracks->dispatch_event(event);
 }
 
@@ -3826,31 +3817,8 @@ bool HTMLMediaElement::is_allowed_to_play() const
 {
     // A media element is said to be allowed to play if the user agent and the system allow media playback in the
     // current context.
-    // NB: We allow playback once the document has been activated by the user, with an exception for inaudible media.
-    //     Gating on transient activation instead pauses audible media once the activation expires, e.g. between ads,
-    //     or media in a playlist.
-    if (auto window = document().window(); window && window->has_sticky_activation())
-        return true;
-
-    // NB: The sticky activation of an ancestor also counts if the document is allowed to use the "autoplay" feature.
-    //     A cross-origin iframe is only allowed to use it if its container allows it.
-    if (document().is_allowed_to_use_feature(DOM::PolicyControlledFeature::Autoplay)) {
-        for (auto const& ancestor : document().ancestor_navigables()) {
-            if (ancestor->active_window_has_sticky_activation())
-                return true;
-        }
-    }
-
-    switch (AutoplaySettings::the().decision_for_origin(document(), document().origin())) {
-    case AutoplayDecision::Allowed:
-        return true;
-    case AutoplayDecision::AllowedIfInaudible:
-        return effective_media_volume() == 0.0;
-    case AutoplayDecision::Blocked:
-        return false;
-    }
-
-    VERIFY_NOT_REACHED();
+    auto is_audible = effective_media_volume() == 0.0 ? IsAudible::No : IsAudible::Yes;
+    return system_allows_media_playback(document(), is_audible);
 }
 
 HTMLMediaElement::PlaybackDirection HTMLMediaElement::direction_of_playback() const

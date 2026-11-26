@@ -49,6 +49,7 @@
 #include <LibWeb/ContentSecurityPolicy/Directives/Names.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/Fetch/Engine/WholeBodyTransport.h>
 #include <LibWeb/Fetch/Fetching/BodyStreamPullSource.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
@@ -356,12 +357,7 @@ void initialize_agent(HTML::AgentType type)
                 auto& global_object = settings_object.global_object();
                 auto& realm = settings_object.realm();
                 HTML::queue_global_task(HTML::Task::Source::DOMManipulation, global_object, GC::create_function(GC::Heap::the(), GC::captures(global, promise, realm), [](auto& global, auto& promise, auto& realm) {
-                    HTML::PromiseRejectionEventInit event_init {
-                        {}, // Initialize the inherited EventInit
-                        /* .promise = */ promise,
-                        /* .reason = */ promise.result(),
-                    };
-                    auto promise_rejection_event = HTML::PromiseRejectionEvent::create(realm.global_object(), HTML::EventNames::rejectionhandled, event_init);
+                    auto promise_rejection_event = HTML::create_promise_rejection_event(realm, HTML::EventNames::rejectionhandled, {}, promise, promise.result());
                     global.dispatch_event(promise_rejection_event);
                 }));
                 break;
@@ -886,6 +882,7 @@ void shut_down_agent()
     for (;;) {
         if (ResourceLoader::is_initialized())
             ResourceLoader::the().stop_all_requests();
+        Fetch::Engine::WholeBodyTransport::stop_all_on_this_thread();
         if (!event_queue.has_pending_events())
             break;
         event_queue.process();
@@ -901,6 +898,7 @@ void shut_down_agent()
 
     // NB: What this agent used is of no use to this process unless another worker comes along, which may be never. What
     //     this thread's allocator still holds goes back when the thread exits.
+    Fetch::Engine::WholeBodyTransport::forget_all_on_this_thread();
     ak_kmalloc_collect();
     ladybird_did_end_short_lived_thread();
 

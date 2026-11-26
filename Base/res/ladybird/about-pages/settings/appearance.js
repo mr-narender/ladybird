@@ -1,9 +1,14 @@
 const showMenuBar = document.querySelector("#show-menu-bar");
+const alwaysShowScrollbars = document.querySelector("#always-show-scrollbars");
 const showMenuBarGroup = document.querySelector("#show-menu-bar-group");
+const windowDecorations = document.querySelector("#use-client-side-window-decorations");
+const windowDecorationsGroup = document.querySelector("#window-decorations-group");
 const showBookmarksBar = document.querySelector("#show-bookmarks-bar");
 const interfaceTheme = document.querySelector("#interface-theme");
 const websiteColorScheme = document.querySelector("#website-color-scheme");
 const colorTheme = document.querySelector("#color-theme");
+
+const WINDOW_DECORATIONS_VARIABLE = "ui.window.use_client_side_decorations";
 
 function segmentedValue(control) {
     return control.querySelector("input:checked")?.value;
@@ -20,6 +25,14 @@ const loadFeatures = features => {
 };
 
 const loadSettings = settings => {
+    const windowDecorationsVariable = settings.configVariableDefinitions?.find(
+        variable => variable.name === WINDOW_DECORATIONS_VARIABLE
+    );
+    if (windowDecorationsVariable) {
+        windowDecorations.checked = windowDecorationsVariable.value;
+        windowDecorationsGroup.classList.remove("hidden");
+    }
+
     if (!Object.hasOwn(settings, "appearance")) {
         return;
     }
@@ -27,6 +40,7 @@ const loadSettings = settings => {
     APPEARANCE = settings.appearance || {};
 
     showMenuBar.checked = !!APPEARANCE.showMenuBar;
+    alwaysShowScrollbars.checked = !!APPEARANCE.alwaysShowScrollbars;
     showBookmarksBar.value = APPEARANCE.showBookmarksBar || "never";
     setSegmentedValue(interfaceTheme, APPEARANCE.interfaceTheme || "system");
     setSegmentedValue(websiteColorScheme, APPEARANCE.websiteColorScheme || "system");
@@ -39,6 +53,18 @@ function saveAppearance() {
 
 showMenuBar.addEventListener("change", () => {
     APPEARANCE.showMenuBar = showMenuBar.checked;
+    saveAppearance();
+});
+
+windowDecorations.addEventListener("change", () => {
+    ladybird.sendMessage("setConfigVariable", {
+        name: WINDOW_DECORATIONS_VARIABLE,
+        value: windowDecorations.checked,
+    });
+});
+
+alwaysShowScrollbars.addEventListener("change", () => {
+    APPEARANCE.alwaysShowScrollbars = alwaysShowScrollbars.checked;
     saveAppearance();
 });
 

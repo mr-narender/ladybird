@@ -17,7 +17,9 @@ use crate::surfaces::painting_surface::PaintingSurface;
 use libcompositing_rust::display_list::commands::CompositorContextId;
 use libcompositing_rust::display_list::replay::{CompositedContexts, NoCompositedContexts, ResolvedCompositedContext};
 use libcompositing_rust::ipc_types::{
-    Compositing_ContextVisibility as ContextVisibility, compositor_presentation_client, compositor_web_content_client,
+    Compositing_ContextVisibility as ContextVisibility,
+    Compositing_RenderingOpportunityFrameTime as RenderingOpportunityFrameTime, compositor_presentation_client,
+    compositor_web_content_client,
 };
 use libcompositing_rust::scrolling::wheel_gesture_identity::TouchpadGestureEnd;
 use libcompositing_rust::time::MonotonicTime;
@@ -68,6 +70,7 @@ pub struct PresentationCapabilities {
     pub scrolls_elastically: bool,
     // Whether a press on a scrollbar track beside the thumb jumps there rather than paging toward it.
     pub scrollbar_track_press_jumps: bool,
+    pub scrollbars_always_shown: bool,
     // LUID of the GPU adapter the presentation can present shared GPU textures on, if any.
     pub gpu_presentation_adapter_luid: Option<u64>,
     // Whether the presentation found it cannot present the shared GPU images it was given.
@@ -243,10 +246,7 @@ impl CompositorCore {
                 let Some(viewport_rect) = viewport_rect else {
                     continue;
                 };
-                let frame = PendingFrame {
-                    viewport_rect,
-                    forced_damage_rect: request.forced_damage_rect,
-                };
+                let frame = PendingFrame::within(viewport_rect);
                 match request.scheduling {
                     PresentScheduling::OnNextDisplayTick => self.schedule_present_frame(request.context_id, frame, now),
                     PresentScheduling::WithDisplayTickInProgress => presenting.borrow_mut().queue_present_frame(frame),
@@ -268,13 +268,18 @@ impl CompositorCore {
         self.schedule_pending_present_frame(context_id, now);
     }
 
-    fn schedule_present_frame_repainting_everything(
+    /// Schedules a frame that repaints its store in full, and that is presented even where it shows nothing new.
+    fn schedule_present_frame_in_full(
         &self,
         context_id: CompositorContextId,
         viewport_rect: IntRect,
         now: MonotonicTime,
     ) {
-        self.schedule_present_frame(context_id, PendingFrame::repainting_everything(viewport_rect), now);
+        let Some(presenting) = self.presenting_of(context_id) else {
+            return;
+        };
+        presenting.borrow_mut().present_next_frame_in_full();
+        self.schedule_present_frame(context_id, PendingFrame::within(viewport_rect), now);
     }
 
     pub(super) fn present_current_frame(&self, context_id: CompositorContextId, now: MonotonicTime) {
@@ -283,7 +288,7 @@ impl CompositorCore {
         };
         let frame_rect = presenting.borrow().frame_rect_to_repaint();
         if let Some(frame_rect) = frame_rect {
-            self.schedule_present_frame_repainting_everything(context_id, frame_rect, now);
+            self.schedule_present_frame_in_full(context_id, frame_rect, now);
         }
     }
 
@@ -293,7 +298,7 @@ impl CompositorCore {
         };
         let frame_rect = presenting.borrow().frame_rect_to_repaint();
         if let Some(frame_rect) = frame_rect {
-            self.schedule_present_frame(context_id, PendingFrame::repainting_changes(frame_rect), now);
+            self.schedule_present_frame(context_id, PendingFrame::within(frame_rect), now);
         }
     }
 
@@ -914,25 +919,32 @@ impl CompositorCore {
 
     // A context scrolls elastically, takes presses on scrollbar tracks, and ends touchpad gestures as the presentation of
     // its root context does. A platform that reports the momentum of a flick reports when the fingers lift for it.
-    pub(super) fn update_scroll_capabilities(&self) {
+    pub(super) fn update_scroll_capabilities(&self, now: MonotonicTime) {
         for (&context_id, context) in &self.contexts {
             let root = self.root_context_id_of(context_id);
             let capabilities = self
                 .context_if_present(root)
                 .and_then(|root| root.borrow().bound_presentation())
                 .and_then(|presentation| self.presentations.borrow().get(&presentation).copied());
-            let mut scroll_capabilities = crate::context_state::ScrollCapabilities::default();
+            let mut scroll_capabilities = crate::context_state::ScrollCapabilities {
+                scrollbars_always_shown: self.scrollbars_always_shown,
+                ..Default::default()
+            };
             if let Some(capabilities) = capabilities {
                 scroll_capabilities.synthesizes_scroll_momentum = capabilities.synthesizes_scroll_momentum;
                 scroll_capabilities.scrolls_elastically = capabilities.scrolls_elastically;
                 scroll_capabilities.scrollbar_track_press_jumps = capabilities.scrollbar_track_press_jumps;
+                scroll_capabilities.scrollbars_always_shown |= capabilities.scrollbars_always_shown;
                 scroll_capabilities.touchpad_gesture_end = if capabilities.synthesizes_scroll_momentum {
                     TouchpadGestureEnd::AfterIdleDelay
                 } else {
                     TouchpadGestureEnd::WhenFingersLift
                 };
             }
-            context.borrow_mut().set_scroll_capabilities(&scroll_capabilities);
+            let visibility_changed = context.borrow_mut().set_scroll_capabilities(&scroll_capabilities, now);
+            if visibility_changed {
+                self.request_present_at_presented_viewport_rect(context_id);
+            }
         }
     }
 
@@ -953,7 +965,7 @@ impl CompositorCore {
         if let Some(presenting) = self.presenting_of(context_id) {
             presenting.borrow_mut().release_all_presented_stores();
         }
-        self.update_scroll_capabilities();
+        self.update_scroll_capabilities(now);
         if let Some(presenting) = self.presenting_of(context_id) {
             presenting.borrow_mut().invalidate_backing_stores();
         }
@@ -997,7 +1009,7 @@ impl CompositorCore {
             .presenting_of(root_context_id)
             .and_then(|presenting| presenting.borrow().frame_rect_to_repaint());
         if let Some(frame_rect) = frame_rect {
-            self.schedule_present_frame_repainting_everything(root_context_id, frame_rect, now);
+            self.schedule_present_frame_in_full(root_context_id, frame_rect, now);
         }
     }
 
@@ -1038,7 +1050,7 @@ impl CompositorCore {
         }
         self.clear_parent_context(context_id, now);
         context.borrow_mut().set_parent_context(parent_context_id);
-        self.update_scroll_capabilities();
+        self.update_scroll_capabilities(now);
         // The context can be shown now, or on another display.
         self.resume_display_ticks_of_contexts_nested_in(context_id, now);
         let Some(parent_context_id) = parent_context_id else {
@@ -1070,6 +1082,8 @@ impl CompositorCore {
         context_id: CompositorContextId,
         frame_time: MonotonicTime,
         frame_interval: f64,
+        display_refresh_rate: f64,
+        frame_time_kind: RenderingOpportunityFrameTime,
     ) {
         let web_content_client_id = context.borrow().web_content_client_id();
         self.host.post_to_web_content(
@@ -1078,6 +1092,8 @@ impl CompositorCore {
                 context_id,
                 frame_time_nanoseconds: frame_time.nanoseconds(),
                 frame_interval_milliseconds: frame_interval,
+                display_interval_milliseconds: 1000.0 / display_refresh_rate,
+                frame_time_kind,
             },
         );
     }
@@ -1117,7 +1133,14 @@ impl CompositorCore {
                 })
             };
             if let Some(frame_interval) = delivery {
-                self.post_rendering_opportunity(context, context_id, frame_time, frame_interval);
+                self.post_rendering_opportunity(
+                    context,
+                    context_id,
+                    frame_time,
+                    frame_interval,
+                    display_refresh_rate,
+                    RenderingOpportunityFrameTime::DisplayTick,
+                );
                 return;
             }
         }
@@ -1143,7 +1166,14 @@ impl CompositorCore {
             presenting.rendering_opportunity_request.did_deliver(now);
             frame_interval
         };
-        self.post_rendering_opportunity(context, context_id, now, frame_interval);
+        self.post_rendering_opportunity(
+            context,
+            context_id,
+            now,
+            frame_interval,
+            display_refresh_rate,
+            RenderingOpportunityFrameTime::BetweenDisplayTicks,
+        );
     }
 
     pub(super) fn vsync_inner(&self, display_id: Option<u64>, frame_time: MonotonicTime, now: MonotonicTime) {
@@ -1193,7 +1223,14 @@ impl CompositorCore {
                 }
             };
             if let Some(frame_interval) = rendering_opportunity {
-                self.post_rendering_opportunity(context, context_id, frame_time, frame_interval);
+                self.post_rendering_opportunity(
+                    context,
+                    context_id,
+                    frame_time,
+                    frame_interval,
+                    display_refresh_rate,
+                    RenderingOpportunityFrameTime::DisplayTick,
+                );
             }
 
             let present_is_scheduled_on_tick_display = {
@@ -1237,7 +1274,7 @@ impl CompositorCore {
                 {
                     presenting
                         .borrow_mut()
-                        .queue_present_frame(PendingFrame::repainting_changes(viewport_rect));
+                        .queue_present_frame(PendingFrame::within(viewport_rect));
                 }
                 let has_pending_present_frame = presenting.borrow().has_pending_present_frame();
                 if has_pending_present_frame {
@@ -1261,11 +1298,7 @@ impl CompositorCore {
                 continue;
             };
             if tick.needs_animation_frames {
-                self.schedule_present_frame(
-                    context_id,
-                    PendingFrame::repainting_changes(pending_frame.viewport_rect),
-                    now,
-                );
+                self.schedule_present_frame(context_id, PendingFrame::within(pending_frame.viewport_rect), now);
             }
             self.present_frame(context_id, pending_frame, now);
         }
@@ -1297,14 +1330,7 @@ impl CompositorCore {
         if screenshot_inputs.scrollbar_fades_changed {
             let viewport_rect = presenting.borrow().viewport_rect_of_current_frame();
             if let Some(viewport_rect) = viewport_rect {
-                self.schedule_present_frame(
-                    context_id,
-                    PendingFrame {
-                        viewport_rect,
-                        forced_damage_rect: Default::default(),
-                    },
-                    now,
-                );
+                self.schedule_present_frame(context_id, PendingFrame::within(viewport_rect), now);
             }
         }
         true
@@ -1332,7 +1358,7 @@ impl CompositorCore {
             .presenting_of(context_id)
             .and_then(|presenting| presenting.borrow().self_present_rect());
         if let Some(rect) = rect {
-            self.schedule_present_frame(context_id, PendingFrame::repainting_changes(rect), now);
+            self.schedule_present_frame(context_id, PendingFrame::within(rect), now);
         }
     }
 

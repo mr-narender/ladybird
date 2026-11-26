@@ -53,7 +53,6 @@
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
-#include <LibWebView/LocalFileRoot.h>
 #include <LibWebView/MediaSessionCoordinator.h>
 #include <LibWebView/Options.h>
 #include <LibWebView/PlatformFeatureDecisions.h>
@@ -97,7 +96,6 @@ public:
 
     static Settings& settings() { return *the().m_settings; }
     static Profile const& profile() { return *the().m_profile; }
-    static LocalFileGrantPolicy const& local_file_grant_policy() { return the().m_local_file_grant_policy; }
     BrowserProcess& browser_process() { return *m_browser_process; }
     bool should_exit_after_profile_coordination() const { return m_should_exit_after_profile_coordination; }
     // Whether the process exits because a browser is running for the profile, but does not take what we were asked to
@@ -156,6 +154,15 @@ public:
     virtual bool platform_scrollbar_track_press_jumps() const { return false; }
     // Tells the compositor of a change to what platform_scrollbar_track_press_jumps() returns.
     void platform_scrollbar_track_press_behavior_changed();
+    virtual bool platform_scrollbars_always_shown() const
+    {
+#if defined(AK_OS_LINUX) || defined(AK_OS_WINDOWS)
+        return true;
+#else
+        return false;
+#endif
+    }
+    void platform_scrollbar_visibility_changed();
     // Returns true if the platform's settings ask for less motion, which pages see while the motion preference is Auto.
     virtual bool platform_prefers_reduced_motion() const { return false; }
     // Tells every page of a change to what platform_prefers_reduced_motion() returns.
@@ -620,7 +627,6 @@ private:
     static Application* s_the;
 
     Optional<Profile> m_profile;
-    LocalFileGrantPolicy m_local_file_grant_policy;
     OwnPtr<Settings> m_settings;
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };

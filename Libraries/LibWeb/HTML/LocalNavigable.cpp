@@ -711,17 +711,17 @@ void PopulateSessionHistoryEntryDocumentOutput::visit_edges(Cell::Visitor& visit
     visitor.visit(navigation_params);
 }
 
-HashTable<GC::RawRef<LocalNavigable>>& all_local_navigables()
+GC::WeakHashSet<LocalNavigable>& all_local_navigables()
 {
     // NB: Worker agents have no navigables, and these are cells of the window agent's heap.
-    static thread_local NeverDestroyed<HashTable<GC::RawRef<LocalNavigable>>> set;
+    static thread_local NeverDestroyed<GC::WeakHashSet<LocalNavigable>> set;
     return *set;
 }
 
 GC::Ptr<LocalNavigable> local_navigable_with_id(CrossProcessId id)
 {
     for (auto& navigable : all_local_navigables()) {
-        if (navigable->id() == id)
+        if (navigable.id() == id)
             return navigable;
     }
     return nullptr;
@@ -732,9 +732,9 @@ Vector<GC::Root<LocalNavigable>> LocalNavigable::child_navigables() const
 {
     Vector<GC::Root<LocalNavigable>> results;
     for (auto& entry : all_local_navigables()) {
-        if (entry->current_session_history_entry()->step() == SessionHistoryEntry::Pending::Tag)
+        if (entry.current_session_history_entry()->step() == SessionHistoryEntry::Pending::Tag)
             continue;
-        if (entry->parent().ptr() == this)
+        if (entry.parent().ptr() == this)
             results.append(entry);
     }
 
@@ -844,7 +844,6 @@ void LocalNavigable::finalize()
     cancel_hover_update_after_async_scroll();
     cancel_scroll_sequences();
     destroy_compositor_context();
-    all_local_navigables().remove(*this);
     Base::finalize();
 }
 
@@ -6587,7 +6586,6 @@ bool LocalNavigable::dispatch_composition_event(Utf16FlyString const& event_name
     event_init.view = document->window() ? GC::Ptr<HTML::WindowProxy> { document->window()->window() } : nullptr;
 
     auto event = UIEvents::CompositionEvent::create(event_name, event_init, HighResolutionTime::current_high_resolution_time(relevant_global_object(*document)));
-    event->set_is_trusted(true);
     return target->dispatch_event(event);
 }
 
@@ -6710,7 +6708,6 @@ static void dispatch_composition_beforeinput(DOM::Document& document, Utf16View 
             target_ranges.append(GC::Heap::the().allocate<DOM::StaticRange>(range->start_container(), range->start_offset(), range->end_container(), range->end_offset()));
     }
     auto beforeinput = UIEvents::InputEvent::create_from_platform_event(UIEvents::EventNames::beforeinput, input_event_init, target_ranges, HighResolutionTime::current_high_resolution_time(relevant_global_object(document)));
-    beforeinput->set_is_trusted(true);
     // https://w3c.github.io/input-events/#event-order-during-composition
     // The beforeinput and input events:
     // - Are not cancellable

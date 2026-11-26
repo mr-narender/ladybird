@@ -1061,6 +1061,8 @@ struct StyleNodeTables {
     math_attribute_facts: CowMap<StyleNodeID, super::math_formatting_context::FfiMathAttributeFacts>,
     /// The `points` list each <polyline> and <polygon> published beside its facts.
     svg_points: CowMap<StyleNodeID, std::sync::Arc<[super::svg_formatting_context::FfiFloatPoint]>>,
+    /// One entry per addressable character covered by a text positioning element's attribute lists.
+    svg_text_positions: CowMap<StyleNodeID, std::sync::Arc<[super::svg_formatting_context::FfiSvgTextPosition]>>,
     /// The elements carrying each anchor name, in tree order. The DOM's registry republishes a
     /// name's list whenever it changes.
     anchor_name_elements: CowMap<ScopedAnchorName, Vec<StyleNodeID>>,
@@ -1233,7 +1235,6 @@ pub(crate) struct LayoutNodeArena {
     /// plan that follows it. A full layout pass covers every one of them, so its commit clears
     /// them.
     pending_rebuilt_subtree_roots: Vec<NodeSlotId>,
-    pending_layout_tree_update_escaped_rebuild_roots: bool,
     /// Every box must be recreated by the next layout tree build; set when the tree is torn down
     /// or a build finds a box it cannot place among rebuilt roots, cleared by the full pass.
     needs_full_layout_tree_update: bool,
@@ -1392,7 +1393,6 @@ impl LayoutNodeArena {
             active_layout_pass_depth: 0,
             layout_root: (NodeSlotId::INVALID),
             pending_rebuilt_subtree_roots: Vec::new(),
-            pending_layout_tree_update_escaped_rebuild_roots: false,
             needs_full_layout_tree_update: (false),
             forces_parallel_layout: false,
             layout_commit_count: 0,
@@ -1743,7 +1743,6 @@ impl LayoutNodeArena {
         if self.layout_root == root {
             self.layout_root = NodeSlotId::INVALID;
             self.pending_rebuilt_subtree_roots.clear();
-            self.pending_layout_tree_update_escaped_rebuild_roots = false;
             let overflow = &mut self.scrollable_overflow;
             overflow.recalculation_requests.clear();
             overflow.scroll_offset_clamp_candidates.clear();
@@ -2498,6 +2497,7 @@ impl LayoutNodeArena {
             svg_attribute_facts,
             math_attribute_facts,
             svg_points,
+            svg_text_positions,
             anchor_name_elements,
             implicit_anchor_elements,
             implicit_anchor_candidates,
@@ -2510,6 +2510,7 @@ impl LayoutNodeArena {
         generated_content.forget(style_node);
         let removed_svg_attribute_facts = svg_attribute_facts.remove(&style_node);
         svg_points.remove(&style_node);
+        svg_text_positions.remove(&style_node);
         math_attribute_facts.remove(&style_node);
         implicit_anchor_elements.retain(|element, anchor| *element != style_node && *anchor != style_node);
         let removed_implicit_anchor = implicit_anchor_candidates.remove(&style_node);
@@ -3442,20 +3443,12 @@ impl LayoutNodeArena {
         self.layout_tree_update_marks().need_build()
     }
 
-    pub(crate) fn set_pending_rebuilt_subtree_roots(
-        &mut self,
-        roots: Vec<NodeSlotId>,
-        layout_tree_update_escaped_rebuild_roots: bool,
-    ) {
+    pub(crate) fn set_pending_rebuilt_subtree_roots(&mut self, roots: Vec<NodeSlotId>) {
         self.pending_rebuilt_subtree_roots = roots;
-        self.pending_layout_tree_update_escaped_rebuild_roots = layout_tree_update_escaped_rebuild_roots;
     }
 
-    pub(crate) fn take_pending_rebuilt_subtree_roots(&mut self) -> (Vec<NodeSlotId>, bool) {
-        (
-            std::mem::take(&mut self.pending_rebuilt_subtree_roots),
-            std::mem::replace(&mut self.pending_layout_tree_update_escaped_rebuild_roots, false),
-        )
+    pub(crate) fn take_pending_rebuilt_subtree_roots(&mut self) -> Vec<NodeSlotId> {
+        std::mem::take(&mut self.pending_rebuilt_subtree_roots)
     }
 
     /// The DOM nodes the subtrees the last build rebuilt and left live stand for. An anonymous root stands for none.
@@ -3469,7 +3462,6 @@ impl LayoutNodeArena {
 
     pub(crate) fn clear_pending_rebuilt_subtree_roots(&mut self) {
         self.pending_rebuilt_subtree_roots.clear();
-        self.pending_layout_tree_update_escaped_rebuild_roots = false;
     }
 
     pub(crate) fn needs_full_layout_tree_update(&self) -> bool {
@@ -3611,6 +3603,16 @@ impl LayoutNodeArena {
         self.style_node_tables.svg_points.get(&style_node).cloned()
     }
 
+    pub(crate) fn svg_text_positions(
+        &self,
+        id: NodeSlotId,
+    ) -> Option<std::sync::Arc<[super::svg_formatting_context::FfiSvgTextPosition]>> {
+        self.style_node_tables
+            .svg_text_positions
+            .get(&self.node_style_node(id)?)
+            .cloned()
+    }
+
     /// The element an SVG reference resolves to, named by the atom its URL fragment interned to.
     /// `SVGGraphicsElement::resolve_fragment_identifier_to_element` asks the document first and the
     /// shadow tree the referring element sits in second, so the lookup is made in that order.
@@ -3649,6 +3651,7 @@ impl LayoutNodeArena {
         style_node: StyleNodeID,
         facts: super::svg_formatting_context::FfiSvgAttributeFacts,
         points: &[super::svg_formatting_context::FfiFloatPoint],
+        text_positions: &[super::svg_formatting_context::FfiSvgTextPosition],
     ) {
         let retained = Self::published_reference_atoms(&facts);
         let replaced = self
@@ -3664,6 +3667,12 @@ impl LayoutNodeArena {
             published_points.remove(&style_node);
         } else {
             published_points.insert(style_node, points.into());
+        }
+        let published_positions = &mut self.style_node_tables.svg_text_positions;
+        if text_positions.is_empty() {
+            published_positions.remove(&style_node);
+        } else {
+            published_positions.insert(style_node, text_positions.into());
         }
     }
 
@@ -7484,21 +7493,21 @@ mod tests {
         let viewport = arena.allocate_unbound();
         let rebuilt = arena.allocate_unbound();
         arena.set_layout_root(viewport);
-        arena.set_pending_rebuilt_subtree_roots(vec![rebuilt], true);
+        arena.set_pending_rebuilt_subtree_roots(vec![rebuilt]);
         assert_eq!(arena.layout_root(), viewport);
 
         arena
             .free_subtree(rebuilt)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
         assert_eq!(arena.layout_root(), viewport);
-        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), (vec![rebuilt], true));
+        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), vec![rebuilt]);
 
-        arena.set_pending_rebuilt_subtree_roots(vec![viewport], false);
+        arena.set_pending_rebuilt_subtree_roots(vec![viewport]);
         arena
             .free_subtree(viewport)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
         assert!(arena.layout_root().is_invalid());
-        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), (Vec::new(), false));
+        assert_eq!(arena.take_pending_rebuilt_subtree_roots(), Vec::new());
     }
 
     #[test]

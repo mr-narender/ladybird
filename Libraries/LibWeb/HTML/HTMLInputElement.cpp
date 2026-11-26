@@ -148,8 +148,11 @@ void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_selected_files);
     visitor.visit(m_slider_runnable_track);
     visitor.visit(m_slider_progress_element);
+    visitor.visit(m_slider_thumb_container);
     visitor.visit(m_slider_thumb);
     visitor.visit(m_slider_ticks_element);
+    visitor.visit(m_slider_drag_mousemove_listener);
+    visitor.visit(m_slider_drag_mouseup_listener);
     visitor.visit(m_resource_request);
 }
 
@@ -1519,6 +1522,34 @@ void HTMLInputElement::update_file_input_shadow_tree()
     }
 }
 
+static Optional<double> slider_fraction_at_position(DOM::Element& track, DOM::Element& thumb, CSSPixelPoint viewport_position)
+{
+    Layout::ForcedReadScope read { track.document() };
+    track.document().update_layout_if_needed_for_node(track, DOM::UpdateLayoutReason::ElementGetClientRects);
+    auto* track_node = track.layout_node(read);
+    auto* thumb_node = thumb.layout_node(read);
+    if (!track_node || !Painting::has_committed_box(*track_node))
+        return {};
+
+    auto offset = Painting::mouse_event_offset(*track_node, viewport_position);
+    auto writing_mode = track_node->writing_mode();
+    bool horizontal = writing_mode == CSS::WritingMode::HorizontalTb;
+    auto track_length = horizontal ? Painting::content_width(*track_node) : Painting::content_height(*track_node);
+    CSSPixels thumb_length;
+    if (thumb_node && Painting::has_committed_box(*thumb_node)) {
+        auto thumb_rect = Painting::absolute_border_box_rect(*thumb_node);
+        thumb_length = horizontal ? thumb_rect.width() : thumb_rect.height();
+    }
+    auto travel = track_length - thumb_length;
+    if (travel <= 0)
+        return {};
+    double pointer = (horizontal ? offset.x() : offset.y()).to_double();
+    double fraction = clamp((pointer - thumb_length.to_double() / 2) / travel.to_double(), 0.0, 1.0);
+    if ((track_node->direction() == CSS::Direction::Rtl) != (writing_mode == CSS::WritingMode::SidewaysLr))
+        return 1 - fraction;
+    return fraction;
+}
+
 void HTMLInputElement::create_range_input_shadow_tree()
 {
     auto shadow_root = DOM::ShadowRoot::create(document(), *this, Web::DOM::ShadowRootMode::Closed);
@@ -1542,118 +1573,121 @@ void HTMLInputElement::create_range_input_shadow_tree()
     MUST(m_slider_runnable_track->append_child(*m_slider_progress_element));
     m_slider_progress_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderFill);
 
+    // Keep the thumb's positioning grid inside the track so pages can style the track's display.
+    m_slider_thumb_container = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
+    m_slider_thumb_container->set_attribute_value(HTML::AttributeNames::style, "display: grid; grid-template-rows: minmax(0, 1fr); inline-size: 100%; block-size: 100%; align-items: inherit;"_utf16);
+    MUST(m_slider_runnable_track->append_child(*m_slider_thumb_container));
+
     m_slider_thumb = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(m_slider_runnable_track->append_child(*m_slider_thumb));
+    MUST(m_slider_thumb_container->append_child(*m_slider_thumb));
     m_slider_thumb->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderThumb);
 
     m_slider_ticks_element = nullptr;
     m_slider_tick_positions.clear();
     update_slider_shadow_tree_elements();
+}
 
-    auto keydown_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
-            if (self.type_state() != TypeAttributeState::Range)
-                return JS::js_undefined();
-            if (!self.allowed_value_step().has_value())
-                return JS::js_undefined();
-            auto key_value = MUST(vm.argument(0).get(vm, "key"_utf16_fly_string));
-            if (!key_value.is_string())
-                return JS::js_undefined();
-            auto key = key_value.as_string().utf16_string_view();
+bool HTMLInputElement::handle_range_key(UIEvents::KeyCode key, u32 modifiers)
+{
+    if (type_state() != TypeAttributeState::Range || !is_mutable() || !allowed_value_step().has_value())
+        return false;
+    if (modifiers & (UIEvents::Mod_Alt | UIEvents::Mod_Ctrl | UIEvents::Mod_Super))
+        return false;
 
-            if (key == u"ArrowLeft"sv || key == u"ArrowDown"sv)
-                MUST(self.step_down());
-            if (key == u"PageDown"sv)
-                MUST(self.step_down(10));
+    auto value_before_key = value();
+    switch (key) {
+    case UIEvents::KeyCode::Key_Left:
+    case UIEvents::KeyCode::Key_Down:
+        MUST(step_down());
+        break;
+    case UIEvents::KeyCode::Key_PageDown:
+        MUST(step_down(10));
+        break;
+    case UIEvents::KeyCode::Key_Right:
+    case UIEvents::KeyCode::Key_Up:
+        MUST(step_up());
+        break;
+    case UIEvents::KeyCode::Key_PageUp:
+        MUST(step_up(10));
+        break;
+    default:
+        return false;
+    }
 
-            if (key == u"ArrowRight"sv || key == u"ArrowUp"sv)
-                MUST(self.step_up());
-            if (key == u"PageUp"sv)
-                MUST(self.step_up(10));
+    if (value() != value_before_key)
+        user_interaction_did_change_input_value();
+    return true;
+}
 
-            self.user_interaction_did_change_input_value();
-            return JS::js_undefined();
-        }),
-        0, Utf16FlyString {}, &HTML::relevant_realm(*this));
-    auto keydown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*keydown_callback_function, HTML::relevant_realm(*this));
-    add_event_listener_without_options(UIEvents::EventNames::keydown, DOM::IDLEventListener::create(keydown_callback));
+void HTMLInputElement::start_slider_drag(CSSPixelPoint viewport_position)
+{
+    if (type_state() != TypeAttributeState::Range || !is_mutable())
+        return;
 
-    auto wheel_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
-            if (self.type_state() != TypeAttributeState::Range)
+    end_slider_drag();
+    set_slider_value_from_position(viewport_position);
+
+    auto& realm = HTML::relevant_realm(*this);
+    auto mousemove_callback_function = JS::NativeFunction::create(
+        realm, GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
+            auto* event = vm.argument(0).is_object() ? Bindings::impl_from<UIEvents::MouseEvent>(&vm.argument(0).as_object()) : nullptr;
+            if (!event || !event->is_trusted())
                 return JS::js_undefined();
-            if (!self.allowed_value_step().has_value())
+            if (!self.is_mutable()) {
+                self.end_slider_drag();
                 return JS::js_undefined();
-            auto delta_y_value = MUST(vm.argument(0).get(vm, "deltaY"_utf16_fly_string));
-            if (!delta_y_value.is_finite_number())
-                return JS::js_undefined();
-            if (delta_y_value.as_double() > 0) {
-                MUST(self.step_down());
-            } else {
-                MUST(self.step_up());
             }
-            self.user_interaction_did_change_input_value();
+            auto x = event->client_x();
+            auto y = event->client_y();
+            if (isfinite(x) && isfinite(y))
+                self.set_slider_value_from_position({ CSSPixels::nearest_value_for(x), CSSPixels::nearest_value_for(y) });
             return JS::js_undefined();
         }),
-        0, Utf16FlyString {}, &HTML::relevant_realm(*this));
-    auto wheel_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*wheel_callback_function, HTML::relevant_realm(*this));
-    add_event_listener_without_options(UIEvents::EventNames::wheel, DOM::IDLEventListener::create(wheel_callback));
+        0, Utf16FlyString {}, &realm);
+    m_slider_drag_mousemove_listener = DOM::IDLEventListener::create(GC::Heap::the().allocate<WebIDL::CallbackType>(*mousemove_callback_function, realm));
 
-    auto update_slider_by_mouse = GC::create_function<void(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
-        if (self.type_state() != TypeAttributeState::Range)
-            return;
-        auto event = vm.argument(0).is_object()
-            ? Bindings::impl_from<UIEvents::MouseEvent>(&vm.argument(0).as_object())
-            : nullptr;
-        if (!event)
-            return;
-        auto client_x = event->client_x();
-        if (!isfinite(client_x))
-            return;
-        auto rect = self.get_bounding_client_rect().to_type<double>();
-        if (rect.width() <= 0)
-            return;
-        double minimum = *self.min();
-        double maximum = *self.max();
-        if (minimum > maximum)
-            return;
-        auto relative_x = client_x - rect.left();
-        MUST(self.set_value_as_number(mix(minimum, maximum, relative_x / rect.width())));
-        self.user_interaction_did_change_input_value();
-    });
-
-    auto mousedown_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this, update_slider_by_mouse), [](HTMLInputElement& self, auto& update_slider_by_mouse, JS::VM& vm) {
-            update_slider_by_mouse->function()(vm);
-
-            auto mousemove_callback_function = JS::NativeFunction::create(
-                HTML::relevant_realm(self), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(update_slider_by_mouse), [](auto& update_slider_by_mouse, JS::VM& vm) {
-                    update_slider_by_mouse->function()(vm);
-                    return JS::js_undefined();
-                }),
-                0, Utf16FlyString {}, &HTML::relevant_realm(self));
-            auto mousemove_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousemove_callback_function, HTML::relevant_realm(self));
-            auto mousemove_listener = DOM::IDLEventListener::create(mousemove_callback);
-            auto& window = relevant_window(self);
-            window.add_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
-
-            auto mouseup_callback_function = JS::NativeFunction::create(
-                HTML::relevant_realm(self), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(self, mousemove_listener), [](HTMLInputElement& self, auto& mousemove_listener, JS::VM&) {
-                    auto& window = relevant_window(self);
-                    window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
-                    return JS::js_undefined();
-                }),
-                0, Utf16FlyString {}, &HTML::relevant_realm(self));
-            auto mouseup_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, HTML::relevant_realm(self));
-            DOM::EventTarget::AddEventListenerOptions mouseup_listener_options;
-            mouseup_listener_options.once = true;
-            window.add_event_listener(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback), mouseup_listener_options);
-
+    auto mouseup_callback_function = JS::NativeFunction::create(
+        realm, GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
+            auto* event = vm.argument(0).is_object() ? Bindings::impl_from<DOM::Event>(&vm.argument(0).as_object()) : nullptr;
+            if (event && event->is_trusted())
+                self.end_slider_drag();
             return JS::js_undefined();
         }),
-        0, Utf16FlyString {}, &HTML::relevant_realm(*this));
-    auto mousedown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousedown_callback_function, HTML::relevant_realm(*this));
-    add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(mousedown_callback));
+        0, Utf16FlyString {}, &realm);
+    m_slider_drag_mouseup_listener = DOM::IDLEventListener::create(GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm));
+
+    auto& window = relevant_window(*this);
+    window.add_event_listener_without_options(UIEvents::EventNames::mousemove, *m_slider_drag_mousemove_listener);
+    window.add_event_listener_without_options(UIEvents::EventNames::mouseup, *m_slider_drag_mouseup_listener);
+}
+
+void HTMLInputElement::set_slider_value_from_position(CSSPixelPoint viewport_position)
+{
+    if (type_state() != TypeAttributeState::Range || !m_slider_runnable_track || !m_slider_thumb)
+        return;
+    auto fraction = slider_fraction_at_position(*m_slider_runnable_track, *m_slider_thumb, viewport_position);
+    if (!fraction.has_value())
+        return;
+    double minimum = *min();
+    double maximum = *max();
+    if (minimum > maximum)
+        return;
+    auto value_before_move = value();
+    // NB: Weight the bounds rather than scale maximum - minimum, which overflows for bounds near the double limits.
+    MUST(set_value_as_number(minimum * (1 - *fraction) + maximum * *fraction));
+    if (value() != value_before_move)
+        user_interaction_did_change_input_value();
+}
+
+void HTMLInputElement::end_slider_drag()
+{
+    auto& window = relevant_window(*this);
+    if (m_slider_drag_mousemove_listener)
+        window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, *m_slider_drag_mousemove_listener);
+    if (m_slider_drag_mouseup_listener)
+        window.remove_event_listener_without_options(UIEvents::EventNames::mouseup, *m_slider_drag_mouseup_listener);
+    m_slider_drag_mousemove_listener = nullptr;
+    m_slider_drag_mouseup_listener = nullptr;
 }
 
 void HTMLInputElement::user_interaction_did_change_input_value(Utf16FlyString const& input_type, Optional<Utf16String> const& data)
@@ -1686,7 +1720,7 @@ void HTMLInputElement::update_slider_shadow_tree_elements()
     double value = convert_string_to_number(value_sanitization_algorithm(m_value)).value_or(0);
     double minimum = *min();
     double maximum = *max();
-    double position = (value - minimum) / (maximum - minimum) * 100;
+    double position = maximum > minimum ? (value - minimum) / (maximum - minimum) * 100 : 0;
 
     // NB: The thumb travels between the ends of the track without overhanging them, and the fill reaches its center.
     //     The fill assumes the 16px thumb width from the UA style sheet.
@@ -1699,37 +1733,31 @@ void HTMLInputElement::update_slider_shadow_tree_elements()
     bool const is_native = !style || style->appearance() != CSS::Appearance::None;
 
     if (m_slider_runnable_track) {
+        // The thumb occupies the middle column. The two outer columns share its travel along the inline axis.
+        auto columns = Utf16String::formatted("minmax(0, {}fr) auto minmax(0, {}fr)", position, 100 - position);
+        MUST(m_slider_thumb_container->style()->set_property(CSS::PropertyID::GridTemplateColumns, columns.utf16_view()));
         MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::BorderRadius, is_native ? u"2px"sv : u"0"sv));
         // NB: A slider with `appearance: none` draws no band for its track, and its track wraps the thumb, so that a
         //     thumb of any size sits in the middle of the slider. An author who sizes the track positions the thumb
         //     on it themselves.
+        MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::AlignItems, is_native ? u"center"sv : u"start"sv));
         if (is_native) {
-            (void)MUST(m_slider_runnable_track->style()->remove_property(CSS::PropertyID::Height));
+            (void)MUST(m_slider_runnable_track->style()->remove_property(CSS::PropertyID::BlockSize));
             (void)MUST(m_slider_runnable_track->style()->remove_property(CSS::PropertyID::BackgroundColor));
         } else {
-            MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::Height, "auto"_utf16));
+            MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::BlockSize, "auto"_utf16));
             MUST(m_slider_runnable_track->style()->set_property(CSS::PropertyID::BackgroundColor, "transparent"_utf16));
         }
     }
 
     if (m_slider_progress_element) {
-        auto width = Utf16String::formatted("calc({}% + {}px)", position, thumb_width / 2 - thumb_offset);
-        MUST(m_slider_progress_element->style()->set_property(CSS::PropertyID::Width, width.utf16_view()));
+        auto inline_size = Utf16String::formatted("calc({}% + {}px)", position, thumb_width / 2 - thumb_offset);
+        MUST(m_slider_progress_element->style()->set_property(CSS::PropertyID::InlineSize, inline_size.utf16_view()));
         auto fill_color = is_native ? (enabled() ? u"AccentColor"sv : u"GrayText"sv) : u"transparent"sv;
         MUST(m_slider_progress_element->style()->set_property(CSS::PropertyID::BackgroundColor, fill_color));
     }
 
     update_slider_ticks();
-
-    if (m_slider_thumb) {
-        // NB: The thumb moves back by the same fraction of its own width, whatever width an author gives it. On the
-        //     band of a native slider, it's centered by its own height.
-        auto margin_left = Utf16String::formatted("{}%", position);
-        MUST(m_slider_thumb->style()->set_property(CSS::PropertyID::MarginLeft, margin_left.utf16_view()));
-        auto translate = Utf16String::formatted("{}% {}", -position, is_native ? "-50%"sv : "0"sv);
-        MUST(m_slider_thumb->style()->set_property(CSS::PropertyID::Translate, translate.utf16_view()));
-        MUST(m_slider_thumb->style()->set_property(CSS::PropertyID::Top, is_native ? u"50%"sv : u"0"sv));
-    }
 }
 
 // NB: A native slider marks the values its suggestions source element suggests with ticks below its track, at the
@@ -1769,16 +1797,16 @@ void HTMLInputElement::update_slider_ticks()
     }
     if (!m_slider_ticks_element) {
         m_slider_ticks_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-        m_slider_ticks_element->set_attribute_value(HTML::AttributeNames::style, "position: absolute; inset-inline: 0; top: calc(100% + 2px); height: 4px; pointer-events: none;"_utf16);
+        m_slider_ticks_element->set_attribute_value(HTML::AttributeNames::style, "position: absolute; inset-inline: 0; inset-block-start: calc(100% + 2px); block-size: 4px; pointer-events: none;"_utf16);
         // NB: The ticks go before the thumb in tree order, so the thumb paints over them.
-        m_slider_runnable_track->insert_before(*m_slider_ticks_element, m_slider_thumb);
+        m_slider_runnable_track->insert_before(*m_slider_ticks_element, m_slider_thumb_container);
     }
 
     static constexpr double thumb_width = 16;
     m_slider_ticks_element->replace_all(nullptr);
     for (auto position : m_slider_tick_positions) {
         auto tick = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-        tick->set_attribute_value(HTML::AttributeNames::style, Utf16String::formatted("position: absolute; left: calc({}% + {}px); width: 1px; height: 100%; background-color: color-mix(in srgb, CanvasText 40%, transparent);", position, thumb_width / 2 - thumb_width * position / 100 - 0.5));
+        tick->set_attribute_value(HTML::AttributeNames::style, Utf16String::formatted("position: absolute; inset-inline-start: calc({}% + {}px); inline-size: 1px; block-size: 100%; background-color: color-mix(in srgb, CanvasText 40%, transparent);", position, thumb_width / 2 - thumb_width * position / 100 - 0.5));
         MUST(m_slider_ticks_element->append_child(tick));
     }
 }

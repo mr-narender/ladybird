@@ -1105,9 +1105,22 @@
                                 <option value="right">Right</option>
                             </select>
                         </div>
+                        <div class="card-group inline-container control-row">
+                            <label for="always-show-scrollbars">Always show scrollbars</label>
+                            <input id="always-show-scrollbars" type="checkbox" switch />
+                        </div>
                         <div class="card-group inline-container control-row" id="show-menu-bar-group">
                             <label for="show-menu-bar">Show system menu bar</label>
                             <input id="show-menu-bar" type="checkbox" switch />
+                        </div>
+                        <div class="card-group inline-container control-row hidden" id="window-decorations-group">
+                            <label for="use-client-side-window-decorations">
+                                Use client-side window decorations
+                                <p class="description">
+                                    Use custom title bar and window controls instead of the system window frame.
+                                </p>
+                            </label>
+                            <input id="use-client-side-window-decorations" type="checkbox" switch />
                         </div>
                         <div class="card-group inline-container control-row">
                             <label for="show-bookmarks-bar">Show bookmarks bar</label>

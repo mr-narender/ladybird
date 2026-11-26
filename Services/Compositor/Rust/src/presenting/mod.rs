@@ -18,7 +18,7 @@ mod window_server;
 use crate::backing_stores::{AllocationOutcome, BackingStores, Publication, StorePublication, StoreResizeOutcome};
 use crate::frame_inputs::FrameInputs;
 use crate::host::{ContextTimer, Host, PendingFrame};
-use crate::raster_host::{FfiSublayer, PaintingResources, RasterHost, SurfaceBlend};
+use crate::raster_host::{FfiSublayer, PaintingResources, RasterHost, SurfaceBlend, SurfaceSampling};
 use crate::remote_layers::{ShowingLayer, WindowServerObject};
 use crate::surfaces::painting_surface::PaintingSurface;
 use crate::surfaces::presentable_surface::PresentableSurface;
@@ -26,6 +26,7 @@ use damage::{PaintedFrame, StoreDamage};
 use layer_overlay::LayerOverlaySwitch;
 use layers::ContextLayers;
 use libcompositing_rust::display_list::commands::CompositorContextId;
+use libcompositing_rust::display_list::layers::SpaceToFrame;
 use libcompositing_rust::display_list::replay::{
     CompositedContexts, CompositingInsideEffects, NoCompositedContexts, ReplayFrame, ReplaySelection,
     ResolvedCompositedContext, composite_inside_effects, replay_display_list,
@@ -34,7 +35,9 @@ use libcompositing_rust::host::FfiRasterPainter;
 use libcompositing_rust::ipc_types::Compositing_CompositorLayersDescription as CompositorLayersDescription;
 use libcompositing_rust::scrolling::DisplayList;
 use libcompositing_rust::time::{Duration, MonotonicTime};
-use libgfx_rust::{Color, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, IntSize, enclosing_int_rect};
+use libgfx_rust::{
+    AffineTransform, Color, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, IntSize, enclosing_int_rect,
+};
 use pacing::PacedTickRequest;
 use std::rc::Rc;
 
@@ -100,6 +103,23 @@ pub(crate) struct FrameToPaint<'a> {
 impl FrameToPaint<'_> {
     pub fn surface_clear_color(&self) -> Color {
         self.display_list.surface_clear_color().unwrap_or(Color::TRANSPARENT)
+    }
+
+    /// What the frame shows of the raster of the page within `viewport_rect` of its own pixels.
+    pub fn rect_of_raster_shown_in(&self, viewport_rect: IntRect) -> IntRect {
+        rect_of_raster_shown_through(self.frame_inputs.raster_to_frame, viewport_rect)
+    }
+}
+
+/// What a frame shows of the raster of the page within `viewport_rect` of its own pixels: that rect, or for a frame that
+/// maps the raster to its pixels through `raster_to_frame`, the bounds of what the transform shows there.
+pub(crate) fn rect_of_raster_shown_through(
+    raster_to_frame: Option<AffineTransform>,
+    viewport_rect: IntRect,
+) -> IntRect {
+    match raster_to_frame {
+        Some(raster_to_frame) => SpaceToFrame::Transform(raster_to_frame).rect_in_space(viewport_rect),
+        None => viewport_rect,
     }
 }
 
@@ -249,6 +269,9 @@ pub struct ContextPresenting {
 
     pending_present_frame: Option<PendingFrame>,
     pending_present_frame_scheduled: bool,
+    /// Whether the next frame painted repaints its store in full, and is presented even where it shows nothing new, as
+    /// when the frames are to be shown in another way than the frame presented last was.
+    presents_next_frame_in_full: bool,
     presented_frame: Option<IntRect>,
     frame_generation: u64,
 
@@ -294,6 +317,7 @@ impl ContextPresenting {
             window_resize_in_progress: false,
             pending_present_frame: None,
             pending_present_frame_scheduled: false,
+            presents_next_frame_in_full: false,
             presented_frame: None,
             frame_generation: 0,
             frame_without_store_in_flight: false,
@@ -718,20 +742,14 @@ impl ContextPresenting {
         self.frame_generation
     }
 
+    /// Queues a frame, which takes the place of any frame queued before it.
     pub fn queue_present_frame(&mut self, pending_frame: PendingFrame) {
         self.frame_generation += 1;
-        let Some(queued) = &mut self.pending_present_frame else {
-            self.pending_present_frame = Some(pending_frame);
-            return;
-        };
-        if queued.viewport_rect.width != pending_frame.viewport_rect.width
-            || queued.viewport_rect.height != pending_frame.viewport_rect.height
-        {
-            self.pending_present_frame = Some(PendingFrame::repainting_everything(pending_frame.viewport_rect));
-            return;
-        }
-        queued.viewport_rect = pending_frame.viewport_rect;
-        queued.forced_damage_rect = queued.forced_damage_rect.united(pending_frame.forced_damage_rect);
+        self.pending_present_frame = Some(pending_frame);
+    }
+
+    pub fn present_next_frame_in_full(&mut self) {
+        self.presents_next_frame_in_full = true;
     }
 
     pub fn mark_pending_present_frame_scheduled(&mut self) {
@@ -884,14 +902,13 @@ impl ContextPresenting {
         let frame_changes_nothing_it_holds = window_server_shows_every_layer
             || (damage_rect.is_empty() && frame_was_presented_within_same_viewport_rect);
         if frame_changes_nothing_it_holds {
-            let only_media_shown_by_window_server_changed =
-                frame_damage.layers.shown_by_window_server() && frame_damage.live_media_changed;
+            let only_media_shown_by_window_server_changed = frame_damage.layers.media_shown_by_window_server_changed;
+            let overlays_draw_same_as_in_latest_frame = self.painted_frame.as_ref().is_some_and(|painted_frame| {
+                frame_inputs
+                    .overlays
+                    .draws_same_as(&painted_frame.frame_inputs.overlays)
+            });
             let sublayers_of_tiles_rastered_for_frame = if frame_damage.layers.window_server_shows_tiles() {
-                let overlays_draw_same_as_in_latest_frame = self.painted_frame.as_ref().is_some_and(|painted_frame| {
-                    frame_inputs
-                        .overlays
-                        .draws_same_as(&painted_frame.frame_inputs.overlays)
-                });
                 Some(self.present_layers_of_frame_painted_into_no_store(
                     env,
                     &frame,
@@ -910,7 +927,6 @@ impl ContextPresenting {
                     pending_frame.viewport_rect,
                     display_list,
                     frame_inputs,
-                    &live_content,
                     frame_damage.layers,
                 );
                 let sublayers = match sublayers_of_tiles_rastered_for_frame {
@@ -920,9 +936,10 @@ impl ContextPresenting {
                     }),
                 };
                 let window_server_shows_other_sublayers = sublayers != self.sublayers_of_latest_frame;
-                // A frame made to repaint, as one shown in another remote layer than the frame before, is presented
-                // even where the window server already shows its sublayers.
-                let frame_is_made_to_repaint = !pending_frame.forced_damage_rect.is_empty();
+                // A frame presented in full, as one shown in another remote layer than the frame before, or one whose
+                // overlays draw otherwise, is presented even where the window server already shows its sublayers.
+                let presents_frame_in_full = std::mem::take(&mut self.presents_next_frame_in_full);
+                let frame_is_made_to_repaint = presents_frame_in_full || !overlays_draw_same_as_in_latest_frame;
                 let hides_store_shown_with_latest_frame =
                     window_server_shows_every_layer && !self.latest_frame_was_presented_without_store_below_sublayers;
                 if !only_media_shown_by_window_server_changed
@@ -965,6 +982,7 @@ impl ContextPresenting {
             self.queue_present_frame(pending_frame);
             return None;
         };
+        self.presents_next_frame_in_full = false;
         let store_rect = rect_of_size(store.size());
         let repaint_rect = self.store_damage.take(bitmap_id, damage_rect, store_rect);
         let (painted_rect, sublayers) = self.paint_layered_frame(
@@ -989,7 +1007,6 @@ impl ContextPresenting {
             pending_frame.viewport_rect,
             display_list,
             frame_inputs,
-            &live_content,
             frame_damage.layers,
         );
         self.sublayers_of_latest_frame = sublayers.clone();
@@ -1017,10 +1034,12 @@ impl ContextPresenting {
         let frame_inputs = frame_inputs.expect("a context with a display list has frame inputs");
         // What the parent draws of the frame can go into the parent's tiles, which the overlay must stay out of.
         self.layer_overlay.switch_for_frame(None);
+        // Without a pending frame, the frame presented last is painted again as the surface or the painted frame was
+        // dropped, which paints it in full.
         let pending_frame = match self.pending_present_frame {
             Some(pending_frame) => pending_frame,
             None => match self.presented_frame {
-                Some(presented_frame) => PendingFrame::repainting_everything(presented_frame),
+                Some(presented_frame) => PendingFrame::within(presented_frame),
                 None => return,
             },
         };
@@ -1063,7 +1082,6 @@ impl ContextPresenting {
             pending_frame.viewport_rect,
             display_list,
             frame_inputs,
-            &live_content,
             frame_damage.layers,
         );
         env.raster.flush(&surface);
@@ -1071,6 +1089,7 @@ impl ContextPresenting {
         self.presented_frame = Some(pending_frame.viewport_rect);
         self.pending_present_frame = None;
         self.pending_present_frame_scheduled = false;
+        self.presents_next_frame_in_full = false;
     }
 
     /// Paints a screenshot into the target, without the overlays of the browser and at the raster's own scale.
@@ -1087,6 +1106,9 @@ impl ContextPresenting {
         };
         if !screenshots_paint_from_layers() || !self.paint_screenshot_from_layers(env, target, &frame) {
             let save_count = env.raster.save(target);
+            if let Some(raster_to_frame) = frame_inputs.raster_to_frame {
+                apply_raster_to_frame(env.raster, target, raster_to_frame);
+            }
             replay_into(env, target, &frame, ReplaySelection::default());
             env.raster.restore_to_count(target, save_count);
         }
@@ -1102,14 +1124,18 @@ impl ContextPresenting {
         target: &Rc<PaintingSurface>,
         frame: &FrameToPaint<'_>,
     ) -> bool {
-        // The layers are rastered under the raster transform, which a screenshot does not apply.
+        // The layers are rastered under the raster transform, which a screenshot does not apply. A screenshot taken
+        // while the frame maps the raster to its pixels through a transform replays the list through it instead.
         let target_size = target.size();
-        if target_size.is_empty() || self.raster_transform() != FloatMatrix4x4::identity() {
+        if target_size.is_empty()
+            || self.raster_transform() != FloatMatrix4x4::identity()
+            || frame.frame_inputs.raster_to_frame.is_some()
+        {
             return false;
         }
         self.with_layered_paint_state(LayeredPaintState::of_screenshot(target_size), |this| {
             let live_content = this.live_content(env, frame.display_list);
-            let pending_frame = PendingFrame::repainting_everything(rect_of_size(target_size));
+            let pending_frame = PendingFrame::within(rect_of_size(target_size));
             let mut frame_damage = this.frame_damage_for(env, &pending_frame, frame, &live_content);
             let _ = this.paint_layered_frame(
                 env,
@@ -1213,8 +1239,14 @@ impl ContextPresenting {
             let composited = env.raster.create_surface(source_size, Some(&source), false);
             if let Some(composited) = composited {
                 let source_rect = rect_of_size(source_size);
-                env.raster
-                    .draw_surface(&composited, &source, source_rect, source_rect, SurfaceBlend::Source);
+                env.raster.draw_surface(
+                    &composited,
+                    &source,
+                    source_rect,
+                    source_rect,
+                    SurfaceBlend::Source,
+                    SurfaceSampling::Nearest,
+                );
                 composite_layers_shown_by_window_server(&composited, painted_frame);
                 source = composited;
             }
@@ -1239,6 +1271,8 @@ impl ContextPresenting {
         // LCD coverage follows the physical pixel grid. Destination blending can erase pixels in the canvas fill.
         self.backing_stores.publication() == StorePublication::Published
             && !self.scales_frames_to_fit
+            // A pinch from zoom 1 keeps the tiles it starts with, scaled, until it rasters at another scale.
+            && frame_inputs.raster_scale == 1
             && self.device_pixel_ratio.fract() == 0.0
             && display_list.storage().summary().destination_blending_records.is_empty()
             // A blend or backdrop filter that reads the root group needs its original isolation from the canvas fill.
@@ -1295,6 +1329,27 @@ pub(crate) fn apply_raster_transform(
 ) {
     raster.translate(surface, translation.x, translation.y);
     raster.scale(surface, scale.width, scale.height);
+}
+
+/// Has what is drawn into the surface next go through `raster_to_frame`, a scale and a translation.
+pub(crate) fn apply_raster_to_frame(
+    raster: &RasterHost,
+    surface: &Rc<PaintingSurface>,
+    raster_to_frame: AffineTransform,
+) {
+    debug_assert!(raster_to_frame.b() == 0.0 && raster_to_frame.c() == 0.0);
+    apply_raster_transform(
+        raster,
+        surface,
+        FloatSize {
+            width: raster_to_frame.a(),
+            height: raster_to_frame.d(),
+        },
+        FloatPoint {
+            x: raster_to_frame.e(),
+            y: raster_to_frame.f(),
+        },
+    );
 }
 
 pub(crate) fn replay_into(

@@ -1026,6 +1026,7 @@ TEST_CASE(test_exif)
     EXPECT(plugin_decoder->metadata().has_value());
     auto const& exif_metadata = static_cast<Gfx::ExifMetadata const&>(plugin_decoder->metadata().value());
     EXPECT_EQ(*exif_metadata.orientation(), Gfx::TIFF::Orientation::Rotate90Clockwise);
+    EXPECT_EQ(frame.image->alpha_type(), Gfx::AlphaType::Unpremultiplied);
 
     EXPECT_EQ(frame.image->get_pixel(65, 70), Gfx::Color(0, 255, 0));
     EXPECT_EQ(frame.image->get_pixel(190, 10), Gfx::Color(255, 0, 0));
@@ -1141,15 +1142,14 @@ TEST_CASE(test_png_malformed_frame)
     }
 }
 
-// Regression test: libpng longjmp() out of png_read_image() must not leak the in-flight row-pointers buffer or bitmap
-// from PNGLoadingContext::read_frames(). The fixture has a valid IHDR, but a corrupted IDAT body that decompresses past
-// its zlib end-of-block marker — forcing libpng to longjmp mid-decode.
-TEST_CASE(test_png_corrupt_idat_does_not_leak_on_libpng_longjmp)
+// A failure in the middle of decoding must not leak the bitmap the frame was being decoded into. The fixture has a valid
+// IHDR, but a corrupted IDAT body that decompresses past its zlib end-of-block marker, so decoding fails mid-frame.
+TEST_CASE(test_png_corrupt_idat_does_not_leak)
 {
     auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("png/corrupt-idat.png"sv)));
     auto plugin_or_error = Gfx::PNGImageDecoderPlugin::create(file->bytes());
-    // PNGImageDecoderPlugin::create() catches the libpng error and falls back to a single-frame placeholder — so we
-    // don't assert on the result here. The test passes if the run completes without LeakSanitizer reports.
+    // PNGImageDecoderPlugin::create() falls back to a single-frame placeholder when decoding fails, so the result is
+    // not checked here. The test passes if the run completes without LeakSanitizer reports.
     if (!plugin_or_error.is_error())
         (void)plugin_or_error.release_value()->frame(0);
 }

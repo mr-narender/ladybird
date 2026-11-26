@@ -27,12 +27,13 @@ use crate::visual_context::{
     ClipNodeData, CompositorScrollNodeRecord, RasterRoot, SpatialData, StickyData, VisualContextTree, WorldTransforms,
 };
 use libgfx_rust::{CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, IntPoint, IntRect, enclosing_int_rect};
+use libipc_rust::wire::{Decode, Encode};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::rc::Rc;
 
 /// The index of a raster space among the spaces of a placement, each after the space it is in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct RasterSpaceIndex(pub usize);
 
 impl RasterSpaceIndex {
@@ -137,7 +138,7 @@ impl RasterSpace {
 
 /// A rect, with rounded corners or not, that rasters of content are clipped to as they are composited, in the raster
 /// coordinates of a space whose anchor the content does not move with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct CompositeClip {
     pub raster_space_index: RasterSpaceIndex,
     pub rect: IntRect,
@@ -350,13 +351,6 @@ fn compositor_scrolled_nodes_without_own_space<'a>(
         .filter(move |node| *node != VISUAL_VIEWPORT_NODE_INDEX && !scrollers_with_spaces.contains(node))
 }
 
-fn visual_viewport_only_translates(tree: &VisualContextTree) -> bool {
-    let Some(SpatialData::Transform(transform)) = tree.spatial_nodes.first().map(|node| &node.data) else {
-        return false;
-    };
-    translation_if_only_translates(&transform.matrix_including_origin()).is_some()
-}
-
 // How deep below the viewport each node is, where nothing between it and the viewport transforms or moves on its own,
 // so that content of the node lands on whole device pixels wherever it is scrolled to.
 struct DepthsBelowViewportOnWholeDevicePixels<'a> {
@@ -551,9 +545,6 @@ pub fn raster_space_anchors(
     tree: &VisualContextTree,
     spatial_nodes_that_move_on_their_own: &[bool],
 ) -> Vec<SpatialNodeIndex> {
-    if !visual_viewport_only_translates(tree) {
-        return Vec::new();
-    }
     let mut depths_below_viewport = DepthsBelowViewportOnWholeDevicePixels::new(spatial_nodes_that_move_on_their_own);
     let candidate_scrollers: Vec<ScrollerThatCanHaveSpace> = tree
         .compositor_scroll_table()

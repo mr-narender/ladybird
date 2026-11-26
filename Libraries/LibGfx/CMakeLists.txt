@@ -53,6 +53,9 @@ endif()
 
 if (HAS_VULKAN)
     list(APPEND SOURCES ImportedYCbCrVulkanImage.cpp VulkanContext.cpp VulkanImage.cpp)
+    if (USE_VULKAN_DMABUF_IMAGES)
+        list(APPEND SOURCES GBMAllocation.cpp)
+    endif()
 endif()
 
 if (HAS_FONTCONFIG)
@@ -73,7 +76,7 @@ ladybird_lib(LibGfx gfx)
 
 target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibUnicode)
 
-target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG PNG::PNG harfbuzz)
+target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG harfbuzz)
 
 import_rust_crate(
     MANIFEST_PATH Rust/Cargo.toml
@@ -118,5 +121,6 @@ if (HAS_VULKAN)
     if (USE_VULKAN_DMABUF_IMAGES)
         pkg_check_modules(LibDRM REQUIRED libdrm)
         target_include_directories(LibGfx PUBLIC ${LibDRM_INCLUDE_DIRS})
+        target_link_libraries(LibGfx PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
