@@ -221,12 +221,21 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .default_value = false,
         .array_element_type = {},
     },
+    {
+        .id = ConfigVariableID::OfferToTrustInvalidCertificates,
+        .name = "security.certificates.offer_to_trust_invalid"sv,
+        .title = "Offer to trust any certificate that fails verification"sv,
+        .description = "Also ask for certificates that fail verification for any other reason, such as one that has expired, was issued for another site, or comes from an issuer Ladybird doesn't trust. Any of these may mean someone is intercepting the connection."sv,
+        .default_value = false,
+        .array_element_type = {},
+        .depends_on = ConfigVariableID::OfferToTrustSelfSignedCertificates,
+    },
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
     {
         .id = ConfigVariableID::UpdateCheckInterval,
         .name = "updates.check_interval_minutes"sv,
         .title = "Update check interval"sv,
-        .description = "How many minutes Ladybird waits after one check for a newer release before it checks again, while it checks for updates by itself. At least 5."sv,
+        .description = "Minutes between update checks after the one at startup, at least 5."sv,
         .default_value = 4 * 60,
         .array_element_type = {},
     },
