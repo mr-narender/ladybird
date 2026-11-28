@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <AK/Optional.h>
+#include <AK/Utf16View.h>
+#include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
 #include <LibJS/Forward.h>
@@ -23,6 +26,7 @@ public:
 
     virtual Canvas2DContextBase* canvas_2d_context() const = 0;
     virtual WebGL::WebGLRenderingContextBase* canvas_webgl_context() const = 0;
+    virtual ImageBitmapRenderingContext* canvas_bitmap_renderer_context() const { return nullptr; }
 
     virtual Page& canvas_page() = 0;
     virtual DOM::EventTarget& canvas_event_target() = 0;
@@ -34,10 +38,16 @@ public:
 
     virtual CSS::FontComputer& canvas_font_computer() = 0;
     virtual CSS::ComputationContext canvas_font_computation_context() = 0;
-    virtual CSS::ColorResolutionContext canvas_color_resolution_context() = 0;
+    virtual CSS::ColorResolutionStyle canvas_color_resolution_style() = 0;
     virtual CSSPixelRect canvas_viewport_rect() const = 0;
 
-    virtual RefPtr<Gfx::Bitmap> get_bitmap_from_surface();
+    // The bitmap of the canvas, converted to sRGB.
+    virtual Optional<Gfx::DecodedImageFrame> get_srgb_frame_from_surface();
+    // The bitmap of the canvas in the color space of its context, with that color space.
+    Optional<Gfx::DecodedImageFrame> get_frame_from_surface();
+    // The bitmap of the canvas as a serialization of it as a file of the type takes it: in the color space of its
+    // context if the file can include a color profile, and converted to sRGB otherwise.
+    Optional<Gfx::DecodedImageFrame> get_frame_for_serialization(Utf16View type);
     virtual bool is_origin_clean() const;
 
 protected:

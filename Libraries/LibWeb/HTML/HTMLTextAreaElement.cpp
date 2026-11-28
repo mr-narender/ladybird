@@ -7,9 +7,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
@@ -19,11 +21,13 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputEvent.h>
@@ -62,6 +66,8 @@ void HTMLTextAreaElement::visit_edges(Cell::Visitor& visitor)
 
 void HTMLTextAreaElement::did_receive_focus()
 {
+    web_authentication_field_received_focus(document().last_focus_trigger());
+
     if (!m_text_node)
         return;
     m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
@@ -74,11 +80,20 @@ void HTMLTextAreaElement::did_receive_focus()
 
 void HTMLTextAreaElement::did_lose_focus()
 {
+    reveal_cursor_if_pending();
+
     if (m_text_node)
         m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     if (m_placeholder_text_node)
         m_placeholder_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
+
+    // NB: Consume the pending edit before dispatch, including removal, so reentrant focus changes cannot commit it again.
+    if (!m_value_before_first_user_edit.has_value())
+        return;
+    auto value_before_first_user_edit = m_value_before_first_user_edit.release_value();
+    if (!is_connected() || value_before_first_user_edit == api_value())
+        return;
 
     // The change event fires when the value is committed, if that makes sense for the control,
     // or else when the control loses focus
@@ -102,6 +117,8 @@ void HTMLTextAreaElement::reset_algorithm()
     // The reset algorithm for textarea elements is to set the user validity to false, the dirty value flag back to false,
     m_user_validity = false;
     m_dirty_value = false;
+    set_value_was_last_changed_by_user_edit(false);
+    m_value_before_first_user_edit.clear();
     // and the raw value to its child text content.
     set_raw_value(child_text_content());
 
@@ -121,7 +138,16 @@ void HTMLTextAreaElement::clear_algorithm()
     m_dirty_value = false;
 
     // and set the raw value of element to an empty string.
+    if (!m_value_before_first_user_edit.has_value())
+        m_value_before_first_user_edit = api_value();
     set_raw_value({});
+    if (*m_value_before_first_user_edit == api_value())
+        m_value_before_first_user_edit.clear();
+
+    if (m_text_node) {
+        MUST(m_text_node->replace_data(0, m_text_node->length_in_utf16_code_units(), m_raw_value));
+        update_placeholder_visibility();
+    }
 
     // Unlike their associated reset algorithms, changes made to form controls as part of these algorithms do count as
     // changes caused by the user (and thus, e.g. do cause input events to fire).
@@ -141,6 +167,7 @@ WebIDL::ExceptionOr<void> HTMLTextAreaElement::cloned(DOM::Node& copy, bool subt
     auto& textarea_copy = as<HTMLTextAreaElement>(copy);
     textarea_copy.m_raw_value = m_raw_value;
     textarea_copy.m_dirty_value = m_dirty_value;
+    textarea_copy.set_value_was_last_changed_by_user_edit(value_was_last_changed_by_user_edit());
 
     return {};
 }
@@ -171,33 +198,51 @@ Utf16String HTMLTextAreaElement::value() const
     return api_value();
 }
 
+void HTMLTextAreaElement::set_value_binding(Utf16View value)
+{
+    // INTEROP: Browsers forget the undo history of a text control when a script sets its value.
+    if (auto history = document().editing_history_if_exists())
+        history->forget_steps_for(*this);
+    set_value(value);
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value
 void HTMLTextAreaElement::set_value(Utf16View value)
 {
     // 1. Let oldAPIValue be this element's API value.
-    auto old_api_value = api_value();
-
     // 2. Set this element's raw value to the new value.
-    set_raw_value(Utf16String::from_utf16(value));
-
     // 3. Set this element's dirty value flag to true.
-    m_dirty_value = true;
+    set_value_was_last_changed_by_user_edit(false);
+    if (!replace_value(value))
+        return;
 
     // 4. If the new API value is different from oldAPIValue, then move the text entry cursor position to the end of
     //    the text control, unselecting any selected text and resetting the selection direction to "none".
-    if (api_value() != old_api_value) {
-        // AD-HOC: Changing the value may change which validity pseudo-classes match.
-        CSS::Invalidation::invalidate_style_after_validity_change(*this);
+    // NB: A textarea without a text node still has a selection, so this also applies to it.
+    auto end_of_text_control = m_text_node ? m_text_node->length() : api_value().length_in_code_units();
+    set_the_selection_range(end_of_text_control, end_of_text_control, SelectionDirection::None, SelectionSource::ValueChange);
+}
 
-        if (m_text_node) {
-            MUST(m_text_node->replace_data(0, m_text_node->length_in_utf16_code_units(), m_raw_value));
-            update_placeholder_visibility();
+// The value setter's steps but the last: set the raw value and the dirty value flag, and update the text node. Returns
+// whether the API value changed.
+bool HTMLTextAreaElement::replace_value(Utf16View value)
+{
+    auto old_api_value = api_value();
+    set_raw_value(Utf16String::from_utf16(value));
+    m_dirty_value = true;
+    if (api_value() == old_api_value)
+        return false;
 
-            set_the_selection_range(m_text_node->length(), m_text_node->length());
-        }
+    // AD-HOC: Changing the value may change which validity pseudo-classes match.
+    CSS::Invalidation::invalidate_style_after_validity_change(*this);
 
-        CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
+    if (m_text_node) {
+        MUST(m_text_node->replace_data(0, m_text_node->length_in_utf16_code_units(), m_raw_value));
+        update_placeholder_visibility();
     }
+
+    CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
+    return true;
 }
 
 void HTMLTextAreaElement::set_raw_value(Utf16String value)
@@ -210,6 +255,63 @@ void HTMLTextAreaElement::set_raw_value(Utf16String value)
         relevant_value_was_changed();
 }
 
+// https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:concept-fe-value
+Utf16String HTMLTextAreaElement::form_value() const
+{
+    // The element's value is defined to be the element's API value with the textarea wrapping transformation applied.
+    // The textarea wrapping transformation is the following algorithm, as applied to a string:
+
+    // 1. If the element's wrap attribute is in the Hard state, insert U+000A LINE FEED (LF) characters into the string
+    //    using an implementation-defined algorithm so that each line has no more than character width characters. For
+    //    the purposes of this requirement, lines are delimited by the start of the string, the end of the string, and
+    //    U+000A LINE FEED (LF) characters.
+    auto wrap = get_attribute(HTML::AttributeNames::wrap);
+    if (!wrap.has_value() || !wrap->equals_ignoring_ascii_case("hard"sv) || !m_text_node)
+        return api_value();
+
+    // AD-HOC: The line feeds go where the rendering wraps the text, rather than after every character width
+    //         characters. So, a CSS width decides where they go, and a textarea whose rendering doesn't wrap its text,
+    //         or that isn't rendered at all, gets none.
+    Layout::ForcedReadScope read { document() };
+    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*m_text_node, DOM::UpdateLayoutReason::HTMLTextAreaElementHardWrap);
+    auto const* layout_node = m_text_node->layout_node(read);
+    if (!layout_node)
+        return api_value();
+
+    Vector<Layout::RustFFI::FfiVisualLine> lines;
+    Layout::RustFFI::render_state_text_visual_lines(layout_node->document_host(), Layout::Node::slot_id(layout_node), &lines,
+        [](void* context, Layout::RustFFI::FfiVisualLine line) {
+            static_cast<Vector<Layout::RustFFI::FfiVisualLine>*>(context)->append(line);
+        });
+
+    // NB: The text node holds the raw value. A line starts a line of the value itself when a CR or an LF comes between
+    //     the end of the line before it and its start, even when the rendering collapsed white space around that line
+    //     break. Only the other lines start where the rendering wrapped the text, and the first line follows no wrap.
+    auto raw_value = m_text_node->data().utf16_view();
+    auto value_length = raw_value.length_in_code_units();
+    auto follows_line_break = [&](size_t previous_line_end, size_t line_start) {
+        for (auto offset = min(previous_line_end, line_start - 1); offset < line_start; ++offset) {
+            auto code_unit = raw_value.code_unit_at(offset);
+            if (code_unit == '\r' || code_unit == '\n')
+                return true;
+        }
+        return false;
+    };
+
+    Utf16StringBuilder builder { value_length + lines.size() };
+    size_t copied_up_to = 0;
+    for (size_t i = 1; i < lines.size(); ++i) {
+        auto line_start = lines[i].start_offset;
+        if (line_start <= copied_up_to || line_start > value_length || follows_line_break(lines[i - 1].end_offset, line_start))
+            continue;
+        builder.append(raw_value.substring_view(copied_up_to, line_start - copied_up_to));
+        builder.append_code_unit('\n');
+        copied_up_to = line_start;
+    }
+    builder.append(raw_value.substring_view(copied_up_to));
+    return Infra::normalize_newlines(builder.to_string());
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:concept-fe-api-value-3
 Utf16String HTMLTextAreaElement::api_value() const
 {
@@ -220,7 +322,9 @@ Utf16String HTMLTextAreaElement::api_value() const
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
 WebIDL::ExceptionOr<void> HTMLTextAreaElement::set_relevant_value(Utf16View value)
 {
-    set_value(value);
+    // NB: Whoever sets the relevant value (setRangeText(), an edit) sets the selection afterward, so this doesn't move
+    //     the cursor to the end, as the value setter does.
+    replace_value(value);
     return {};
 }
 
@@ -247,6 +351,32 @@ WebIDL::ExceptionOr<void> HTMLTextAreaElement::set_max_length(WebIDL::Long value
     // The maxLength IDL attribute must reflect the maxlength content attribute, limited to only non-negative numbers.
     set_attribute_value(HTML::AttributeNames::maxlength, Utf16String::from_utf8(TRY(convert_non_negative_integer_to_string(value))));
     return {};
+}
+
+// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#setting-minimum-input-length-requirements:-the-minlength-attribute
+bool HTMLTextAreaElement::suffering_from_being_too_short() const
+{
+    // Constraint validation: If an element has a minimum allowed value length, its dirty value flag is true, its value
+    // was last changed by a user edit (as opposed to a change made by a script), its value is not the empty string, and
+    // the length of the element's API value is less than the element's minimum allowed value length, then the element
+    // is suffering from being too short.
+    auto minimum_length = min_length();
+    if (minimum_length < 0 || !m_dirty_value || !value_was_last_changed_by_user_edit())
+        return false;
+    auto value = api_value();
+    return !value.is_empty() && value.length_in_code_units() < static_cast<size_t>(minimum_length);
+}
+
+// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#limiting-user-input-length:-the-maxlength-attribute
+bool HTMLTextAreaElement::suffering_from_being_too_long() const
+{
+    // Constraint validation: If an element has a maximum allowed value length, its dirty value flag is true, its value
+    // was last changed by a user edit (as opposed to a change made by a script), and the length of the element's API
+    // value is greater than the element's maximum allowed value length, then the element is suffering from being too
+    // long.
+    auto maximum_length = max_length();
+    return maximum_length >= 0 && m_dirty_value && value_was_last_changed_by_user_edit()
+        && api_value().length_in_code_units() > static_cast<size_t>(maximum_length);
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-minlength
@@ -473,10 +603,25 @@ void HTMLTextAreaElement::form_associated_element_attribute_changed(Utf16FlyStri
         CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
-void HTMLTextAreaElement::did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data)
+void HTMLTextAreaElement::record_user_edit(Utf16View previous_value)
+{
+    // NB: set_range_text() already updated the raw value, so callers supply the pre-edit value.
+    if (!m_value_before_first_user_edit.has_value())
+        m_value_before_first_user_edit = Utf16String::from_utf16(previous_value);
+    if (*m_value_before_first_user_edit == api_value())
+        m_value_before_first_user_edit.clear();
+}
+
+void HTMLTextAreaElement::did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value)
 {
     VERIFY(m_text_node);
     set_raw_value(m_text_node->data());
+    record_user_edit(previous_value);
+
+    // A textarea element's dirty value flag must be set to true whenever the user interacts with the control in a way that changes the raw value.
+    m_dirty_value = true;
+    if (api_value() != previous_value)
+        set_value_was_last_changed_by_user_edit(true);
 
     // AD-HOC: Editing the value may change which validity pseudo-classes match.
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
@@ -493,9 +638,6 @@ void HTMLTextAreaElement::did_edit_text_node(Utf16FlyString const& input_type, O
     input_event_init.is_composing = document().is_input_method_composing();
     auto input_event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, input_event_init, {}, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
     dispatch_event(input_event);
-
-    // A textarea element's dirty value flag must be set to true whenever the user interacts with the control in a way that changes the raw value.
-    m_dirty_value = true;
 
     update_placeholder_visibility();
 }
@@ -536,9 +678,9 @@ Optional<Utf16String> HTMLTextAreaElement::placeholder_value() const
     return get_attribute_value(HTML::AttributeNames::placeholder);
 }
 
-Layout::Node* HTMLTextAreaElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLTextAreaElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::TextAreaBox);
+    return CSS::ElementBoxKind::TextArea;
 }
 
 }

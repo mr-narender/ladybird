@@ -7,10 +7,13 @@
 #pragma once
 
 #include <AK/ByteString.h>
+#include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/Time.h>
 #include <LibCore/File.h>
+#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/Options.h>
 #include <LibWebView/ProcessType.h>
 
 namespace Core::CrashReportData {
@@ -28,11 +31,24 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static ErrorOr<NonnullOwnPtr<CrashReport>> create(ProcessType);
-    static ByteString directory();
     static bool is_supported();
-    static ErrorOr<void> show_directory();
+
     int fd() const { return m_file->fd(); }
-    ErrorOr<void> save(int wait_status, ByteString const& directory = CrashReport::directory());
+    ByteString const& saved_name() const { return m_saved_name; }
+
+    // What a report says of the build and system that crashed. A browser records it with its record, since a later
+    // launch formats the report, and that launch may be another build.
+    static ByteString describe_current_build(ProcessType);
+    // Reports from a browser that runs without the sandbox say so.
+    static void set_sandbox_is_disabled(DisableSandbox);
+    ErrorOr<void> record_build_description(StringView description);
+
+    ErrorOr<void> save(int wait_status, ByteString const& directory = CrashReportStore::the().directory(),
+        Optional<UnixDateTime> crashed_at = {});
+
+    // The platform features a helper was launched with, which stay as they were for its lifetime. A report without them
+    // says that the process has none.
+    void set_platform_features_description(ByteString description) { m_platform_features_description = move(description); }
 
     explicit CrashReport(NonnullOwnPtr<Core::File> file, ProcessType process_type)
         : m_file(move(file))
@@ -41,11 +57,13 @@ public:
     }
 
 private:
-    static ByteString symbolicate_frame(Core::CrashReportData::ReportFrame const&);
+    static void symbolicate_frame(Core::CrashReportData::ReportFrame&);
 
     NonnullOwnPtr<Core::File> m_file;
     [[maybe_unused]] ProcessType m_process_type;
     MonotonicTime m_started_at { MonotonicTime::now() };
+    ByteString m_saved_name;
+    ByteString m_platform_features_description;
 };
 
 }

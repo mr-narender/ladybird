@@ -5,16 +5,15 @@
     // and consult beforeunload in every process hosting a crossing document.
     promiseTest(async () => {
         const httpServer = httpTestServer();
-        const runId = crypto.randomUUID();
         const childHostname = uniqueLocalhostHostname("oop-beforeunload");
 
         const secondUrl = new URL(
-            await httpServer.createEcho("GET", `/oop-beforeunload-second-${runId}`, {
+            await httpServer.createEcho("GET", "/oop-beforeunload-second", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
-                    document.cookie = "secondLoaded=1; path=/";
-                    addEventListener("beforeunload", () => { document.cookie = "secondBeforeUnload=1; path=/"; });
+                    document.cookie = "secondLoaded=1; path=/; SameSite=None; Secure";
+                    addEventListener("beforeunload", () => { document.cookie = "secondBeforeUnload=1; path=/; SameSite=None; Secure"; });
                     setTimeout(() => history.back(), 0);
                 <\/script>`,
             })
@@ -22,12 +21,12 @@
         secondUrl.hostname = childHostname;
 
         const firstUrl = new URL(
-            await httpServer.createEcho("GET", `/oop-beforeunload-first-${runId}`, {
+            await httpServer.createEcho("GET", "/oop-beforeunload-first", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
                     const match = document.cookie.match(/firstVisits=(\\d+)/);
-                    document.cookie = "firstVisits=" + (match ? Number(match[1]) + 1 : 1) + "; path=/";
+                    document.cookie = "firstVisits=" + (match ? Number(match[1]) + 1 : 1) + "; path=/; SameSite=None; Secure";
                     if (!match)
                         addEventListener("load", () => setTimeout(() => { location.href = "${secondUrl}"; }, 0));
                 <\/script>`,

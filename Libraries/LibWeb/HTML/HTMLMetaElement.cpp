@@ -50,9 +50,10 @@ Optional<HTMLMetaElement::HttpEquivAttributeState> HTMLMetaElement::http_equiv_s
 
 void HTMLMetaElement::update_metadata(Optional<Utf16String> const& old_name)
 {
+    Layout::ForcedReadScope read { document() };
     if (auto name = get_attribute_ns({}, AttributeNames::name); name.has_value()) {
         if (name->equals_ignoring_ascii_case(u"theme-color"sv)) {
-            document().obtain_theme_color();
+            document().obtain_theme_color(read);
         } else if (name->equals_ignoring_ascii_case(u"color-scheme"sv)) {
             document().obtain_supported_color_schemes();
         } else if (name->equals_ignoring_ascii_case(u"referrer"sv)) {
@@ -63,7 +64,7 @@ void HTMLMetaElement::update_metadata(Optional<Utf16String> const& old_name)
 
     if (old_name.has_value()) {
         if (old_name->equals_ignoring_ascii_case(u"theme-color"sv)) {
-            document().obtain_theme_color();
+            document().obtain_theme_color(read);
         } else if (old_name->equals_ignoring_ascii_case(u"color-scheme"sv)) {
             document().obtain_supported_color_schemes();
         }
@@ -207,18 +208,26 @@ void HTMLMetaElement::inserted()
             // 3. Let policy be the result of executing Content Security Policy's parse a serialized Content Security
             //    Policy algorithm on the meta element's content attribute's value, with a source of "meta", and a
             //    disposition of "enforce".
-            auto policy = ContentSecurityPolicy::Policy::parse_a_serialized_csp(GC::Heap::the(), input, ContentSecurityPolicy::Policy::Source::Meta, ContentSecurityPolicy::Policy::Disposition::Enforce);
+            auto policy = ContentSecurityPolicy::Policy::parse_a_serialized_csp(input, ContentSecurityPolicy::Policy::Source::Meta, ContentSecurityPolicy::Policy::Disposition::Enforce);
 
             // 4. Remove all occurrences of the report-uri, frame-ancestors, and sandbox directives from policy.
-            policy->remove_directive({}, ContentSecurityPolicy::Directives::Names::ReportUri);
-            policy->remove_directive({}, ContentSecurityPolicy::Directives::Names::FrameAncestors);
-            policy->remove_directive({}, ContentSecurityPolicy::Directives::Names::Sandbox);
+            policy->remove_directive(ContentSecurityPolicy::Directives::Names::ReportUri);
+            policy->remove_directive(ContentSecurityPolicy::Directives::Names::FrameAncestors);
+            policy->remove_directive(ContentSecurityPolicy::Directives::Names::Sandbox);
 
             // FIXME: File spec issue stating the policy's self origin isn't set here.
-            policy->set_self_origin({}, document().origin());
+            policy->set_self_origin(document().origin());
 
             // 5. Enforce the policy policy.
-            document().relevant_settings_object().policy_container()->csp_list->enforce_policy(policy);
+            // NB: This goes in the document's own policy container, which for a document with a browsing context is
+            //     its settings object's too. A document without one, e.g. from DOMParser, shares its relevant settings
+            //     object with the document that created it, which a policy in its markup must never reach.
+            document().policy_container()->csp_list.enforce_policy(policy);
+
+            // NB: A process hosting a child navigable reads its container's node document's CSP list from the
+            //     container's state: Its frame-src governs where the child navigable can be navigated to, and a
+            //     document created in the child navigable inherits its insecure requests policy.
+            document().report_container_state_of_child_navigables();
             break;
         }
         default:

@@ -1,4 +1,0 @@
-engine records: 2
-C++ recomputations: 1
-color: rgb(255, 0, 0)
-font size: 20px

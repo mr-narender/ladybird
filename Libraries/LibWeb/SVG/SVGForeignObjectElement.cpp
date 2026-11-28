@@ -5,8 +5,8 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGAnimatedLength.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
@@ -27,9 +27,13 @@ void SVGForeignObjectElement::initialize_element()
 {
 }
 
-Layout::Node* SVGForeignObjectElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind SVGForeignObjectElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGForeignObjectBox);
+    // NB: A mask or a pattern renders its content only where it is referenced, and foreign content is not part of
+    //     that rendering. Thus a foreignObject in a never-rendered subtree gets no box.
+    if (is_in_never_rendered_subtree())
+        return CSS::ElementBoxKind::NoBox;
+    return CSS::ElementBoxKind::SvgForeignObject;
 }
 
 void SVGForeignObjectElement::visit_edges(GC::Cell::Visitor& visitor)

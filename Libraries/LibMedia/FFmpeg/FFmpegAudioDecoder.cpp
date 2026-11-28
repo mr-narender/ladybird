@@ -6,11 +6,12 @@
 
 #include <AK/GenericShorthands.h>
 #include <LibCore/System.h>
-#include <LibMedia/AudioBlock.h>
-#include <LibMedia/Codecs/AAC.h>
-#include <LibMedia/CodedFrame.h>
-#include <LibMedia/FFmpeg/FFmpegFunctions.h>
-#include <LibMedia/FFmpeg/FFmpegHelpers.h>
+#include <LibMedia/FFmpeg/FFmpegChannelLayout.h>
+#include <LibMediaCodecs/AudioBlock.h>
+#include <LibMediaCodecs/Codecs/AAC.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegFunctions.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegHelpers.h>
 
 #include "FFmpegAudioDecoder.h"
 
@@ -34,9 +35,19 @@ Optional<DecoderCapabilities> FFmpegAudioDecoder::capabilities(FFmpegFunctions c
         return {};
     if (codec.codec_id() == CodecID::AAC && !aac_audio_object_type_is_supported(codec))
         return {};
-    if (!functions.avcodec_find_decoder(ffmpeg_codec_id_from_media_codec_id(codec.codec_id())))
+    if (!functions.avcodec_find_decoder(functions.ffmpeg_codec_id(codec.codec_id())))
         return {};
     return DecoderCapabilities { .smooth = true, .power_efficient = true };
+}
+
+static DecoderErrorOr<Optional<FixedArray<u8>>> maybe_remove_aac_sbr_when_extension_sampling_frequency_is_invalid(CodecID codec_id, ReadonlyBytes codec_configuration)
+{
+    if (codec_id != CodecID::AAC)
+        return OptionalNone {};
+    auto spectral_band_replication = Codecs::AAC::parse_explicit_spectral_band_replication(codec_configuration);
+    if (!spectral_band_replication.has_value() || spectral_band_replication->output_sample_rate > spectral_band_replication->core_sample_rate)
+        return OptionalNone {};
+    return TRY(Codecs::AAC::create_configuration_record(spectral_band_replication->core_audio_object_type, spectral_band_replication->core_sample_rate, spectral_band_replication->channel_count, {}, spectral_band_replication->general_audio_specific_config));
 }
 
 DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> FFmpegAudioDecoder::try_create(FFmpegFunctions const& functions, CodecID codec_id, Audio::SampleSpecification const& sample_specification, ReadonlyBytes codec_initialization_data)
@@ -52,8 +63,7 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> FFmpegAudioDecoder::try_create
         }
     };
 
-    auto ff_codec_id = ffmpeg_codec_id_from_media_codec_id(codec_id);
-    auto const* codec = functions.avcodec_find_decoder(ff_codec_id);
+    auto const* codec = functions.avcodec_find_decoder(functions.ffmpeg_codec_id(codec_id));
     if (!codec)
         return DecoderError::format(DecoderErrorCategory::NotImplemented, "Could not find FFmpeg decoder for codec {}", codec_id);
 
@@ -61,6 +71,9 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> FFmpegAudioDecoder::try_create
     if (!codec_context)
         return DecoderError::format(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg codec context for codec {}", codec_id);
 
+    auto replacement_initialization_data = TRY(maybe_remove_aac_sbr_when_extension_sampling_frequency_is_invalid(codec_id, codec_initialization_data));
+    if (replacement_initialization_data.has_value())
+        codec_initialization_data = replacement_initialization_data->span();
     TRY(set_codec_initialization_data(functions, *codec_context, codec_id, codec_initialization_data));
     VERIFY(functions.av_opt_set_int(codec_context, "threads", min(Core::System::hardware_concurrency(), 4u), 0) == 0);
 
@@ -69,13 +82,13 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> FFmpegAudioDecoder::try_create
     VERIFY(functions.av_opt_set_int(codec_context, "ar", sample_specification.sample_rate(), 0) == 0);
 
     if (sample_specification.channel_map().is_valid()) {
-        auto channel_layout_result = channel_map_to_av_channel_layout(functions, sample_specification.channel_map());
+        auto channel_layout_result = FFmpegChannelLayout::from_channel_map(functions, sample_specification.channel_map());
         if (channel_layout_result.is_error())
             return DecoderError::format(DecoderErrorCategory::Invalid, channel_layout_result.error().string_literal());
         auto channel_layout = channel_layout_result.release_value();
-        auto set_result = functions.av_opt_set_chlayout(codec_context, "ch_layout", &channel_layout, 0);
-        functions.av_channel_layout_uninit(&channel_layout);
-        VERIFY(set_result == 0);
+        auto set_result = functions.av_opt_set_chlayout(codec_context, "ch_layout", &channel_layout.layout(), 0);
+        if (set_result != 0)
+            return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to set the channel layout"sv);
     }
 
     if (functions.avcodec_open2(codec_context, codec, nullptr) < 0)
@@ -90,7 +103,7 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> FFmpegAudioDecoder::try_create
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg frame"sv);
 
     memory_guard.disarm();
-    return DECODER_TRY_ALLOC(try_make<FFmpegAudioDecoder>(functions, codec_context, packet, frame));
+    return DECODER_TRY_ALLOC(try_make<FFmpegAudioDecoder>(functions, codec_id, codec_context, packet, frame));
 }
 
 Optional<DecoderCapabilities> FFmpegAudioDecoder::capabilities(ParsedCodec const& codec)
@@ -103,8 +116,9 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegAudioDecoder>> FFmpegAudioDecoder::try_create
     return try_create(FFmpegFunctions::bundled(), codec_id, sample_specification, codec_initialization_data);
 }
 
-FFmpegAudioDecoder::FFmpegAudioDecoder(FFmpegFunctions const& functions, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame)
+FFmpegAudioDecoder::FFmpegAudioDecoder(FFmpegFunctions const& functions, CodecID codec_id, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame)
     : m_functions(functions)
+    , m_codec_id(codec_id)
     , m_codec_context(codec_context)
     , m_packet(packet)
     , m_frame(frame)
@@ -130,8 +144,12 @@ DecoderErrorOr<void> FFmpegAudioDecoder::receive_coded_data(CodedFrame const& co
 
     ScopeGuard clear_packet_side_data { [&] { m_functions.av_packet_free_side_data(m_packet); } };
     auto new_codec_configuration = coded_frame.new_codec_configuration();
-    if (new_codec_configuration.has_value() && !new_codec_configuration->is_empty())
+    if (new_codec_configuration.has_value() && !new_codec_configuration->is_empty()) {
+        auto replacement_configuration = TRY(maybe_remove_aac_sbr_when_extension_sampling_frequency_is_invalid(m_codec_id, *new_codec_configuration));
+        if (replacement_configuration.has_value())
+            new_codec_configuration = replacement_configuration->span();
         TRY(add_new_extradata_to_packet(m_functions, *m_packet, *new_codec_configuration));
+    }
 
     auto result = m_functions.avcodec_send_packet(m_codec_context, m_packet);
     switch (result) {
@@ -212,10 +230,8 @@ DecoderErrorOr<void> FFmpegAudioDecoder::receive_next_frame()
     if (sample_rate <= 0 || sample_rate > NumericLimits<u32>::max())
         return DecoderError::corrupted("FFmpeg decoder created a frame with an invalid sample rate"sv);
 
-    AVChannelLayout channel_layout;
-    VERIFY(m_functions.av_opt_get_chlayout(m_codec_context, "ch_layout", 0, &channel_layout) == 0);
-    auto channel_map_result = av_channel_layout_to_channel_map(m_functions, channel_layout);
-    m_functions.av_channel_layout_uninit(&channel_layout);
+    auto channel_layout = FFmpegChannelLayout::from_opt(m_functions, m_codec_context, "ch_layout");
+    auto channel_map_result = channel_layout.to_channel_map();
     if (channel_map_result.is_error())
         return DecoderError::with_description(DecoderErrorCategory::NotImplemented, channel_map_result.error().string_literal());
 

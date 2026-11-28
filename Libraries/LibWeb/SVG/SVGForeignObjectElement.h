@@ -18,7 +18,7 @@ class SVGForeignObjectElement final : public SVGGraphicsElement {
 public:
     virtual ~SVGForeignObjectElement() override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     // AD-HOC: The spec states that the x, y, width and height IDL attributes reflect the respective computed values and their
     //         corresponding presentation attributes but other browsers reflect the attribute values instead - see
@@ -39,8 +39,6 @@ public:
 private:
     SVGForeignObjectElement(DOM::Document& document, DOM::QualifiedName qualified_name);
 
-    virtual bool is_svg_foreign_object_element() const override { return true; }
-
     virtual void initialize_element() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
@@ -49,12 +47,5 @@ private:
     GC::Ptr<SVG::SVGAnimatedLength> m_width;
     GC::Ptr<SVG::SVGAnimatedLength> m_height;
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<SVG::SVGForeignObjectElement>() const { return is_svg_foreign_object_element(); }
 
 }

@@ -6,21 +6,21 @@
 
 #include <AK/Checked.h>
 #include <AK/OwnPtr.h>
-#include <LibMedia/AudioBlock.h>
-#include <LibMedia/AudioDecoder.h>
-#include <LibMedia/CodedFrame.h>
 #include <LibMedia/DecodeAudioStream.h>
-#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/FFmpeg/FFmpegAudioConverter.h>
 #include <LibMedia/Track.h>
+#include <LibMediaCodecs/AudioBlock.h>
+#include <LibMediaCodecs/AudioDecoder.h>
+#include <LibMediaCodecs/AudioDecoderRegistry.h>
+#include <LibMediaCodecs/CodedFrame.h>
 
 namespace Media {
 
 // Materializing an entire stream can require a large amount of memory for long inputs, so all sample storage is
 // allocated fallibly and any failure is reported as a decoder error instead of crashing the process.
-static DecoderErrorOr<void> append_block_samples(AudioBlock const& block, DecodedAudioData& data)
+static DecoderErrorOr<void> append_block_samples(AudioBlock const& block, DecodedAudioData& data, size_t maximum_decoded_byte_count)
 {
     if (block.frame_count() == 0)
         return {};
@@ -34,7 +34,10 @@ static DecoderErrorOr<void> append_block_samples(AudioBlock const& block, Decode
 
     Checked<size_t> new_frame_count { data.channels[0].size() };
     new_frame_count += block.frame_count();
-    if (new_frame_count.has_overflow())
+    auto new_byte_count = new_frame_count;
+    new_byte_count *= data.channels.size();
+    new_byte_count *= sizeof(float);
+    if (new_byte_count.has_overflow() || new_byte_count.value() > maximum_decoded_byte_count)
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Decoded audio stream is too large"sv);
 
     for (size_t channel = 0; channel < data.channels.size(); channel++) {
@@ -49,7 +52,7 @@ static DecoderErrorOr<void> append_block_samples(AudioBlock const& block, Decode
 // to a single sample specification: the requested output sample rate (or the stream's native rate) combined with the
 // stream's native channel map. Routing all blocks through the converter also makes streams whose sample specification
 // changes mid-stream come out uniform.
-DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaStream> const& stream, Optional<u32> output_sample_rate)
+DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaStream> const& stream, Optional<u32> output_sample_rate, size_t maximum_decoded_byte_count)
 {
     auto demuxer = TRY(create_demuxer(stream));
     auto track = TRY(demuxer->get_preferred_track_for_type(TrackType::Audio));
@@ -102,10 +105,8 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
         }
     };
 
-    // Streams often carry stray bytes after their last frame: container padding, an encoder's alignment, or whatever
-    // a producer left behind when it sized a buffer generously. The decoder reports those as corrupt data, but the
-    // audio ahead of them is perfectly good, so once a stream has produced samples we treat undecodable data as the
-    // end of the audio rather than discarding everything decoded so far.
+    // Padding, an encoder's alignment or a generously sized buffer leaves bytes behind the last frame, so once a
+    // stream has produced samples, data that no longer parses ends the audio instead of discarding it.
     auto is_trailing_data = [&data](DecoderError const& error) {
         return error.category() == DecoderErrorCategory::Corrupted && data.sample_specification.is_valid();
     };
@@ -131,11 +132,9 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
                     return DecoderError::format(DecoderErrorCategory::NotImplemented, "Could not find an audio decoder for codec {}", sample.codec_id());
                 decoder = TRY(create_audio_decoder(selection, sample.codec_id(), track->audio_data().sample_specification, *codec_initialization_data));
             }
-            if (auto result = decoder->receive_coded_data(sample); result.is_error()) {
-                if (!is_trailing_data(result.error()))
-                    return result.release_error();
-                decoder->signal_end_of_stream();
-            }
+            // A frame the decoder cannot read costs only the audio it carried; the frames behind it still decode.
+            if (auto result = decoder->receive_coded_data(sample); result.is_error() && result.error().category() != DecoderErrorCategory::Corrupted)
+                return result.release_error();
         }
 
         while (true) {
@@ -150,7 +149,7 @@ DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaS
                 return block_result.release_error();
             }
 
-            TRY(append_block_samples(block, data));
+            TRY(append_block_samples(block, data, maximum_decoded_byte_count));
         }
     }
 

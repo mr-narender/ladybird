@@ -22,25 +22,16 @@ public:
     virtual SVGFitToViewBox const* fit_to_view_box() const override { return this; }
 
 private:
-    virtual bool is_svg_symbol_element() const final { return true; }
-
     SVGSymbolElement(DOM::Document&, DOM::QualifiedName);
 
     virtual void initialize_element() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     bool is_direct_child_of_use_shadow_tree() const;
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<SVG::SVGSymbolElement>() const { return is_svg_symbol_element(); }
 
 }

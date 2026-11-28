@@ -5,12 +5,24 @@
  */
 
 #[cfg(feature = "allocator")]
-/// cbindgen:ignore
-#[path = "../../../RustAllocator.rs"]
-mod rust_allocator;
+extern crate ladybird_allocator;
+
+#[path = "../../../RustDemangle.rs"]
+mod rust_demangle;
 
 #[path = "../../../RustPanic.rs"]
 mod rust_panic;
 
+mod ffi;
+
+pub mod bmp;
+pub use bmp::*;
+
+pub mod ico;
+pub use ico::*;
+
 pub mod jpeg_xl;
 pub use jpeg_xl::*;
+
+pub mod png;
+pub use self::png::*;

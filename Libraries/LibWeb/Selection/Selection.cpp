@@ -13,9 +13,11 @@
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/ClipboardSerializer.h>
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/Selection/SelectionModifier.h>
 
@@ -538,11 +540,9 @@ Utf16String Selection::to_string() const
     if (auto form_text = try_form_control_selected_text_for_stringifier(); form_text.has_value())
         return form_text.release_value();
 
-    // FIXME: This needs more work to be compatible with other engines.
-    //        See https://www.w3.org/Bugs/Public/show_bug.cgi?id=10583
-    if (!m_range)
+    if (!m_range || m_range->collapsed())
         return {};
-    return m_range->to_string();
+    return Editing::serialize_selection_as_plain_text(*m_range);
 }
 
 GC::Ref<DOM::Document> Selection::document() const
@@ -567,6 +567,7 @@ void Selection::set_range(GC::Ptr<DOM::Range> range)
     m_range = range;
     m_focus_affinity = TextAffinity::Downstream;
     m_preferred_inline_coordinate.clear();
+    m_document->page().clear_find_in_page_active_match();
 
     if (range)
         range->set_associated_selection({}, this);
@@ -603,7 +604,7 @@ GC::Ptr<DOM::Position> Selection::cursor_position() const
     if (!m_range || !is_collapsed())
         return nullptr;
 
-    return DOM::Position::create(*m_range->start_container(), m_range->start_offset());
+    return DOM::Position::create(*m_range->start_container(), m_range->start_offset(), m_focus_affinity);
 }
 
 void Selection::move_offset_to_next_character(bool collapse_selection)
@@ -642,10 +643,11 @@ void Selection::scroll_focus_into_view()
     if (!focus)
         return;
 
+    Layout::ForcedReadScope read { *m_document };
     m_document->update_layout(DOM::UpdateLayoutReason::ScrollCursorIntoView);
 
     if (auto* text = as_if<DOM::Text>(*focus))
-        Painting::scroll_text_offset_into_view(*text, focus_offset(), m_focus_affinity);
+        Painting::scroll_text_offset_into_view(read, *text, focus_offset(), m_focus_affinity);
 }
 
 }

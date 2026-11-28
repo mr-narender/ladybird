@@ -7,7 +7,7 @@
     "org.freedesktop.Sdk.Extension.llvm20",
     "org.freedesktop.Sdk.Extension.rust-stable"
   ],
-  "command": "Ladybird",
+  "command": "ladybird",
   "finish-args": [
     "--device=dri",
     "--device=input",
@@ -16,7 +16,9 @@
     "--socket=wayland",
     "--socket=fallback-x11",
     "--socket=pulseaudio",
-    "--socket=session-bus"
+    "--socket=session-bus",
+    "--filesystem=xdg-config/gtk-3.0:ro",
+    "--filesystem=xdg-download"
   ],
   "cleanup": [
     "/sbin",
@@ -37,13 +39,12 @@
         {
           "type": "git",
           "url": "https://github.com/simdjson/simdjson.git",
-          "tag": "v4.6.4"
+          "tag": "v5.1.1"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         "-DSIMDJSON_BUILD_STATIC_LIB=OFF",
         "-DSIMDJSON_DEVELOPER_MODE=OFF"
@@ -56,54 +57,16 @@
         {
           "type": "git",
           "url": "https://github.com/simdutf/simdutf.git",
-          "tag": "v9.1.0"
+          "tag": "v9.5.0"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         "-DSIMDUTF_TESTS=OFF",
         "-DSIMDUTF_BENCHMARKS=OFF",
         "-DSIMDUTF_TOOLS=OFF"
-      ]
-    },
-    {
-      "name": "libpng",
-      "buildsystem": "cmake-ninja",
-      "sources": [
-        {
-          "type": "git",
-          "url": "https://github.com/pnggroup/libpng.git",
-          "tag": "v1.6.58"
-        },
-        {
-          "type": "file",
-          "url": "https://downloads.sourceforge.net/project/libpng-apng/libpng16/1.6.58/libpng-1.6.58-apng.patch.gz",
-          "sha512": "95a6f5bb7148b5c48dccd73811d7bcf9752a631a7bb4f4856670a7da12a7159581ac1bce1749318343794e0f5cb86972711ba2ec0f523c168f0991fa940687d5"
-        },
-        {
-          "type": "shell",
-          "commands": [
-            "gunzip -k libpng-1.6.58-apng.patch.gz",
-            "patch -p1 -i libpng-1.6.58-apng.patch"
-          ]
-        }
-      ],
-      "config-opts": [
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
-        "-DPNG_FRAMEWORK=OFF",
-        "-DPNG_TESTS=OFF",
-        "-DPNG_TOOLS=OFF",
-        "-DSKIP_INSTALL_EXECUTABLES=ON",
-        "-DSKIP_INSTALL_FILES=OFF",
-        "-DSKIP_INSTALL_PROGRAMS=ON"
-      ],
-      "cleanup": [
-        "/bin"
       ]
     },
     {
@@ -194,25 +157,6 @@
       ]
     },
     {
-      "name": "fmt",
-      "buildsystem": "cmake-ninja",
-      "sources": [
-        {
-          "type": "git",
-          "url": "https://github.com/fmtlib/fmt.git",
-          "tag": "12.2.0"
-        }
-      ],
-      "config-opts": [
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
-        "-DBUILD_SHARED_LIBS=ON",
-        "-DFMT_TEST=OFF",
-        "-DFMT_DOC=OFF"
-      ]
-    },
-    {
       "name": "icu",
       "buildsystem": "autotools",
       "builddir": false,
@@ -249,12 +193,12 @@
         {
           "type": "git",
           "url": "https://github.com/rockdaboot/libpsl.git",
-          "tag": "0.21.5"
+          "tag": "0.23.3"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/publicsuffix/list/303b81a2140a3192d336f22af389a28daf6efab6/public_suffix_list.dat",
-          "sha256": "82d4d57e397177be3a627df27f88dc0ab04f54d081bc94c68f82c3e100855e0b",
+          "url": "https://raw.githubusercontent.com/publicsuffix/list/bfd12e081959c7ae143c05eb99c95513686f90f4/public_suffix_list.dat",
+          "sha256": "fec2c726dc5f1fe42e863e41299e58954565ddf85eec7681abade762274c236d",
           "dest": "list/"
         }
       ],
@@ -269,67 +213,18 @@
       ]
     },
     {
-      "name": "libxml2",
-      "buildsystem": "cmake-ninja",
-      "sources": [
-        {
-          "type": "git",
-          "url": "https://github.com/GNOME/libxml2.git",
-          "tag": "v2.15.3"
-        }
-      ],
-      "config-opts": [
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
-        "-DLIBXML2_WITH_TESTS=OFF",
-        "-DLIBXML2_WITH_PROGRAMS=OFF",
-        "-DLIBXML2_WITH_HTML=ON",
-        "-DLIBXML2_WITH_C14N=ON",
-        "-DLIBXML2_WITH_CATALOG=ON",
-        "-DLIBXML2_WITH_DEBUG=OFF",
-        "-DLIBXML2_WITH_ISO8859X=ON",
-        "-DLIBXML2_WITH_MODULES=ON",
-        "-DLIBXML2_WITH_OUTPUT=ON",
-        "-DLIBXML2_WITH_PATTERN=ON",
-        "-DLIBXML2_WITH_PUSH=ON",
-        "-DLIBXML2_WITH_PYTHON=OFF",
-        "-DLIBXML2_WITH_READER=ON",
-        "-DLIBXML2_WITH_REGEXPS=ON",
-        "-DLIBXML2_WITH_SAX1=ON",
-        "-DLIBXML2_WITH_SCHEMAS=ON",
-        "-DLIBXML2_WITH_SCHEMATRON=ON",
-        "-DLIBXML2_WITH_THREADS=ON",
-        "-DLIBXML2_WITH_THREAD_ALLOC=OFF",
-        "-DLIBXML2_WITH_TREE=ON",
-        "-DLIBXML2_WITH_VALID=ON",
-        "-DLIBXML2_WITH_WRITER=ON",
-        "-DLIBXML2_WITH_XINCLUDE=ON",
-        "-DLIBXML2_WITH_XPATH=ON",
-        "-DLIBXML2_WITH_XPTR=ON",
-        "-DLIBXML2_WITH_ICONV=ON",
-        "-DLIBXML2_WITH_ICU=ON",
-        "-DLIBXML2_WITH_LZMA=ON",
-        "-DLIBXML2_WITH_ZLIB=ON"
-      ],
-      "cleanup": [
-        "/bin"
-      ]
-    },
-    {
       "name": "vulkan-memory-allocator",
       "buildsystem": "cmake-ninja",
       "sources": [
         {
           "type": "git",
           "url": "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git",
-          "tag": "v3.4.0"
+          "tag": "v3.5.0"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib"
+        "-DCMAKE_PREFIX_PATH=/app"
       ]
     },
     {
@@ -339,13 +234,12 @@
         {
           "type": "git",
           "url": "https://github.com/google/brotli.git",
-          "tag": "v1.2.0"
+          "tag": "v1.2.1"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DBROTLI_DISABLE_TESTS=ON",
         "-DBROTLI_BUILD_TOOLS=OFF"
       ],
@@ -371,7 +265,6 @@
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DCANONICAL_PREFIXES=ON",
         "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
       ]
@@ -383,7 +276,7 @@
         {
           "type": "git",
           "url": "https://code.videolan.org/videolan/dav1d.git",
-          "tag": "1.5.3"
+          "tag": "1.5.4"
         }
       ],
       "config-opts": [
@@ -427,9 +320,8 @@
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DAVIF_CODEC_AOM=OFF",
-        "-DAVIF_CODEC_DAV1D=ON",
+        "-DAVIF_CODEC_DAV1D=SYSTEM",
         "-DAVIF_BUILD_APPS=OFF"
       ]
     },
@@ -446,7 +338,6 @@
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DBUILD_SHARED_LIBS=ON",
         "-DWEBP_BUILD_ANIM_UTILS=ON",
         "-DWEBP_BUILD_LIBWEBPMUX=ON",
@@ -510,30 +401,13 @@
       ]
     },
     {
-      "name": "libtommath",
-      "buildsystem": "cmake-ninja",
-      "sources": [
-        {
-          "type": "git",
-          "url": "https://github.com/libtom/libtommath.git",
-          "tag": "v1.3.0"
-        }
-      ],
-      "config-opts": [
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
-        "-DBUILD_SHARED_LIBS=ON"
-      ]
-    },
-    {
       "name": "fast-float",
         "buildsystem": "cmake-ninja",
         "sources": [
           {
             "type": "git",
             "url": "https://github.com/fastfloat/fast_float.git",
-            "tag": "v8.2.10"
+            "tag": "v8.3.3"
           }
         ],
         "config-opts": [
@@ -549,13 +423,12 @@
         {
           "type": "git",
           "url": "https://github.com/libsdl-org/SDL.git",
-          "tag": "release-3.2.28"
+          "tag": "release-3.4.20"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib"
+        "-DCMAKE_PREFIX_PATH=/app"
       ]
     },
     {
@@ -565,13 +438,19 @@
         {
           "type": "git",
           "url": "https://github.com/davea42/libdwarf-code.git",
-          "tag": "v2.3.1"
+          "commit": "1c267616a4c8dc46b3380f0be4296ff8767bdfbb",
+          "tag": "v2.3.3"
         }
+      ],
+      "license-files": [
+        "COPYING",
+        "src/lib/libdwarf/COPYING",
+        "src/lib/libdwarf/LGPL.txt",
+        "src/lib/libdwarf/LIBDWARFCOPYRIGHT"
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DBUILD_SHARED=ON",
         "-DBUILD_DWARFDUMP=OFF"
       ]
@@ -589,8 +468,7 @@
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib"
+        "-DCMAKE_PREFIX_PATH=/app"
       ]
     },
     {
@@ -601,13 +479,12 @@
         {
           "type": "git",
           "url": "https://github.com/jeremy-rifkin/cpptrace.git",
-          "tag": "v1.0.2"
+          "tag": "v1.0.4"
         }
       ],
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DBUILD_SHARED_LIBS=ON",
         "-DCPPTRACE_USE_EXTERNAL_LIBDWARF=ON",
         "-DCPPTRACE_USE_EXTERNAL_ZSTD=ON"
@@ -619,14 +496,16 @@
       "build-commands": [
         "./Configure enable-static-engine enable-capieng no-apps no-docs no-tests shared --prefix=/app --openssldir=/app/ssl --libdir=lib",
         "make -j$(nproc)",
-        "make install"
+        "make install",
+        "ln -sf /etc/ssl/certs/ca-certificates.crt /app/ssl/cert.pem"
       ],
       "sources": [
         {
           "type": "git",
           "url": "https://github.com/openssl/openssl.git",
-          "commit": "aae016bfd52fcad2bc9657c2c782cfdf73b1ed5f",
-          "tag": "openssl-3.6.3"
+          "commit": "c8bd5a57108599ac650bbae77fcabe3109dab2e8",
+          "tag": "openssl-3.6.5",
+          "disable-submodules": true
         }
       ]
     },
@@ -634,7 +513,7 @@
       "name": "ffmpeg",
       "buildsystem": "simple",
       "build-commands": [
-        "./configure --prefix=/app --libdir=/app/lib --enable-shared --disable-static --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --build-suffix=-ladybird --disable-everything --disable-network --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --enable-avformat --disable-avfilter --disable-postproc --enable-swresample --disable-swscale --enable-libdav1d --enable-zlib --enable-decoder=vp8,vp9,libdav1d,theora,vorbis,opus,flac,mp3float,pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_alaw,pcm_mulaw --enable-parser=vp8,vp9,av1,flac,mpegaudio --enable-demuxer=ogg,mov,flac,wav --disable-optimizations",
+        "./configure --prefix=/app --libdir=/app/lib --enable-shared --disable-static --enable-pic --disable-doc --enable-debug --enable-runtime-cpudetect --disable-autodetect --build-suffix=-ladybird --disable-everything --disable-network --disable-ffmpeg --disable-ffplay --disable-ffprobe --enable-avcodec --disable-avdevice --disable-avformat --disable-avfilter --enable-swresample --disable-swscale --enable-libdav1d --enable-libopus --enable-zlib --enable-vulkan --enable-libdrm --enable-decoder=vp8,vp9,av1,libdav1d,theora,vorbis,opus,flac,mp3float,pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_alaw,pcm_mulaw --enable-encoder=libopus --enable-hwaccel=vp9_vulkan,av1_vulkan --enable-parser=vp8,vp9,av1,mpegaudio --disable-optimizations",
         "make -j$(nproc) V=1",
         "make install"
       ],
@@ -642,12 +521,20 @@
         {
           "type": "git",
           "url": "https://github.com/FFmpeg/FFmpeg.git",
-          "commit": "db69d06eeeab4f46da15030a80d539efb4503ca8",
-          "tag": "n7.1.1"
+          "commit": "946fcce07b6dcd0331c8cc609192aeff5e1924f8",
+          "tag": "n9.0.2"
         },
         {
           "type": "patch",
           "path": "../vcpkg/overlay-ports/ffmpeg/0100-ladybird-symbol-version-nodes.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../vcpkg/overlay-ports/ffmpeg/0101-vulkan-decode-dpb-distinct-no-drm-modifiers.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../vcpkg/overlay-ports/ffmpeg/0102-vulkan-av1-clear-unused-ref-frame-mvs.patch"
         }
       ]
     },
@@ -664,7 +551,6 @@
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DMI_BUILD_OBJECT=OFF",
         "-DMI_BUILD_TESTS=OFF",
         "-DMI_BUILD_STATIC=OFF",
@@ -673,6 +559,20 @@
         "-DMI_OVERRIDE=OFF",
         "-DMI_SECURE=ON",
         "-DMI_USE_CXX=ON"
+      ]
+    },
+    {
+      "name": "llvm-libc",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cd libc && find hdr include shared src/__support src/string/memory_utils -name '*.h' -exec install -D -m644 {} /app/include/llvm-libc/{} \\;"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://github.com/llvm/llvm-project/archive/e54169423e7ee5d8b41c2f1b6f7a59000c901ee0.tar.gz",
+          "sha256": "db3ee51752d716118e3ff1109c7920a32dfc29bd414112e8d18ff6280e608c1c"
+        }
       ]
     },
     {
@@ -685,7 +585,7 @@
         {
           "type": "git",
           "url": "https://github.com/google/wuffs-mirror-release-c.git",
-          "tag": "v0.3.4"
+          "tag": "v0.3.5"
         }
       ]
     },
@@ -694,10 +594,11 @@
       "buildsystem": "simple",
       "build-commands": [
         "patch -p1 -i 0001-ladybird-embed.patch",
-        "install -d /app/share/pdfjs/build /app/share/pdfjs/web/images /app/share/pdfjs/web/locale/en-US",
+        "install -d /app/share/pdfjs/build /app/share/pdfjs/web/images /app/share/pdfjs/web/wasm /app/share/pdfjs/web/locale/en-US",
         "install -m644 build/*.mjs /app/share/pdfjs/build/",
         "install -m644 web/viewer.html web/viewer.mjs web/viewer.css /app/share/pdfjs/web/",
         "cp -r web/images/. /app/share/pdfjs/web/images/",
+        "cp -r web/wasm/. /app/share/pdfjs/web/wasm/",
         "install -m644 web/locale/locale.json /app/share/pdfjs/web/locale/",
         "install -m644 web/locale/en-US/viewer.ftl /app/share/pdfjs/web/locale/en-US/"
       ],
@@ -705,13 +606,13 @@
         {
           "type": "git",
           "url": "https://github.com/mozilla/pdf.js.git",
-          "tag": "v5.6.205",
+          "tag": "v6.5.438",
           "dest": "pdfjs-src"
         },
         {
           "type": "archive",
-          "url": "https://github.com/mozilla/pdf.js/releases/download/v5.6.205/pdfjs-5.6.205-dist.zip",
-          "sha256": "0555ef47464e456125dcd0b9742cfa2aaed6d282e804e4dd1f1b99316b46ac00",
+          "url": "https://github.com/mozilla/pdf.js/releases/download/v6.5.438/pdfjs-6.5.438-dist.zip",
+          "sha256": "fcbe9ba21d9911843e3502adc178a7f549a524a4055f887bedc942e5490c6ba1",
           "dest": ".",
           "strip-components": 0
         },
@@ -719,6 +620,114 @@
           "type": "file",
           "path": "../vcpkg/overlay-ports/pdfjs/0001-ladybird-embed.patch"
         }
+      ]
+    },
+    {
+      "name": "zmij",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/vitaut/zmij",
+          "tag": "v1.2"
+        }
+      ],
+      "config-opts": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_PREFIX_PATH=/app",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DZMIJ_TEST=OFF",
+        "-DZMIJ_EXAMPLE=OFF"
+      ]
+    },
+    {
+      "name": "nghttp3",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/ngtcp2/nghttp3.git",
+          "commit": "dc83309ca5fd2beb91cc5c030a2d30525e9f2a00",
+          "tag": "v1.19.0"
+        }
+      ],
+      "config-opts": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_PREFIX_PATH=/app",
+        "-DENABLE_LIB_ONLY=ON",
+        "-DENABLE_SHARED_LIB=ON",
+        "-DENABLE_STATIC_LIB=OFF",
+        "-DBUILD_TESTING=OFF"
+      ]
+    },
+    {
+      "name": "ngtcp2",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/ngtcp2/ngtcp2.git",
+          "commit": "6a22a4d7a111f6b52391910e40ad3681a09cfb9c",
+          "tag": "v1.26.0"
+        }
+      ],
+      "config-opts": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_PREFIX_PATH=/app",
+        "-DOPENSSL_ROOT_DIR=/app",
+        "-DENABLE_OPENSSL=ON",
+        "-DENABLE_SHARED_LIB=ON",
+        "-DENABLE_STATIC_LIB=OFF",
+        "-DBUILD_TESTING=OFF",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_Libev=ON",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_Libnghttp3=ON"
+      ]
+    },
+    {
+      "name": "curl",
+      "buildsystem": "cmake-ninja",
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://curl.se/download/curl-8.23.0.tar.xz",
+          "sha256": "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5"
+        },
+        {
+          "type": "patch",
+          "path": "../vcpkg/overlay-ports/curl/wake-all-pending-transfers.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../vcpkg/overlay-ports/curl/poll-idle-connection-input.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../vcpkg/overlay-ports/curl/wait-for-http2-stream-limit.patch"
+        }
+      ],
+      "config-opts": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_PREFIX_PATH=/app",
+        "-DOPENSSL_ROOT_DIR=/app",
+        "-DBUILD_CURL_EXE=OFF",
+        "-DBUILD_EXAMPLES=OFF",
+        "-DBUILD_LIBCURL_DOCS=OFF",
+        "-DBUILD_MISC_DOCS=OFF",
+        "-DBUILD_STATIC_LIBS=OFF",
+        "-DBUILD_TESTING=OFF",
+        "-DENABLE_CURL_MANUAL=OFF",
+        "-DCURL_USE_OPENSSL=ON",
+        "-DCURL_CA_FALLBACK=ON",
+        "-DCURL_BROTLI=ON",
+        "-DCURL_ZSTD=ON",
+        "-DUSE_NGHTTP2=ON",
+        "-DUSE_NGTCP2=ON",
+        "-DCURL_DISABLE_LDAP=ON",
+        "-DCURL_DISABLE_LDAPS=ON",
+        "-DCURL_USE_LIBPSL=OFF",
+        "-DCURL_USE_LIBSSH2=OFF",
+        "-DUSE_LIBIDN2=OFF",
+        "-DCMAKE_DISABLE_FIND_PACKAGE_Perl=ON"
       ]
     },
     {
@@ -730,6 +739,24 @@
           "url": "https://raw.githubusercontent.com/chromium/chromium/aa04f175415addb04bb78936b0d8b973fbd8ea61/net/http/transport_security_state_static.json",
           "dest": "Caches/HSTSPreload/",
           "sha256": "4ca70f051571a198246bc337bd357f759fb8f9fdeddbe66b65960997540ee163"
+        },
+        {
+          "type": "file",
+          "url": "https://ffmpeg.org/releases/ffmpeg-6.1.6.tar.xz",
+          "dest": "Caches/FFmpegHeaders/",
+          "sha256": "d4fcb164028dd3beee5d92c0ac72e46aac6973c75ea12dc14de07bf8f407370a"
+        },
+        {
+          "type": "file",
+          "url": "https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz",
+          "dest": "Caches/FFmpegHeaders/",
+          "sha256": "de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f"
+        },
+        {
+          "type": "file",
+          "url": "https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz",
+          "dest": "Caches/FFmpegHeaders/",
+          "sha256": "7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3"
         },
         {
           "type": "shell",
@@ -757,13 +784,12 @@
       "config-opts": [
         "-CCache.cmake",
         "-DCMAKE_PREFIX_PATH=/app",
-        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DCMAKE_C_COMPILER=clang",
         "-DCMAKE_CXX_COMPILER=clang++",
-        "-DENABLE_CI_BASELINE_CPU=ON",
-        "-DENABLE_LTO_FOR_RELEASE=ON",
-        "-DENABLE_INSTALL_FREEDESKTOP_FILES=ON",
+        "-DLADYBIRD_BASELINE_CPU_TARGET=ON",
+        "-DLADYBIRD_ENABLE_LTO=ON",
+        "-DLADYBIRD_GENERATE_SYMBOL_FILES=ON",
         "-DENABLE_INSTALL_HEADERS=OFF",
         "-DBUILD_TESTING=OFF",
         "-DICU_ROOT=/app"

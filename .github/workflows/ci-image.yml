@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           ci_image_version="$(tr -d '[:space:]' < Meta/Docker/ci/VERSION)"
-          if ! [[ "${ci_image_version}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]+$ ]]; then
+          if ! [[ "${ci_image_version}" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "Invalid CI image version: ${ci_image_version}"
             exit 1
           fi
@@ -54,7 +54,7 @@ jobs:
         shell: bash
         run: |
           changed_files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD")"
-          if grep -Eqx 'Meta/Docker/ci/Dockerfile|rust-toolchain.toml' <<< "${changed_files}" \
+          if grep -Eqx 'Meta/Docker/ci/Dockerfile|Meta/Docker/ci/install-build-dependencies.sh|rust-toolchain.toml' <<< "${changed_files}" \
             && ! grep -qx 'Meta/Docker/ci/VERSION' <<< "${changed_files}"; then
             echo "Meta/Docker/ci/VERSION must change when CI image inputs change."
             exit 1
@@ -87,17 +87,17 @@ jobs:
 
       - name: Login to GitHub Container Registry
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: Build and publish image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.4.0
         with:
           context: Meta/Docker/ci
           file: Meta/Docker/ci/Dockerfile
@@ -118,14 +118,14 @@ jobs:
 
     steps:
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4.6.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: Publish multi-arch manifests
         shell: bash

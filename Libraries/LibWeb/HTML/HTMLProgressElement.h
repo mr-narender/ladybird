@@ -33,6 +33,10 @@ public:
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
 
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-progress-element-2
+    // The progress element is a devolvable widget.
+    virtual bool is_devolvable_widget() const override { return true; }
+
     // https://www.w3.org/TR/html-aria/#el-progress
     virtual Optional<ARIA::Role> default_role() const override { return ARIA::Role::progressbar; }
 
@@ -40,8 +44,9 @@ private:
     HTMLProgressElement(DOM::Document&, DOM::QualifiedName);
 
     // ^DOM::Node
-    virtual bool is_html_progress_element() const final { return true; }
     virtual void visit_edges(Cell::Visitor&) override;
+
+    virtual void computed_properties_changed() override;
 
     void create_shadow_tree_if_needed();
 
@@ -49,14 +54,8 @@ private:
 
     bool is_determinate() const { return has_attribute(HTML::AttributeNames::value); }
 
+    GC::Ptr<DOM::Element> m_progress_bar_element;
     GC::Ptr<DOM::Element> m_progress_value_element;
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLProgressElement>() const { return is_html_progress_element(); }
 
 }

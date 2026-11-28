@@ -1,0 +1,17 @@
+document.onselectstart: null
+window.onselectstart: null
+div.onselectstart: null
+selectstart at #text, bubbles true, cancelable true, trusted true, selection ""
+free: selected "one two t"
+selectstart at #text, bubbles true, cancelable true, trusted true, selection ""
+blocked: selected ""
+unselectable: selected ""
+onselectstart attribute at #text
+selectstart at #text, bubbles true, cancelable true, trusted true, selection ""
+handler: selected ""
+selectstart at #text, bubbles true, cancelable true, trusted true, selection ""
+click count 2: selected "one"
+selectstart at #text, bubbles true, cancelable true, trusted true, selection ""
+click count 3: selected "one two three four five"
+right press on free: selectstart fired as often as expected, caret moved
+right press on blocked: selectstart fired as often as expected, caret did not move

@@ -9,6 +9,7 @@
 #include <AK/DistinctNumeric.h>
 #include <AK/Function.h>
 #include <AK/GenericShorthands.h>
+#include <AK/HashMap.h>
 #include <AK/RefPtr.h>
 #include <AK/TypeCasts.h>
 #include <AK/Utf16FlyString.h>
@@ -16,6 +17,7 @@
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <AK/Vector.h>
+#include <LibGC/Weak.h>
 #include <LibWeb/Bindings/Node.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/DOM/FragmentSerializationMode.h>
@@ -41,15 +43,16 @@ enum class UserSelect : u8;
 
 }
 
-namespace Web::Layout {
+namespace Web::Layout::RustFFI {
 
-enum class LayoutUpdatePropagation : u8;
+struct FfiBoxMarks;
 
 }
 
 namespace Web::Bindings {
 
 struct GetRootNodeOptions;
+struct SetHTMLOptions;
 
 }
 
@@ -84,17 +87,19 @@ enum class RootNodeComposed {
     X(HTMLCanvasElementWidthOrHeightChange)           \
     X(HTMLImageElementReactToChangesInTheEnvironment) \
     X(HTMLImageElementUpdateTheImageData)             \
+    X(EmbeddedDocumentResized)                        \
     X(HTMLVideoElementNaturalDimensionsChanged)       \
     X(HTMLVideoElementSetVideoTrack)                  \
+    X(ImplicitAnchorChange)                           \
     X(KeyframeEffect)                                 \
-    X(LanguageChangeUnderCasingTextTransform)         \
     X(LayoutTreeUpdate)                               \
+    X(MathMLAttributeChange)                          \
+    X(FrameScrollingAttributeChange)                  \
     X(NavigableSetViewportSize)                       \
     X(SVGImageElementFetchTheDocument)                \
     X(SVGResourceElementAttributeChange)              \
     X(SVGViewBoxChange)                               \
-    X(StyleChange)                                    \
-    X(TableSpanAttributeChange)
+    X(StyleChange)
 
 enum class SetNeedsLayoutReason {
 #define ENUMERATE_SET_NEEDS_LAYOUT_REASON(e) e,
@@ -106,11 +111,12 @@ enum class SetNeedsLayoutReason {
 
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASONS(X) \
     X(CharacterDataReplaceData)                           \
-    X(ElementSetInnerHTML)                                \
     X(ElementSetShadowRoot)                               \
     X(DetailsElementOpenedOrClosed)                       \
     X(HTMLImageElementUpdateTheImageData)                 \
     X(HTMLInputElementSrcAttribute)                       \
+    X(HTMLInputElementTypeAttribute)                      \
+    X(HTMLEmbedElementRepresentationChanged)              \
     X(HTMLObjectElementUpdateLayoutAndChildObjects)       \
     X(KeyframeEffect)                                     \
     X(LanguageChangeUnderCasingTextTransform)             \
@@ -119,15 +125,18 @@ enum class SetNeedsLayoutReason {
     X(NodeInsertBefore)                                   \
     X(NodeInsertBeforeWithDisplayContents)                \
     X(NodeRemove)                                         \
-    X(NodeSetTextContent)                                 \
+    X(TableCellSpanAttribute)                             \
     X(None)                                               \
-    X(PseudoElementBoxEscapedRebuildRoot)                 \
-    X(ShadowRootSetInnerHTML)                             \
     X(SlotAssignmentChange)                               \
     X(StyleChange)                                        \
+    X(StyleRebuild)                                       \
     X(SVGResourceContentChange)                           \
     X(SVGResourceElementRemoved)                          \
-    X(TopLayerMembershipChange)
+    X(SVGResourceReferenceChange)                         \
+    X(SVGUseElementShadowTreeRebuild)                     \
+    X(TopLayerMembershipChange)                           \
+    X(WhitespaceTextBoxChange)                            \
+    X(WritingSuggestionChange)
 
 enum class SetNeedsLayoutTreeUpdateReason {
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASON(e) e,
@@ -163,32 +172,25 @@ public:
     bool is_comment() const { return type() == NodeType::COMMENT_NODE; }
     bool is_character_data() const { return first_is_one_of(type(), NodeType::TEXT_NODE, NodeType::COMMENT_NODE, NodeType::CDATA_SECTION_NODE, NodeType::PROCESSING_INSTRUCTION_NODE); }
     bool is_document_fragment() const { return type() == NodeType::DOCUMENT_FRAGMENT_NODE; }
-    bool is_parent_node() const { return is_element() || is_document() || is_document_fragment(); }
     bool is_slottable() const { return is_element() || is_text() || is_cdata_section(); }
     bool is_attribute() const { return type() == NodeType::ATTRIBUTE_NODE; }
     bool is_cdata_section() const { return type() == NodeType::CDATA_SECTION_NODE; }
-    virtual bool is_shadow_root() const { return false; }
+    bool is_shadow_root() const { return fast_is<ShadowRoot>(); }
 
-    virtual bool requires_svg_container() const { return false; }
-    virtual bool is_svg_container() const { return false; }
-    virtual bool is_svg_element() const { return false; }
-    virtual bool is_svg_graphics_element() const { return false; }
-    virtual bool is_svg_mask_element() const { return false; }
-    virtual bool is_svg_script_element() const { return false; }
-    virtual bool is_svg_style_element() const { return false; }
-    virtual bool is_svg_svg_element() const { return false; }
-    virtual bool is_svg_switch_element() const { return false; }
-    virtual bool is_svg_symbol_element() const { return false; }
-    virtual bool is_svg_use_element() const { return false; }
-    virtual bool is_svg_view_element() const { return false; }
-    virtual bool is_svg_a_element() const { return false; }
-    virtual bool is_svg_g_element() const { return false; }
-    virtual bool is_svg_foreign_object_element() const { return false; }
-    virtual bool is_svg_gradient_element() const { return false; }
-    virtual bool is_svg_pattern_element() const { return false; }
-    virtual bool is_svg_clip_path_element() const { return false; }
-    virtual bool is_svg_image_element() const { return false; }
-    virtual bool is_svg_text_content_element() const { return false; }
+    bool is_svg_element() const { return fast_is<SVG::SVGElement>(); }
+    bool is_svg_graphics_element() const { return fast_is<SVG::SVGGraphicsElement>(); }
+    bool is_svg_mask_element() const { return fast_is<SVG::SVGMaskElement>(); }
+    bool is_svg_script_element() const { return fast_is<SVG::SVGScriptElement>(); }
+    bool is_svg_style_element() const { return fast_is<SVG::SVGStyleElement>(); }
+    bool is_svg_svg_element() const { return fast_is<SVG::SVGSVGElement>(); }
+    bool is_svg_a_element() const { return fast_is<SVG::SVGAElement>(); }
+    bool is_svg_foreign_object_element() const { return fast_is<SVG::SVGForeignObjectElement>(); }
+    bool is_svg_gradient_element() const { return fast_is<SVG::SVGGradientElement>(); }
+    bool is_svg_pattern_element() const { return fast_is<SVG::SVGPatternElement>(); }
+    bool is_svg_clip_path_element() const { return fast_is<SVG::SVGClipPathElement>(); }
+    bool is_svg_geometry_element() const { return fast_is<SVG::SVGGeometryElement>(); }
+    bool is_svg_filter_element() const { return fast_is<SVG::SVGFilterElement>(); }
+    bool is_mathml_anchor_element() const { return fast_is<MathML::MathMLAnchorElement>(); }
 
     bool in_a_document_tree() const;
 
@@ -198,67 +200,46 @@ public:
     bool is_editable() const;
     bool is_editing_host() const;
     bool is_editable_or_editing_host() const { return is_editable() || is_editing_host(); }
+    // NB: A false answer settles is_editable_or_editing_host() without asking what kind of node this is.
+    bool may_be_editable_or_editing_host() const;
     GC::Ptr<Node> editing_host();
+
+    bool has_spelling_markers() const { return m_has_spelling_markers; }
+    void set_has_spelling_markers(Badge<Editing::SpellingMarkers>, bool value) { m_has_spelling_markers = value; }
     CSS::UserSelect user_select_used_value() const;
 
     bool in_editable_subtree() const { return m_in_editable_subtree; }
     bool recompute_editable_subtree_flag();
     void recompute_editable_subtree_flags_and_repaint();
+    // Brings the editing-host and empty-text stamps of the boxes in the subtree to the nodes' editability.
 
-    virtual bool is_dom_node() const final { return true; }
-    virtual bool is_html_element() const { return false; }
-    virtual bool is_html_html_element() const { return false; }
-    virtual bool is_html_anchor_element() const { return false; }
-    virtual bool is_html_area_element() const { return false; }
-    virtual bool is_html_base_element() const { return false; }
-    virtual bool is_html_body_element() const { return false; }
-    virtual bool is_html_head_element() const { return false; }
-    virtual bool is_html_heading_element() const { return false; }
-    virtual bool is_html_input_element() const { return false; }
-    virtual bool is_html_link_element() const { return false; }
-    virtual bool is_html_media_element() const { return false; }
-    virtual bool is_html_optgroup_element() const { return false; }
-    virtual bool is_html_option_element() const { return false; }
-    virtual bool is_html_progress_element() const { return false; }
-    virtual bool is_html_script_element() const { return false; }
-    virtual bool is_html_select_element() const { return false; }
-    virtual bool is_html_style_element() const { return false; }
-    virtual bool is_html_template_element() const { return false; }
-    virtual bool is_html_table_element() const { return false; }
-    virtual bool is_html_table_section_element() const { return false; }
-    virtual bool is_html_table_row_element() const { return false; }
-    virtual bool is_html_table_cell_element() const { return false; }
-    virtual bool is_html_table_col_element() const { return false; }
-    virtual bool is_html_title_element() const { return false; }
-    virtual bool is_html_br_element() const { return false; }
-    virtual bool is_html_button_element() const { return false; }
-    virtual bool is_html_details_element() const { return false; }
-    virtual bool is_html_dialog_element() const { return false; }
-    virtual bool is_html_slot_element() const { return false; }
-    virtual bool is_html_embed_element() const { return false; }
-    virtual bool is_html_object_element() const { return false; }
-    virtual bool is_html_canvas_element() const { return false; }
-    virtual bool is_html_form_element() const { return false; }
-    virtual bool is_html_image_element() const { return false; }
-    virtual bool is_html_video_element() const { return false; }
-    virtual bool is_html_iframe_element() const { return false; }
-    virtual bool is_html_div_element() const { return false; }
-    virtual bool is_html_span_element() const { return false; }
-    virtual bool is_html_textarea_element() const { return false; }
-    virtual bool is_html_frameset_element() const { return false; }
-    virtual bool is_html_fieldset_element() const { return false; }
-    virtual bool is_html_data_list_element() const { return false; }
-    virtual bool is_html_meter_element() const { return false; }
-    virtual bool is_html_li_element() const { return false; }
-    virtual bool is_html_menu_element() const { return false; }
-    virtual bool is_html_olist_element() const { return false; }
-    virtual bool is_html_ulist_element() const { return false; }
+    bool is_html_element() const { return fast_is<HTML::HTMLElement>(); }
+    bool is_html_html_element() const { return fast_is<HTML::HTMLHtmlElement>(); }
+    bool is_html_anchor_element() const { return fast_is<HTML::HTMLAnchorElement>(); }
+    bool is_html_area_element() const { return fast_is<HTML::HTMLAreaElement>(); }
+    bool is_html_body_element() const { return fast_is<HTML::HTMLBodyElement>(); }
+    bool is_html_input_element() const { return fast_is<HTML::HTMLInputElement>(); }
+    bool is_html_link_element() const { return fast_is<HTML::HTMLLinkElement>(); }
+    bool is_html_media_element() const { return fast_is<HTML::HTMLMediaElement>(); }
+    bool is_html_script_element() const { return fast_is<HTML::HTMLScriptElement>(); }
+    bool is_html_style_element() const { return fast_is<HTML::HTMLStyleElement>(); }
+    bool is_html_template_element() const { return fast_is<HTML::HTMLTemplateElement>(); }
+    bool is_html_details_element() const { return fast_is<HTML::HTMLDetailsElement>(); }
+    bool is_html_slot_element() const { return fast_is<HTML::HTMLSlotElement>(); }
+    bool is_html_iframe_element() const { return fast_is<HTML::HTMLIFrameElement>(); }
+    bool is_html_textarea_element() const { return fast_is<HTML::HTMLTextAreaElement>(); }
+    bool is_html_frameset_element() const { return fast_is<HTML::HTMLFrameSetElement>(); }
+    bool is_html_li_element() const { return fast_is<HTML::HTMLLIElement>(); }
+    bool is_html_menu_element() const { return fast_is<HTML::HTMLMenuElement>(); }
+    bool is_html_olist_element() const { return fast_is<HTML::HTMLOListElement>(); }
+    bool is_html_ulist_element() const { return fast_is<HTML::HTMLUListElement>(); }
     ALWAYS_INLINE bool is_html_ol_ul_menu_element() const
     {
         return is_html_olist_element() || is_html_ulist_element() || is_html_menu_element();
     }
-    virtual bool is_navigable_container() const { return false; }
-    virtual bool is_lazy_loading() const { return false; }
+    bool is_navigable_container() const { return fast_is<HTML::NavigableContainer>(); }
+    // NB: HTML::LazyLoadingElement asserts that these are its only classes.
+    bool is_lazy_loading() const { return fast_is<HTML::HTMLImageElement>() || fast_is<HTML::HTMLIFrameElement>(); }
 
     WebIDL::ExceptionOr<GC::Ref<Node>> pre_insert(GC::Ref<Node>, GC::Ptr<Node>);
     WebIDL::ExceptionOr<GC::Ref<Node>> pre_remove(GC::Ref<Node>);
@@ -269,6 +250,13 @@ public:
     void insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_observers = false);
     void parser_insert_before(GC::Ref<Node> node, GC::Ptr<Node> child);
     void parser_append_child(GC::Ref<Node> node) { parser_insert_before(node, nullptr); }
+    // Links a node the parser has just created into a new subtree that is not yet in any tree. The caller must
+    // insert the subtree's root, which runs the insertion steps for every node of the subtree.
+    void parser_append_child_without_insertion_steps(GC::Ref<Node> node)
+    {
+        VERIFY(!is_connected() && &node->document() == &document());
+        append_child_impl(node);
+    }
     void remove(bool suppress_observers = false);
     void remove_all_children(bool suppress_observers = false);
 
@@ -333,7 +321,6 @@ public:
 
     HTML::HTMLHyperlinkElementUtils const* enclosing_link_element() const;
     HTML::HTMLElement const* enclosing_html_element() const;
-    HTML::HTMLElement const* enclosing_html_element_with_attribute(Utf16FlyString const&) const;
 
     Utf16String child_text_content() const;
 
@@ -350,7 +337,22 @@ public:
 
     bool is_connected() const { return m_is_connected; }
     void set_is_connected(bool is_connected) { m_is_connected = is_connected; }
+
+    // The generation of this node's child list in which its element children's child indices hold. A new one begins
+    // whenever an element child moves relative to the element children after it.
+    u32 child_index_generation() const { return m_child_index_generation; }
     bool is_tracked_by_style_engine() const;
+
+    // Whether this subtree waits to take its place in the style engine's tree, and whether a shadow-including
+    // descendant's subtree does. See CSS::take_in_pending_style_arrivals().
+    bool style_arrival_pending() const { return m_style_arrival_pending; }
+    void set_style_arrival_pending(bool value) { m_style_arrival_pending = value; }
+    bool descendant_style_arrival_pending() const { return m_descendant_style_arrival_pending; }
+    void set_descendant_style_arrival_pending(bool value) { m_descendant_style_arrival_pending = value; }
+    // Whether this element arrived alone in a display:none subtree, its children waiting to arrive until something
+    // could observe them. See CSS::take_in_pending_style_arrivals().
+    bool child_style_arrivals_wait() const { return m_child_style_arrivals_wait; }
+    void set_child_style_arrivals_wait(bool value) { m_child_style_arrivals_wait = value; }
 
     // Mirrors the slottable's assigned slot; see SlottableMixin::set_assigned_slot().
     bool has_assigned_slot() const { return m_has_assigned_slot; }
@@ -365,17 +367,20 @@ public:
     Node* parent_node() { return parent(); }
     Node const* parent_node() const { return parent(); }
 
-    static constexpr size_t parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
-    static constexpr size_t first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
-    static constexpr size_t last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
-    static constexpr size_t previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
-    static constexpr size_t next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
+    static constexpr GC::MemberOffset first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
+    static constexpr GC::MemberOffset last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
+    static constexpr GC::MemberOffset previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
 
     GC::Ptr<Element> parent_element();
     GC::Ptr<Element const> parent_element() const;
 
     MUST_UPCALL virtual void inserted();
     virtual void post_connection();
+    // Whether this node overrides post_connection(). Every override of post_connection() must also override this to
+    // return true, since insertions skip the post-connection steps when no inserted node has them.
+    virtual bool has_post_connection_steps() const { return false; }
     enum class IsSubtreeRoot : u8 {
         No,
         Yes,
@@ -397,6 +402,8 @@ public:
         Type type {};
         GC::Ref<Node> node;
         AffectsElements affects_elements { AffectsElements::No };
+        // For a removal, the sibling that was before the removed node, if any.
+        GC::Ptr<Node> old_previous_sibling {};
     };
     // FIXME: It would be good if we could always provide this metadata for use in optimizations.
     virtual void children_changed(ChildrenChangedMetadata const&) { }
@@ -404,47 +411,44 @@ public:
     virtual void adopted_from(Document&) { }
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const { return {}; }
 
-    Layout::Node const* layout_node() const;
-    Layout::Node* layout_node();
+    Layout::Node const* layout_node(Layout::BegunRead const& read) const;
+    Layout::Node* layout_node(Layout::BegunRead const& read);
 
-    Layout::Node const* unsafe_layout_node() const { return m_layout_node.ptr(); }
-    Layout::Node* unsafe_layout_node() { return m_layout_node.ptr(); }
+    Layout::Node const* unsafe_layout_node(Layout::BegunRead const& read) const;
+    Layout::Node* unsafe_layout_node(Layout::BegunRead const& read) { return const_cast<Layout::Node*>(static_cast<Node const*>(this)->unsafe_layout_node(read)); }
     // Whether the last layout tree build gave this node a box, and whether layout committed geometry for it. Code
-    // that only needs to know whether there is a box should ask these instead of reaching for the box.
-    [[nodiscard]] bool has_layout_box() const { return m_layout_node; }
-    [[nodiscard]] bool is_rendered() const;
-    Element const* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor) const;
-    Element* first_letter_owner_for_layout_subtree_from(Node const& inclusive_ancestor)
+    // that only needs to know whether there is a box should ask these instead of reaching for the box. The layout
+    // node arena writes both as it changes the boxes they describe, so asking reads the node, not the arena.
+    [[nodiscard]] bool has_layout_box() const { return m_has_layout_box; }
+    [[nodiscard]] bool may_have_layout_box() const;
+    [[nodiscard]] bool is_rendered() const { return m_has_committed_box; }
+    void set_box_presence(Badge<Layout::NodeArena>, bool has_layout_box, bool has_committed_box)
     {
-        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(inclusive_ancestor));
+        m_has_layout_box = has_layout_box;
+        m_has_committed_box = has_committed_box;
     }
-
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
+    // Queues `marks` for the node's box, which the render state finds as it applies them: the marks may be made beside a
+    // frame in flight, which holds the boxes.
+    void mark_box(Layout::RustFFI::FfiBoxMarks);
+    // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
+    void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
-    void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
 
-    // Whether the node's layout subtree can leave the parent's box without restructuring the
-    // anonymous boxes around it, so the parent's subtree keeps its layout tree.
-    static bool can_detach_layout_subtree_in_place(Node const& node, Node const& parent, bool box_is_block_level);
-    // Whether a list item's box appearing or disappearing changes the list-item counter value of
-    // some item that stays in the list.
-    static bool list_item_box_change_renumbers_list(Element const& list_item);
-
-    void clear_layout_node(Badge<Document>);
-    void set_layout_node(Badge<Layout::Node>, Layout::Node&);
-    void rebind_layout_node(Badge<Layout::Node>, Layout::Node&);
-    void detach_layout_node(Badge<Layout::LayoutTreeBuilderAccess>);
+    // Does what a removal does to the layout nodes of this subtree that stay until the parent's layout is rebuilt,
+    // while the StyleNodeIDs they are found through are still current.
+    void detach_remaining_layout_nodes_for_removal();
 
     virtual bool is_child_allowed(Node const&) const { return true; }
 
-    [[nodiscard]] bool needs_layout_tree_update() const { return m_needs_layout_tree_update; }
+    // The layout tree update marks live in the layout arena, keyed by the node's identity in the style mirror. A node
+    // the style mirror has not named holds none.
+    [[nodiscard]] bool needs_layout_tree_update() const;
     void set_needs_layout_tree_update(bool, SetNeedsLayoutTreeUpdateReason);
+    // Which narrower rebuild a layout tree update mark made for `reason` permits.
+    static u8 layout_tree_update_reuse_reason(SetNeedsLayoutTreeUpdateReason);
 
-    [[nodiscard]] bool needs_pseudo_element_layout_tree_update() const { return m_layout_tree_update_reuse_reasons & PseudoElementChange; }
-    [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return m_layout_tree_update_reuse_reasons & ChildListInsertion; }
-
-    [[nodiscard]] bool child_needs_layout_tree_update() const { return m_child_needs_layout_tree_update; }
-    void set_child_needs_layout_tree_update(bool b) { m_child_needs_layout_tree_update = b; }
+    [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return layout_tree_update_reuse_reasons() & ChildListInsertion; }
 
     // The number of animations associated with this node's shadow-including inclusive subtree. A
     // synchronous read of layout geometry has to catch up the style of a throttled animation that
@@ -453,10 +457,6 @@ public:
     [[nodiscard]] u32 associated_animation_count_in_subtree() const { return m_associated_animation_count_in_subtree; }
     void change_associated_animation_count_in_subtree(i32 delta);
 
-    [[nodiscard]] u32 children_explicitly_inherited_non_inherited_style_groups() const { return m_children_explicitly_inherited_non_inherited_style_groups; }
-    void add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups) { m_children_explicitly_inherited_non_inherited_style_groups |= style_groups; }
-
-    void record_style_environment_change();
     CSS::StyleScope& style_scope();
     CSS::StyleScope const& style_scope() const { return const_cast<Node*>(this)->style_scope(); }
 
@@ -464,7 +464,17 @@ public:
 
     virtual EventTarget* get_parent(Event const&) override;
 
+    // Whether the node is of class T, or of a class that descends from it, which its class id tells. See
+    // DOM/NodeClassId.h.
     template<typename T>
+    requires(HasNodeClassId<T>)
+    bool fast_is() const
+    {
+        return node_class_id_is_a<T>(node_class_id());
+    }
+    // NB: A class of nodes that is no class of its own, such as a mixin, specializes this.
+    template<typename T>
+    requires(!HasNodeClassId<T>)
     bool fast_is() const = delete;
 
     template<typename T>
@@ -496,7 +506,11 @@ public:
 
     WebIDL::ExceptionOr<Utf16String> serialize_fragment(HTML::RequireWellFormed, FragmentSerializationMode = FragmentSerializationMode::Inner) const;
 
-    WebIDL::ExceptionOr<void> unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>>, Utf16View);
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-parsing-and-serialization
+    // NB: These are the NonDocumentTypeChildNode methods, which are exposed on Element and CharacterData objects.
+    WebIDL::ExceptionOr<void> before_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
+    WebIDL::ExceptionOr<void> after_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
+    WebIDL::ExceptionOr<void> replace_with_html(Utf16String const& html, Bindings::SetHTMLOptions const&);
 
     void replace_all(GC::Ptr<Node>);
     void replace_all(GC::RootVector<GC::Ref<Node>>);
@@ -578,8 +592,6 @@ public:
     bool is_inert() const;
 
     bool has_inclusive_ancestor_with_display_none_ignoring_animations() const;
-    bool has_inclusive_ancestor_with_event_listener(Utf16FlyString const& type) const;
-
     GC::Ptr<ShadowRoot> containing_shadow_root();
     GC::Ptr<ShadowRoot const> containing_shadow_root() const
     {
@@ -596,16 +608,25 @@ protected:
         virtual void visit_edges(Cell::Visitor&);
         virtual size_t external_memory_size() const;
 
-        mutable Optional<UniqueNodeID> unique_id;
         Optional<String> webdriver_node_id;
 
         // https://dom.spec.whatwg.org/#registered-observer-list
         // "Nodes have a strong reference to registered observers in their registered observer list." https://dom.spec.whatwg.org/#garbage-collection
         OwnPtr<Vector<GC::Ref<RegisteredObserver>>> registered_observer_list;
 
-        GC::Ptr<NodeList> child_nodes;
-        GC::Ptr<HTMLCollection> children;
+        GC::Member<NodeList> child_nodes;
+        GC::Member<HTMLCollection> children;
         OwnPtr<HTMLCollectionCacheRegistration::List> html_collections_with_valid_caches;
+
+        // The collections getElementsByTagName() returned, which it may return again for the same argument while the
+        // type of the root's node document stays the same, so that type is kept with each.
+        struct CollectionByTagName {
+            GC::Weak<HTMLCollection> collection;
+            bool for_html_document { false };
+        };
+        OwnPtr<HashMap<Utf16FlyString, CollectionByTagName>> collections_by_tag_name;
+        // The size the map grows to before the entries of collected collections are swept from it.
+        size_t collections_by_tag_name_sweep_size { 0 };
     };
 
     void register_html_collection_with_valid_cache(HTMLCollection&);
@@ -625,46 +646,51 @@ protected:
     virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
-    GC::Ptr<Document> m_document;
-    GC::Ptr<Node> m_root;
-    WeakPtr<Layout::Node> m_layout_node;
+    GC::Member<Document> m_document;
+    GC::Member<Node> m_root;
     NodeType m_type { NodeType::INVALID };
-    bool m_needs_layout_tree_update { false };
-    bool m_child_needs_layout_tree_update { false };
+    bool m_has_layout_box { false };
+    bool m_has_committed_box { false };
+    // Which narrower rebuilds the layout tree update marks collected so far still permit.
     enum LayoutTreeUpdateReuseReason : u8 {
         ChildListInsertion = 1,
         PseudoElementChange = 2,
+        // NB: Bits 4 and 8 are the marks themselves, and 32 and 64 notes of the mark.
+        ChildListRemoval = 16,
+        // The element's box may stay if a fresh build gives it a box of the same kind.
+        Restyle = 128,
     };
-    u8 m_layout_tree_update_reuse_reasons { 0 };
+    [[nodiscard]] u8 layout_tree_update_reuse_reasons() const;
 
-    u32 m_children_explicitly_inherited_non_inherited_style_groups { 0 };
     u32 m_associated_animation_count_in_subtree { 0 };
     bool m_in_editable_subtree { false };
     bool m_is_connected { false };
-    bool m_has_assigned_slot { false };
-    bool m_inside_blocking_wheel_event_handler { false };
+    // NB: These share a byte, which keeps every node from growing.
+    bool m_has_assigned_slot : 1 { false };
+    bool m_inside_blocking_wheel_event_handler : 1 { false };
+    bool m_style_arrival_pending : 1 { false };
+    bool m_descendant_style_arrival_pending : 1 { false };
+    bool m_child_style_arrivals_wait : 1 { false };
+    bool m_has_spelling_markers : 1 { false };
+    u32 m_child_index_generation { 1 };
+    // The slot of the node directory that names the node by its unique id, or 0 before anything asked for the id.
+    mutable u32 m_node_directory_slot { 0 };
 
     void build_accessibility_tree(AccessibilityTreeNode& parent);
 
-    ErrorOr<Utf16String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    ErrorOr<Utf16String> name_or_description(Layout::BegunRead const& read, NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
+    // The first ID token of an aria-labelledby or aria-describedby value that names an element in the document.
+    static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 
 private:
-    enum class LayoutSubtreeRemoval {
-        DetachInPlace,
-        RebuildParent,
-    };
-    enum class AncestorsMayHaveFirstLetter {
-        No,
-        Yes,
-    };
-
     void run_node_iterator_pre_removing_steps();
     bool schedule_list_item_renumber_for_removal();
     void report_removal_to_style_engine(Node& parent);
-    void update_layout_tree_for_removal(Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
-    void assign_slottables_after_removal(Node& parent, Node& parent_root);
+    void update_layout_tree_for_removal(Node& parent);
+    GC::RootVector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
+    void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);
-    void add_transient_registered_observers_for_removal(Node& parent);
+    void add_transient_registered_observers(Node& parent);
     void queue_tree_mutation_record_for_removal(Node& parent, GC::Ptr<Node> old_previous_sibling, GC::Ptr<Node> old_next_sibling);
 
     void queue_tree_mutation_record(ReadonlySpan<GC::Ref<Node>> added_nodes, ReadonlySpan<GC::Ref<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
@@ -678,12 +704,42 @@ private:
     void insert_nodes_before(ReadonlySpan<GC::Ref<Node>>, GC::Ptr<Node> child, bool suppress_observers, GC::Ref<Node> metadata_node, ChildrenChangedMetadata::AffectsElements);
     void append_child_impl(GC::Ref<Node>);
     void remove_child_impl(GC::Ref<Node>);
+    void begin_child_index_generation();
     void set_root_for_subtree(Node&);
-    void clear_committed_layout_box();
-
-    static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 
     mutable OwnPtr<RareData> m_rare_data;
+};
+
+}
+
+namespace Web::DOM {
+
+// Whether DOM/NodeClasses.json lists T, and every class T derives from, under the class it derives from.
+template<typename T>
+constexpr bool node_class_is_listed_under_its_base()
+{
+    if constexpr (!HasNodeClassId<T>)
+        return false;
+    else if constexpr (IsSame<T, Node>)
+        return NodeClassTraits<T>::parent == NodeClassId::NotANode;
+    else
+        return NodeClassTraits<T>::parent == NodeClassTraits<typename T::Base>::id && node_class_is_listed_under_its_base<typename T::Base>();
+}
+
+}
+
+namespace GC {
+
+// Gives a node, as it is constructed, the id of its class (see DOM/NodeClassId.h).
+template<typename T>
+requires(IsBaseOf<Web::DOM::Node, T>)
+struct CellConstructionHook<T> {
+    static void did_construct(T& node)
+    {
+        static_assert(Web::DOM::HasNodeClassId<T>, "DOM/NodeClasses.json must list every class of nodes");
+        static_assert(Web::DOM::node_class_is_listed_under_its_base<T>(), "DOM/NodeClasses.json must list each class of nodes under the class it derives from");
+        static_cast<Web::Bindings::Wrappable&>(node).set_node_class_id(Web::DOM::NodeClassTraits<T>::id);
+    }
 };
 
 }

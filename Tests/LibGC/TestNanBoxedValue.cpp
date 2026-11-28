@@ -10,9 +10,12 @@
 #include <LibGC/Heap.h>
 #include <LibGC/HeapRegion.h>
 #include <LibGC/NanBoxedValue.h>
+#include <LibGC/Testing.h>
 #include <LibGC/Weak.h>
 #include <LibGC/WeakInlines.h>
 #include <LibTest/TestCase.h>
+
+namespace {
 
 class TestCell final : public GC::Cell {
     GC_CELL(TestCell, GC::Cell);
@@ -29,17 +32,13 @@ static GC::Heap& test_heap()
     return *heap;
 }
 
-static NEVER_INLINE void scrub_stack()
-{
-    u8 volatile filler[8 * KiB];
-    for (size_t i = 0; i < sizeof(filler); ++i)
-        filler[i] = 0;
-}
-
 TEST_SETUP
 {
     GC::Heap::set_default_heap_for_testing(test_heap());
 }
+
+// Every payload bit above the heap region offset.
+static constexpr u64 JUNK_PAYLOAD_BITS = 0x0000'ffff'ffff'ffffULL & ~static_cast<u64>(GC::HEAP_REGION_OFFSET_MASK);
 
 class TestNanBox final : public GC::NanBoxedValue {
 public:
@@ -69,7 +68,7 @@ TEST_CASE(cell_payload_masks_junk_high_bits)
 {
     auto cell = test_heap().allocate<TestCell>();
     auto offset = GC::NanBoxedValue::encode_pointer_bits(cell.ptr());
-    auto value = TestNanBox::from_payload(offset | 0x0000'fc00'0000'0000ULL);
+    auto value = TestNanBox::from_payload(offset | JUNK_PAYLOAD_BITS);
     auto decoded = value.extract_pointer<GC::Cell>();
     auto base = js_heap_region_base;
 
@@ -89,16 +88,18 @@ TEST_CASE(conservative_scanner_decodes_caged_value)
         weak_cell = cell.ptr();
         boxed_value = GC::SHIFTED_IS_CELL_PATTERN
             | GC::NanBoxedValue::encode_pointer_bits(cell.ptr())
-            | 0x0000'fc00'0000'0000ULL;
+            | JUNK_PAYLOAD_BITS;
         EXPECT(boxed_value != 0);
     }
 
-    scrub_stack();
+    GC::scrub_stack_for_testing();
     heap.collect_garbage();
     EXPECT(weak_cell);
 
     boxed_value = 0;
-    scrub_stack();
+    GC::scrub_stack_for_testing();
     heap.collect_garbage(GC::Heap::CollectionType::CollectEverything);
     EXPECT(!weak_cell);
+}
+
 }

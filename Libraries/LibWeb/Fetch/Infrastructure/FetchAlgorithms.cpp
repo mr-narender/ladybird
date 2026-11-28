@@ -7,6 +7,8 @@
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+#include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 
 namespace Web::Fetch::Infrastructure {
 
@@ -14,39 +16,37 @@ GC_DEFINE_ALLOCATOR(FetchAlgorithms);
 
 GC::Ref<FetchAlgorithms> FetchAlgorithms::create(Input input)
 {
-    auto process_request_body_chunk_length = GC::create_function(GC::Heap::the(), move(input.process_request_body_chunk_length));
-    auto process_request_end_of_body = GC::create_function(GC::Heap::the(), move(input.process_request_end_of_body));
-    auto process_early_hints_response = GC::create_function(GC::Heap::the(), move(input.process_early_hints_response));
-    auto process_response = GC::create_function(GC::Heap::the(), move(input.process_response));
-    auto process_response_end_of_body = GC::create_function(GC::Heap::the(), move(input.process_response_end_of_body));
-    auto process_response_consume_body = GC::create_function(GC::Heap::the(), move(input.process_response_consume_body));
-    return GC::Heap::the().allocate<FetchAlgorithms>(
-        process_request_body_chunk_length,
-        process_request_end_of_body,
-        process_early_hints_response,
-        process_response,
-        process_response_end_of_body,
-        process_response_consume_body);
-}
+    auto has_consuming_intent = input.body_intent == Engine::BodyIntent::ConsumeForCallback || input.body_intent == Engine::BodyIntent::SyncAccumulate;
+    VERIFY(has_consuming_intent || !input.process_response_consume_body);
 
-GC::Ref<FetchAlgorithms> FetchAlgorithms::create(JS::VM&, Input input)
-{
-    return create(move(input));
+    return GC::Heap::the().allocate<FetchAlgorithms>(
+        input.body_intent,
+        input.process_request_body_chunk_length,
+        input.process_request_end_of_body,
+        input.process_early_hints_response,
+        input.process_response,
+        input.process_response_end_of_body,
+        input.process_response_consume_body,
+        move(input.request_body_reader));
 }
 
 FetchAlgorithms::FetchAlgorithms(
+    Engine::BodyIntent body_intent,
     ProcessRequestBodyChunkLengthHeapFunction process_request_body_chunk_length,
     ProcessRequestEndOfBodyHeapFunction process_request_end_of_body,
     ProcessEarlyHintsResponseHeapFunction process_early_hints_response,
     ProcessResponseHeapFunction process_response,
     ProcessResponseEndOfBodyHeapFunction process_response_end_of_body,
-    ProcessResponseConsumeBodyHeapFunction process_response_consume_body)
-    : m_process_request_body_chunk_length(process_request_body_chunk_length)
+    ProcessResponseConsumeBodyHeapFunction process_response_consume_body,
+    Optional<RequestBodyReader> request_body_reader)
+    : m_body_intent(body_intent)
+    , m_process_request_body_chunk_length(process_request_body_chunk_length)
     , m_process_request_end_of_body(process_request_end_of_body)
     , m_process_early_hints_response(process_early_hints_response)
     , m_process_response(process_response)
     , m_process_response_end_of_body(process_response_end_of_body)
     , m_process_response_consume_body(process_response_consume_body)
+    , m_request_body_reader(move(request_body_reader))
 {
 }
 
@@ -59,6 +59,10 @@ void FetchAlgorithms::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_process_response);
     visitor.visit(m_process_response_end_of_body);
     visitor.visit(m_process_response_consume_body);
+    if (m_request_body_reader.has_value()) {
+        visitor.visit(m_request_body_reader->body);
+        visitor.visit(m_request_body_reader->reader);
+    }
 }
 
 }

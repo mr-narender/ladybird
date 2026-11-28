@@ -12,14 +12,15 @@ find_package(mimalloc CONFIG REQUIRED)
 find_package(Backtrace)
 find_package(cpptrace CONFIG)
 find_package(FastFloat CONFIG REQUIRED)
-find_package(fmt CONFIG REQUIRED)
+find_path(LLVM_LIBC_INCLUDE_DIR NAMES llvm-libc/shared/math.h REQUIRED)
 find_package(simdutf REQUIRED)
+find_package(zmij CONFIG REQUIRED)
 
 # LibGfx dependencies
 find_package(harfbuzz REQUIRED)
 find_package(JPEG REQUIRED)
 find_package(LIBAVIF REQUIRED)
-find_package(PNG REQUIRED)
+find_package(PDFJS QUIET)
 find_package(WebP REQUIRED)
 find_path(WUFFS_INCLUDE_DIR NAMES wuffs/wuffs-v0.3.c REQUIRED)
 
@@ -28,12 +29,51 @@ pkg_check_modules(WOFF2 REQUIRED IMPORTED_TARGET libwoff2dec)
 # TODO: Figure out if we can do this the same way on all platforms
 if (NOT ANDROID)
     pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec-ladybird)
-    pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat-ladybird)
     pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil-ladybird)
     pkg_check_modules(LIBSWRESAMPLE REQUIRED IMPORTED_TARGET libswresample-ladybird)
 else()
     find_package(FFMPEG REQUIRED)
 endif()
+
+# LibMediaCodecs loads these at runtime on Linux, rather than linking them, and the install rules ship them. CMake 3.25.0
+# also sets LINUX for Android, which links FFmpeg.
+if (LINUX AND NOT ANDROID)
+    foreach (library IN ITEMS AVCODEC LIBSWRESAMPLE)
+        # pkg-config leaves out the directory of a library in a default one, so the path it was resolved to is used.
+        set(LADYBIRD_BUNDLED_${library}_LIBRARY "${${library}_LINK_LIBRARIES}")
+        list(FILTER LADYBIRD_BUNDLED_${library}_LIBRARY INCLUDE REGEX "/lib${${library}_LIBRARIES}\\.so$")
+        if (NOT LADYBIRD_BUNDLED_${library}_LIBRARY)
+            message(FATAL_ERROR "The bundled lib${${library}_LIBRARIES} is not a shared library")
+        endif()
+        file(REAL_PATH "${LADYBIRD_BUNDLED_${library}_LIBRARY}" library_file)
+        # FFmpeg names each library's soname after its major version, which the file's name starts with.
+        cmake_path(GET library_file FILENAME library_file_name)
+        if (NOT library_file_name MATCHES "^(.+\\.so\\.[0-9]+)")
+            message(FATAL_ERROR "Cannot tell the soname of the bundled ${library_file_name}")
+        endif()
+        set(LADYBIRD_BUNDLED_${library}_SONAME "${CMAKE_MATCH_1}")
+        add_library(BundledFFmpeg::${library} SHARED IMPORTED)
+        set_target_properties(BundledFFmpeg::${library} PROPERTIES IMPORTED_LOCATION "${library_file}")
+
+        # Without vcpkg, installs do not carry the bundled FFmpeg, so binaries look for it where it was found, as they do
+        # for the libraries they link.
+        if ("${VCPKG_INSTALLED_DIR}" STREQUAL "")
+            cmake_path(GET LADYBIRD_BUNDLED_${library}_LIBRARY PARENT_PATH library_directory)
+            if (NOT library_directory IN_LIST CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES AND NOT library_directory IN_LIST CMAKE_INSTALL_RPATH)
+                list(APPEND CMAKE_INSTALL_RPATH "${library_directory}")
+            endif()
+        endif()
+    endforeach()
+endif()
+
+# Compiles a target against the bundled FFmpeg's headers without linking it, for code that calls it through the
+# functions LibMediaCodecs loads.
+function(ladybird_use_bundled_ffmpeg_headers target)
+    foreach (library IN ITEMS AVCODEC AVUTIL LIBSWRESAMPLE)
+        target_include_directories(${target} SYSTEM PRIVATE $<TARGET_PROPERTY:PkgConfig::${library},INTERFACE_INCLUDE_DIRECTORIES>)
+        target_compile_options(${target} PRIVATE $<TARGET_PROPERTY:PkgConfig::${library},INTERFACE_COMPILE_OPTIONS>)
+    endforeach()
+endfunction()
 
 if (NOT APPLE AND NOT ANDROID AND NOT WIN32)
     find_package(Fontconfig REQUIRED)
@@ -68,7 +108,6 @@ endif()
 
 find_package(CURL REQUIRED)
 find_package(ICU 78.3 EXACT REQUIRED COMPONENTS data i18n uc)
-find_package(LibXml2 REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(SDL3 CONFIG REQUIRED)
 find_package(simdjson CONFIG REQUIRED)
@@ -76,16 +115,7 @@ find_package(SQLite3 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
-find_package(unofficial-brotli CONFIG)
-if(unofficial-brotli_FOUND)
-    set(BROTLI_TARGETS unofficial::brotli::brotlienc unofficial::brotli::brotlidec)
-else()
-    pkg_check_modules(BROTLI REQUIRED IMPORTED_TARGET libbrotlienc libbrotlidec libbrotlicommon)
-    set(BROTLI_TARGETS PkgConfig::BROTLI)
-endif()
-
 pkg_check_modules(LIBPSL REQUIRED IMPORTED_TARGET libpsl)
-pkg_check_modules(libtommath REQUIRED IMPORTED_TARGET libtommath)
 
 find_package(unofficial-angle CONFIG)
 if(unofficial-angle_FOUND)
@@ -152,4 +182,43 @@ if (WIN32)
     endif()
 else()
     set(HAS_DIRECTX OFF CACHE BOOL "" FORCE)
+endif()
+
+if (ENABLE_GUI_TARGETS AND NOT ANDROID)
+    set(LADYBIRD_QT_COMPONENTS Core Gui Widgets)
+    if (NOT APPLE)
+        list(APPEND LADYBIRD_QT_COMPONENTS Positioning)
+    endif()
+
+    if (APPLE OR HAS_DIRECTX)
+        # The native presentation paths use platform GPU buffer handles directly instead of copying frames through CPU
+        # memory.
+        list(APPEND LADYBIRD_QT_COMPONENTS GuiPrivate)
+        set(QT_NO_PRIVATE_MODULE_WARNING ON)
+    endif()
+
+    if (LINUX AND "qt" IN_LIST VCPKG_MANIFEST_FEATURES)
+        set(vcpkg_qt_package_dir "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share")
+        set(vcpkg_qt_dir "${vcpkg_qt_package_dir}/Qt6")
+
+        # Cached package directories take priority over the search paths, including for Qt modules.
+        get_cmake_property(cached_qt_dirs CACHE_VARIABLES)
+        list(FILTER cached_qt_dirs INCLUDE REGEX "^Qt6.*_DIR$")
+        foreach (cached_qt_dir IN LISTS cached_qt_dirs)
+            cmake_path(IS_PREFIX vcpkg_qt_package_dir "$CACHE{${cached_qt_dir}}" NORMALIZE is_vcpkg_qt_dir)
+            if (NOT is_vcpkg_qt_dir)
+                unset("${cached_qt_dir}" CACHE)
+            endif()
+        endforeach()
+
+        list(APPEND LADYBIRD_QT_COMPONENTS Svg)
+        find_package(Qt6 6.10 REQUIRED COMPONENTS ${LADYBIRD_QT_COMPONENTS} PATHS "${vcpkg_qt_dir}" NO_DEFAULT_PATH)
+
+        get_target_property(qt_core_type Qt6::Core TYPE)
+        if (NOT qt_core_type STREQUAL "SHARED_LIBRARY" OR NOT Qt6_DIR STREQUAL vcpkg_qt_dir)
+            message(FATAL_ERROR "The qt feature requires shared Qt from vcpkg.")
+        endif()
+    else()
+        find_package(Qt6 6.10 REQUIRED COMPONENTS ${LADYBIRD_QT_COMPONENTS})
+    endif()
 endif()

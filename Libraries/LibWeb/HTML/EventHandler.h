@@ -27,10 +27,11 @@ public:
     // NOTE: This does not contain Empty as part of the optimization of not allocating all event handler attributes up front.
     // FIXME: The string should actually be an "internal raw uncompiled handler" struct. This struct is just the uncompiled source code plus a source location for reporting parse errors.
     //        https://html.spec.whatwg.org/multipage/webappapis.html#internal-raw-uncompiled-handler
-    Variant<Utf16String, GC::Ptr<WebIDL::CallbackType>> value;
+    // NB: This comes first and has no unique address, so that the listener fits in its tail padding.
+    NO_UNIQUE_ADDRESS Variant<Utf16String, GC::Ptr<WebIDL::CallbackType>> value;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-listener
-    GC::Ptr<DOM::DOMEventListener> listener;
+    GC::Member<DOM::DOMEventListener> listener;
 
 private:
     virtual void visit_edges(Cell::Visitor&) override;

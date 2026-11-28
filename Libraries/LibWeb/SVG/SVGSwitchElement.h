@@ -18,19 +18,10 @@ class SVGSwitchElement final : public SVGGraphicsElement {
 public:
     virtual ~SVGSwitchElement() override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
 private:
     SVGSwitchElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual bool is_svg_switch_element() const override { return true; }
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<SVG::SVGSwitchElement>() const { return is_svg_switch_element(); }
 
 }

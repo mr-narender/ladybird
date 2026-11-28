@@ -51,36 +51,33 @@ static StringView navigation_scroll_behavior_to_string(NavigationScrollBehavior 
 
 GC::Ref<NavigateEvent> NavigateEvent::create(Window& relevant_window, FlyString const& event_name, NavigateEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
 {
-    auto event = GC::Heap::the().allocate<NavigateEvent>(relevant_window, event_name, event_init, time_stamp);
-    event->set_is_trusted(true);
-    return event;
+    return GC::Heap::the().allocate<NavigateEvent>(relevant_window, event_name, event_init, time_stamp);
 }
 
 GC::Ref<NavigateEvent> NavigateEvent::create(Window& relevant_window, Utf16FlyString const& event_name, NavigateEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
 {
-    auto event = GC::Heap::the().allocate<NavigateEvent>(relevant_window, event_name, event_init, time_stamp);
-    event->set_is_trusted(true);
-    return event;
+    return GC::Heap::the().allocate<NavigateEvent>(relevant_window, event_name, event_init, time_stamp);
 }
 
 GC::Ref<NavigateEvent> NavigateEvent::create(JS::Realm& realm, Utf16String const& event_name, Bindings::NavigateEventInit const& event_init)
 {
     auto& window = HTML::relevant_window(realm.global_object());
-    return create(window, Utf16FlyString::from_utf16(event_name.utf16_view()), {
-                                                                                   { .bubbles = event_init.bubbles, .cancelable = event_init.cancelable, .composed = event_init.composed },
-                                                                                   event_init.navigation_type,
-                                                                                   event_init.destination,
-                                                                                   event_init.can_intercept,
-                                                                                   event_init.user_initiated,
-                                                                                   event_init.hash_change,
-                                                                                   event_init.signal,
-                                                                                   event_init.form_data,
-                                                                                   event_init.download_request,
-                                                                                   event_init.info,
-                                                                                   event_init.has_ua_visual_transition,
-                                                                                   event_init.source_element,
-                                                                               },
+    auto event = create(window, Utf16FlyString::from_utf16(event_name.utf16_view()), {
+                                                                                         { .bubbles = event_init.bubbles, .cancelable = event_init.cancelable, .composed = event_init.composed },
+                                                                                         event_init.navigation_type,
+                                                                                         event_init.destination,
+                                                                                         event_init.can_intercept,
+                                                                                         event_init.user_initiated,
+                                                                                         event_init.hash_change,
+                                                                                         event_init.signal,
+                                                                                         event_init.form_data,
+                                                                                         event_init.download_request,
+                                                                                         event_init.info,
+                                                                                         event_init.has_ua_visual_transition,
+                                                                                         event_init.source_element,
+                                                                                     },
         HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window)));
+    return event;
 }
 
 NavigateEvent::NavigateEvent(Window& relevant_window, FlyString const& event_name, NavigateEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
@@ -122,6 +119,7 @@ NavigateEvent::~NavigateEvent() = default;
 void NavigateEvent::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
+    visitor.visit(m_navigation_precommit_handler_list);
     visitor.visit(m_navigation_handler_list);
     visitor.visit(m_abort_controller);
     visitor.visit(m_destination);
@@ -130,6 +128,11 @@ void NavigateEvent::visit_edges(GC::Cell::Visitor& visitor)
     visitor.visit(m_info);
     visitor.visit(m_source_element);
     visitor.visit(m_relevant_window);
+}
+
+GC::Ptr<Bindings::Wrappable> NavigateEvent::relevant_global_impl() const
+{
+    return m_relevant_window;
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-navigateevent-intercept
@@ -149,17 +152,27 @@ WebIDL::ExceptionOr<void> NavigateEvent::intercept(JS::Realm& realm, NavigationI
     if (!this->dispatched())
         return WebIDL::InvalidStateError::create("NavigationEvent is not dispatched yet"_utf16);
 
-    // 4. Assert: this's interception state is either "none" or "intercepted".
+    // 4. If options["precommitHandler"] exists:
+    if (options.precommit_handler) {
+        // 1. If this's cancelable attribute is initialized to false, then throw an "InvalidStateError" DOMException.
+        if (!cancelable())
+            return WebIDL::InvalidStateError::create("Cannot use a precommit handler with a NavigateEvent that is not cancelable"_utf16);
+
+        // 2. Append options["precommitHandler"] to this's navigation precommit handler list.
+        TRY_OR_THROW_OOM(vm, m_navigation_precommit_handler_list.try_append(*options.precommit_handler));
+    }
+
+    // 5. Assert: this's interception state is either "none" or "intercepted".
     VERIFY(m_interception_state == InterceptionState::None || m_interception_state == InterceptionState::Intercepted);
 
-    // 5. Set this's interception state to "intercepted".
+    // 6. Set this's interception state to "intercepted".
     m_interception_state = InterceptionState::Intercepted;
 
-    // 6. If options["handler"] exists, then append it to this's navigation handler list.
+    // 7. If options["handler"] exists, then append it to this's navigation handler list.
     if (options.handler)
         TRY_OR_THROW_OOM(vm, m_navigation_handler_list.try_append(*options.handler));
 
-    // 7. If options["focusReset"] exists, then:
+    // 8. If options["focusReset"] exists, then:
     if (options.focus_reset.has_value()) {
         auto focus_reset = *options.focus_reset;
 
@@ -177,7 +190,7 @@ WebIDL::ExceptionOr<void> NavigateEvent::intercept(JS::Realm& realm, NavigationI
         m_focus_reset_behavior = focus_reset;
     }
 
-    // 8. If options["scroll"] exists, then:
+    // 9. If options["scroll"] exists, then:
     if (options.scroll.has_value()) {
         auto scroll = *options.scroll;
 
@@ -246,10 +259,13 @@ void NavigateEvent::process_scroll_behavior()
     // 2. Set event's interception state to "scrolled".
     m_interception_state = InterceptionState::Scrolled;
 
-    // FIXME: 3. If event's navigationType was initialized to "traverse" or "reload", then restore scroll position data
-    //           given event's relevant global object's navigable's active session history entry.
-    if (m_navigation_type == NavigationType::Traverse || m_navigation_type == NavigationType::Reload) {
-        dbgln("FIXME: restore scroll position data after traversal or reload navigation");
+    // 3. If event's navigationType was initialized to "traverse", then restore scroll position data given event's
+    //    relevant global object's navigable's active session history entry.
+    if (m_navigation_type == NavigationType::Traverse) {
+        if (auto navigable = m_relevant_window->navigable()) {
+            if (auto entry = navigable->active_session_history_entry())
+                navigable->restore_scroll_position_data(*entry);
+        }
     }
 
     // 4. Otherwise:
@@ -260,6 +276,9 @@ void NavigateEvent::process_scroll_behavior()
         // 2. If document's indicated part is null, then scroll to the beginning of the document given document. [CSSOMVIEW]
         auto indicated_part = document.determine_the_indicated_part();
         if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>() == nullptr) {
+            // INTEROP: Other browsers also clear the document's target element here, as scrolling to the fragment
+            //          does when the indicated part is null.
+            document.set_target_element(nullptr);
             document.scroll_to_the_beginning_of_the_document();
         }
 

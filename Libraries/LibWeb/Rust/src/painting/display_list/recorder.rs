@@ -4,17 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::builder::{
-    CommandRange, ContextRewrite, DisplayListBuilder, HEADER_SIZE, OpenGroup, PendingInlineClip, RecordedDisplayList,
-};
+use super::builder::{DisplayListBuilder, HEADER_SIZE, OpenGroup, PendingInlineClip};
+use super::chunks::Chunk;
 use super::commands::*;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::ffi_bytes::FfiBytes;
 use crate::painting::force_dark::{ForceDarkResolver, ForceDarkRole, ForceDarkSettings};
 use libgfx_rust::*;
 
 pub struct CommandPayloadBuilder {
     payload_start_offset: usize,
-    payload_size: usize,
+    command_size: usize,
     inline_payload: Vec<u8>,
 }
 
@@ -23,33 +23,48 @@ impl CommandPayloadBuilder {
         debug_assert_eq!(builder.byte_size() % super::builder::COMMAND_ALIGNMENT, 0);
         Self {
             payload_start_offset: builder.byte_size() + HEADER_SIZE,
-            payload_size: std::mem::size_of::<C>(),
+            command_size: std::mem::size_of::<C>(),
             inline_payload: Vec::new(),
         }
     }
 
     pub fn append_data(&mut self, bytes: &[u8], alignment: usize) -> DisplayListDataSpan {
-        assert!(alignment > 0);
-        let absolute_offset = self.payload_start_offset + self.payload_size;
-        let padded_offset = absolute_offset.next_multiple_of(alignment);
-        let padding = padded_offset - absolute_offset;
-        let payload_relative_offset = self.payload_size + padding;
-        self.inline_payload.resize(self.inline_payload.len() + padding, 0);
+        let payload_relative_offset = self.pad_payload_to_alignment(alignment);
         self.inline_payload.extend_from_slice(bytes);
-        self.payload_size = payload_relative_offset + bytes.len();
-        DisplayListDataSpan {
-            offset: u32::try_from(payload_relative_offset).expect("display list payload exceeds u32"),
-            size: u32::try_from(bytes.len()).expect("display list payload exceeds u32"),
-        }
+        self.data_span_from(payload_relative_offset)
     }
 
-    pub fn append_objects<T: FfiBytes>(&mut self, objects: &[T]) -> DisplayListDataSpan {
-        let size = std::mem::size_of::<T>();
-        let mut bytes = vec![0u8; std::mem::size_of_val(objects)];
-        for (index, object) in objects.iter().enumerate() {
-            object.write_ffi_bytes(&mut bytes[index * size..(index + 1) * size]);
+    pub fn append_objects<T: FfiBytes>(&mut self, objects: impl IntoIterator<Item = T>) -> DisplayListDataSpan {
+        let payload_relative_offset = self.pad_payload_to_alignment(std::mem::align_of::<T>());
+        let object_size = std::mem::size_of::<T>();
+        let objects = objects.into_iter();
+        self.inline_payload.reserve(objects.size_hint().0 * object_size);
+        for object in objects {
+            let object_start = self.inline_payload.len();
+            self.inline_payload.resize(object_start + object_size, 0);
+            object.write_ffi_bytes(&mut self.inline_payload[object_start..]);
         }
-        self.append_data(&bytes, std::mem::align_of::<T>())
+        self.data_span_from(payload_relative_offset)
+    }
+
+    fn payload_size(&self) -> usize {
+        self.command_size + self.inline_payload.len()
+    }
+
+    fn pad_payload_to_alignment(&mut self, alignment: usize) -> usize {
+        assert!(alignment > 0);
+        let absolute_offset = self.payload_start_offset + self.payload_size();
+        let padding = absolute_offset.next_multiple_of(alignment) - absolute_offset;
+        self.inline_payload.resize(self.inline_payload.len() + padding, 0);
+        self.payload_size()
+    }
+
+    fn data_span_from(&self, payload_relative_offset: usize) -> DisplayListDataSpan {
+        DisplayListDataSpan {
+            offset: u32::try_from(payload_relative_offset).expect("display list payload exceeds u32"),
+            size: u32::try_from(self.payload_size() - payload_relative_offset)
+                .expect("display list payload exceeds u32"),
+        }
     }
 
     pub fn append_f32s(&mut self, values: &[f32]) -> DisplayListDataSpan {
@@ -104,6 +119,10 @@ pub struct LinearGradientData {
 pub struct ConicGradientData {
     pub start_angle: f32,
     pub color_stops: ColorStops,
+    /// The fraction of a turn the stops' positions start from, and how many turns they run, as for a linear
+    /// gradient's line.
+    pub first_stop_position: f32,
+    pub repeat_length: f32,
     pub interpolation_method: GradientInterpolationMethod,
 }
 
@@ -134,7 +153,7 @@ pub enum PaintStyle {
         end_radius: f32,
     },
     Pattern {
-        tile_records: std::rc::Rc<Vec<u8>>,
+        tile_records: std::sync::Arc<Vec<u8>>,
         tile_rect: FloatRect,
         content_scale: FloatSize,
         pattern_transform: OptionalAffineTransform,
@@ -210,7 +229,7 @@ pub enum PaintStyleOrColor {
 
 pub struct FillPathParams<'a> {
     pub force_dark_role: ForceDarkRole,
-    pub path: &'a libgfx_rust::path::OwnedPath,
+    pub path: &'a libgfx_rust::path::Path,
     pub opacity: f32,
     pub paint_style_or_color: PaintStyleOrColor,
     pub winding_rule: WindingRule,
@@ -224,29 +243,87 @@ pub struct StrokePathParams<'a> {
     pub miter_limit: f32,
     pub dash_array: Vec<f32>,
     pub dash_offset: f32,
-    pub path: &'a libgfx_rust::path::OwnedPath,
+    pub path: &'a libgfx_rust::path::Path,
     pub opacity: f32,
     pub paint_style_or_color: PaintStyleOrColor,
     pub thickness: f32,
     pub should_anti_alias: ShouldAntiAlias,
 }
 
-pub struct GlyphRunForRecording<'a> {
+pub struct GlyphRunForRecording<Glyphs: IntoIterator<Item = DisplayListGlyph>> {
     pub font_smoothing: u8,
     pub font_id: FontResourceId,
-    pub glyphs: &'a [DisplayListGlyph],
+    pub glyphs: Glyphs,
 }
 
 pub struct IsolatedGroupEffects {
-    pub clip_rect: Option<FloatRect>,
+    pub clip_rect: FloatRect,
     pub opacity: f32,
-    pub filter: Option<std::rc::Rc<Vec<u8>>>,
+    pub filter: Option<std::sync::Arc<Vec<u8>>>,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub mask_kind: MaskKind,
 }
 
+/// The box and the part of its painting that recorded a record. What is recorded outside the boxes, such as the canvas
+/// and the inspector's overlays, names no box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordOrigin {
+    pub(crate) owner: NodeSlotId,
+    pub(crate) phase: &'static str,
+}
+
+/// What a recording notes beside its records for the display list dump, by the offsets the records start at, in
+/// increasing order.
+#[derive(Default)]
+pub(crate) struct RecordNotes {
+    pub(crate) origins: Vec<(u32, RecordOrigin)>,
+    pub(crate) glyph_run_texts: Vec<(u32, String)>,
+}
+
+impl RecordNotes {
+    pub(crate) fn append_shifted_by(&mut self, other: RecordNotes, shift: u32) {
+        self.origins.extend(
+            other
+                .origins
+                .into_iter()
+                .map(|(offset, origin)| (offset + shift, origin)),
+        );
+        self.glyph_run_texts.extend(
+            other
+                .glyph_run_texts
+                .into_iter()
+                .map(|(offset, text)| (offset + shift, text)),
+        );
+    }
+
+    pub(crate) fn glyph_run_text_at(&self, record_offset: u32) -> Option<&str> {
+        let index = self
+            .glyph_run_texts
+            .binary_search_by_key(&record_offset, |(offset, _)| *offset)
+            .ok()?;
+        Some(&self.glyph_run_texts[index].1)
+    }
+
+    pub(crate) fn origin_at(&self, record_offset: u32) -> Option<RecordOrigin> {
+        let index = self
+            .origins
+            .binary_search_by_key(&record_offset, |(offset, _)| *offset)
+            .ok()?;
+        Some(self.origins[index].1)
+    }
+}
+
+#[derive(Default)]
+struct RecordNoting {
+    open_origins: Vec<RecordOrigin>,
+    glyph_run_text: Option<String>,
+    notes: RecordNotes,
+}
+
 pub struct DetachedRecords {
     outer_builder: DisplayListBuilder,
+    // The notes of the outer records. The detached records are copied wherever they are drawn, and note nothing.
+    outer_record_notes: Option<RecordNotes>,
     outer_ambient_inline_clips: Vec<PendingInlineClip>,
     outer_ambient_inline_transform: Option<AffineTransform>,
 }
@@ -268,9 +345,59 @@ pub struct DisplayListRecorder {
     context: ContextRef,
     ambient_inline_clips: Vec<PendingInlineClip>,
     ambient_inline_transform: Option<AffineTransform>,
+    // Present only while a recording for the display list dump notes where its records come from.
+    record_noting: Option<Box<RecordNoting>>,
 }
 
 impl DisplayListRecorder {
+    /// Notes, for each record from now on, the box and phase that recorded it, and the text a glyph run draws.
+    pub(crate) fn note_record_origins(&mut self) {
+        self.record_noting = Some(Box::default());
+    }
+
+    pub(crate) fn notes_record_origins(&self) -> bool {
+        self.record_noting.is_some()
+    }
+
+    pub(crate) fn begin_record_origin(&mut self, owner: NodeSlotId, phase: &'static str) {
+        if let Some(noting) = &mut self.record_noting {
+            noting.open_origins.push(RecordOrigin { owner, phase });
+        }
+    }
+
+    pub(crate) fn end_record_origin(&mut self) {
+        if let Some(noting) = &mut self.record_noting {
+            noting.open_origins.pop();
+        }
+    }
+
+    /// The text the glyph runs recorded from now on draw, until another is set.
+    pub(crate) fn set_glyph_run_text(&mut self, text: Option<String>) {
+        if let Some(noting) = &mut self.record_noting {
+            noting.glyph_run_text = text;
+        }
+    }
+
+    /// The notes of the records recorded since the last chunk was taken, with offsets from where that chunk ended.
+    pub(crate) fn take_record_notes(&mut self) -> Option<RecordNotes> {
+        self.record_noting
+            .as_mut()
+            .map(|noting| std::mem::take(&mut noting.notes))
+    }
+
+    fn note_record_start(&mut self, draws_glyph_run: bool) {
+        let Some(noting) = &mut self.record_noting else {
+            return;
+        };
+        let offset = u32::try_from(self.builder.byte_size()).expect("display list exceeds u32");
+        if let Some(origin) = noting.open_origins.last() {
+            noting.notes.origins.push((offset, *origin));
+        }
+        if draws_glyph_run && let Some(text) = &noting.glyph_run_text {
+            noting.notes.glyph_run_texts.push((offset, text.clone()));
+        }
+    }
+
     pub fn new(force_dark_settings: Option<ForceDarkSettings>) -> Self {
         Self {
             force_dark: force_dark_settings.map(ForceDarkResolver::new),
@@ -314,11 +441,31 @@ impl DisplayListRecorder {
         self.ambient_inline_clips.extend_from_slice(inline_clips);
     }
 
+    /// Whether one of the ambient inline clips already keeps what is recorded under it within `rect`.
+    pub fn has_ambient_inline_clip_within(&self, rect: FloatRect) -> bool {
+        self.ambient_inline_clips.iter().any(|clip| clip.lies_within(rect))
+    }
+
+    /// Makes every ambient inline clip apply in `space`, whatever space the commands recorded under them draw in,
+    /// and hands back the clips as they were, for the caller to restore with [`Self::replace_ambient_inline_clips`].
+    pub fn move_ambient_inline_clips_to_space(&mut self, space: SpatialNodeIndex) -> Vec<PendingInlineClip> {
+        let clips_in_space = self
+            .ambient_inline_clips
+            .iter()
+            .map(|clip| clip.in_space(space))
+            .collect();
+        self.replace_ambient_inline_clips(clips_in_space)
+    }
+
+    pub fn replace_ambient_inline_clips(&mut self, inline_clips: Vec<PendingInlineClip>) -> Vec<PendingInlineClip> {
+        std::mem::replace(&mut self.ambient_inline_clips, inline_clips)
+    }
+
     pub fn truncate_ambient_inline_clips(&mut self, enclosing_scope_clip_count: usize) {
         self.ambient_inline_clips.truncate(enclosing_scope_clip_count);
     }
 
-    fn resolve_color(&mut self, color: Color, force_dark_role: ForceDarkRole) -> Color {
+    pub fn resolve_color(&mut self, color: Color, force_dark_role: ForceDarkRole) -> Color {
         let backdrop = self.contrast_backdrop;
         match &mut self.force_dark {
             Some(resolver) => resolver.resolve_against_backdrop(color, force_dark_role, backdrop),
@@ -406,10 +553,6 @@ impl DisplayListRecorder {
         })
     }
 
-    pub fn builder(&self) -> &DisplayListBuilder {
-        &self.builder
-    }
-
     pub fn into_builder(self) -> DisplayListBuilder {
         debug_assert!(self.ambient_inline_clips.is_empty());
         self.builder
@@ -423,6 +566,10 @@ impl DisplayListRecorder {
         self.builder.bytes()
     }
 
+    pub fn command_runs(&self) -> &[DisplayListCommandRun] {
+        self.builder.command_runs()
+    }
+
     pub fn accumulated_visual_context(&self) -> ContextRef {
         self.context
     }
@@ -432,6 +579,10 @@ impl DisplayListRecorder {
     }
 
     fn append_command<C: DisplayListCommand>(&mut self, command: &C, inline_data: &[u8]) {
+        self.note_record_start(matches!(
+            C::COMMAND_TYPE,
+            DisplayListCommandType::DrawGlyphRun | DisplayListCommandType::PaintTextShadow
+        ));
         self.builder.append_with_inline_state(
             command,
             inline_data,
@@ -442,38 +593,10 @@ impl DisplayListRecorder {
         );
     }
 
-    pub fn append_cached_command_range(
-        &mut self,
-        source: &RecordedDisplayList,
-        range: CommandRange,
-        recorded_context: ContextRef,
-    ) -> CommandRange {
-        let offset = self.builder.append_command_range(
-            source,
-            range,
-            Some(ContextRewrite {
-                recorded_context,
-                current_context: self.context,
-            }),
-        );
-        CommandRange {
-            offset,
-            size: range.size,
-        }
-    }
-
-    /// Copies a cached command range without rewriting visual-context indices. The caller must
-    /// establish that the recorded indices are still valid for the current visual context tree.
-    pub fn append_cached_command_range_verbatim(
-        &mut self,
-        source: &RecordedDisplayList,
-        range: CommandRange,
-    ) -> CommandRange {
-        let offset = self.builder.append_command_range(source, range, None);
-        CommandRange {
-            offset,
-            size: range.size,
-        }
+    /// Takes everything recorded so far out as one chunk, named by what it holds. What is recorded next starts a run
+    /// of its own.
+    pub fn take_chunk(&mut self) -> Chunk {
+        self.builder.take_chunk()
     }
 
     pub fn fill_rect(&mut self, rect: IntRect, color: Color, force_dark_role: ForceDarkRole) {
@@ -686,6 +809,8 @@ impl DisplayListRecorder {
             rect,
             start_angle: data.start_angle,
             color_stops,
+            first_stop_position: data.first_stop_position,
+            repeat_length: data.repeat_length,
             interpolation_method: data.interpolation_method,
             position,
             compositing_and_blending_operator,
@@ -742,18 +867,16 @@ impl DisplayListRecorder {
                 dst_rect,
                 child_context_id,
                 scaling_mode,
+                spatial_node_index: self.context.spatial,
+                snap_origin_if_untransformed: self
+                    .ambient_inline_transform
+                    .is_none_or(|transform| transform.is_identity()),
             },
             &[],
         );
     }
 
-    pub fn draw_canvas(
-        &mut self,
-        dst_rect: IntRect,
-        canvas_id: CanvasId,
-        content_generation: u64,
-        scaling_mode: ScalingMode,
-    ) {
+    pub fn draw_canvas(&mut self, dst_rect: IntRect, canvas_id: CanvasId, scaling_mode: ScalingMode) {
         if dst_rect.is_empty() {
             return;
         }
@@ -761,7 +884,6 @@ impl DisplayListRecorder {
             &DrawCanvas {
                 dst_rect,
                 canvas_id,
-                content_generation,
                 scaling_mode,
             },
             &[],
@@ -771,7 +893,7 @@ impl DisplayListRecorder {
     pub fn draw_video_frame(
         &mut self,
         dst_rect: IntRect,
-        video_sink_id: VideoSinkResourceId,
+        video_sink_handle: VideoSinkHandle,
         scaling_mode: ScalingMode,
     ) {
         if dst_rect.is_empty() {
@@ -780,7 +902,7 @@ impl DisplayListRecorder {
         self.append_command(
             &DrawVideoFrame {
                 dst_rect,
-                video_sink_id,
+                video_sink_handle,
                 scaling_mode,
             },
             &[],
@@ -884,6 +1006,7 @@ impl DisplayListRecorder {
     pub fn begin_detached_records(&mut self) -> DetachedRecords {
         DetachedRecords {
             outer_builder: std::mem::take(&mut self.builder),
+            outer_record_notes: self.take_record_notes(),
             outer_ambient_inline_clips: std::mem::take(&mut self.ambient_inline_clips),
             outer_ambient_inline_transform: self.ambient_inline_transform.take(),
         }
@@ -893,9 +1016,17 @@ impl DisplayListRecorder {
         debug_assert!(self.ambient_inline_clips.is_empty());
         self.ambient_inline_transform = detached.outer_ambient_inline_transform;
         self.ambient_inline_clips = detached.outer_ambient_inline_clips;
+        if let (Some(noting), Some(outer_record_notes)) = (&mut self.record_noting, detached.outer_record_notes) {
+            noting.notes = outer_record_notes;
+        }
         std::mem::replace(&mut self.builder, detached.outer_builder)
             .finish()
             .bytes
+    }
+
+    /// The force-dark settings the recorder applies, which content it records while force dark is suspended has none of.
+    pub fn force_dark_settings(&self) -> Option<ForceDarkSettings> {
+        self.force_dark.as_ref().map(ForceDarkResolver::settings)
     }
 
     pub fn suspend_force_dark(&mut self) -> Option<ForceDarkResolver> {
@@ -911,6 +1042,7 @@ impl DisplayListRecorder {
     }
 
     fn begin_group<C: DisplayListCommand>(&mut self) -> OpenRecorderGroup {
+        self.note_record_start(false);
         let suspended_ambient_inline_clips = std::mem::take(&mut self.ambient_inline_clips);
         OpenRecorderGroup {
             group: self.builder.begin_group::<C>(suspended_ambient_inline_clips.clone()),
@@ -937,7 +1069,7 @@ impl DisplayListRecorder {
         self.finish_group_with_effects(
             group,
             IsolatedGroupEffects {
-                clip_rect: Some(clip_rect),
+                clip_rect,
                 opacity: 1.0,
                 filter: None,
                 compositing_and_blending_operator,
@@ -955,7 +1087,7 @@ impl DisplayListRecorder {
             None => DisplayListDataSpan::default(),
         };
         let command = DrawIsolatedGroup {
-            clip_rect: effects.clip_rect.into(),
+            clip_rect: effects.clip_rect,
             content,
             mask,
             filter,
@@ -1065,11 +1197,12 @@ impl DisplayListRecorder {
     pub fn draw_glyph_run(
         &mut self,
         baseline_start: FloatPoint,
-        run: GlyphRunForRecording<'_>,
+        run: GlyphRunForRecording<impl IntoIterator<Item = DisplayListGlyph>>,
         color: Color,
+        stroke_width: f32,
         rect: IntRect,
         scale: f64,
-        orientation: Orientation,
+        orientation: GlyphRunOrientation,
         glyph_bounding_rect: IntRect,
         force_dark_role: ForceDarkRole,
     ) {
@@ -1079,7 +1212,12 @@ impl DisplayListRecorder {
         let color = self.resolve_color(color, force_dark_role);
         let mut payload = CommandPayloadBuilder::new::<DrawGlyphRun>(&self.builder);
         let glyphs = payload.append_objects(run.glyphs);
+        let stroke_width = stroke_width.min(crate::css::css_pixels::max_dimension_value().to_float());
+        // A miter limit of 4 lets sharp glyph corners extend four half-widths beyond the fill bounds.
+        let margin = (stroke_width * 2.0).ceil() as i32;
+        let glyph_bounding_rect = glyph_bounding_rect.inflated_edges(margin, margin, margin, margin);
         let command = DrawGlyphRun {
+            stroke_width,
             font_smoothing: run.font_smoothing,
             font_id: run.font_id,
             glyphs,
@@ -1105,6 +1243,33 @@ impl DisplayListRecorder {
         self.append_command(&shadow, &[]);
     }
 
+    /// Paints a box shadow cast from the shape `shape_path`, outside the shape, or inside it when `inner`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_path_box_shadow(
+        &mut self,
+        color: Color,
+        blur_radius: i32,
+        spread_distance: f32,
+        offset: FloatPoint,
+        shape_path: &libgfx_rust::path::Path,
+        inner: bool,
+        force_dark_role: ForceDarkRole,
+    ) {
+        let color = self.resolve_color(color, force_dark_role);
+        let mut payload = CommandPayloadBuilder::new::<PaintPathBoxShadow>(&self.builder);
+        let shape_path_data = payload.append_data(&shape_path.serialize_to_bytes(), std::mem::align_of::<u32>());
+        let command = PaintPathBoxShadow {
+            color,
+            blur_radius,
+            spread_distance,
+            offset,
+            shape_path_bounding_rect: FloatRect::from_array(shape_path.bounding_box()),
+            shape_path_data,
+            inner,
+        };
+        self.append_command(&command, payload.inline_data());
+    }
+
     pub fn paint_inner_box_shadow(&mut self, mut shadow: PaintInnerBoxShadow, force_dark_role: ForceDarkRole) {
         shadow.color = self.resolve_color(shadow.color, force_dark_role);
         self.append_command(&shadow, &[]);
@@ -1113,29 +1278,30 @@ impl DisplayListRecorder {
     #[allow(clippy::too_many_arguments)]
     pub fn paint_text_shadow(
         &mut self,
-        blur_radius: i32,
-        shadow_bounding_rect: IntRect,
+        layers: &[TextShadowLayer],
+        shadows_bounding_rect: IntRect,
         rect: IntRect,
         translation: FloatPoint,
-        run: GlyphRunForRecording<'_>,
+        run: GlyphRunForRecording<impl IntoIterator<Item = DisplayListGlyph>>,
         glyph_run_scale: f64,
-        color: Color,
-        orientation: Orientation,
+        orientation: GlyphRunOrientation,
         force_dark_role: ForceDarkRole,
     ) {
-        let color = self.resolve_color(color, force_dark_role);
         let mut payload = CommandPayloadBuilder::new::<PaintTextShadow>(&self.builder);
         let glyphs = payload.append_objects(run.glyphs);
+        let layers = payload.append_objects(layers.iter().map(|layer| TextShadowLayer {
+            color: self.resolve_color(layer.color, force_dark_role),
+            ..*layer
+        }));
         let command = PaintTextShadow {
             font_smoothing: run.font_smoothing,
             font_id: run.font_id,
             glyphs,
-            shadow_bounding_rect,
+            layers,
+            shadows_bounding_rect,
             rect,
             translation,
             scale: glyph_run_scale as f32,
-            blur_radius,
-            color,
             orientation,
         };
         self.append_command(&command, payload.inline_data());
@@ -1251,13 +1417,16 @@ impl DisplayListRecorder {
         gutter_rect: IntRect,
         thumb_rect: IntRect,
         track_rect: IntRect,
+        expanded_gutter_rect: IntRect,
         scroll_size: f64,
         thumb_color: Color,
+        thumb_outline_color: Color,
         track_color: Color,
         vertical: bool,
         force_dark_role: ForceDarkRole,
     ) {
         let thumb_color = self.resolve_color(thumb_color, force_dark_role);
+        let thumb_outline_color = self.resolve_color(thumb_outline_color, force_dark_role);
         let track_color = self.resolve_color(track_color, force_dark_role);
         self.append_command(
             &PaintScrollBar {
@@ -1265,8 +1434,10 @@ impl DisplayListRecorder {
                 gutter_rect,
                 thumb_rect,
                 track_rect,
+                expanded_gutter_rect,
                 scroll_size,
                 thumb_color,
+                thumb_outline_color,
                 track_color,
                 vertical,
             },
@@ -1274,24 +1445,24 @@ impl DisplayListRecorder {
         );
     }
 
-    pub fn paint_nested_display_list(
+    /// Paints the records of the SVG image `vector_image_id` names, which were recorded at `recorded_size`, into
+    /// `rect`. The tape takes the records in where it is sent.
+    pub fn paint_vector_image_records(
         &mut self,
-        display_list_id: DisplayListResourceId,
+        vector_image_id: DisplayListResourceId,
         rect: FloatRect,
-        list_size: IntSize,
+        recorded_size: IntSize,
     ) {
         self.append_command(
-            &PaintNestedDisplayList {
-                display_list_id,
+            &PaintVectorImage {
+                vector_image_id,
                 rect,
-                list_size,
+                recorded_size,
+                records: DisplayListDataSpan::default(),
+                requires_direct_replay: false,
             },
             &[],
         );
-    }
-
-    pub fn compositor_scroll_node(&mut self, node: CompositorScrollNode) {
-        self.append_command(&node, &[]);
     }
 
     pub fn compositor_wheel_hit_test_target(&mut self, target: CompositorWheelHitTestTarget) {
@@ -1309,6 +1480,10 @@ impl DisplayListRecorder {
         self.append_command(&region, &[]);
     }
 
+    pub fn compositor_nested_context_wheel_region(&mut self, region: CompositorNestedContextWheelRegion) {
+        self.append_command(&region, &[]);
+    }
+
     pub fn compositor_scrollbar(&mut self, scrollbar: CompositorScrollbar) {
         self.append_command(&scrollbar, &[]);
     }
@@ -1316,12 +1491,49 @@ impl DisplayListRecorder {
     pub fn compositor_blocking_wheel_event_region(&mut self, region: CompositorBlockingWheelEventRegion) {
         self.append_command(&region, &[]);
     }
+}
 
-    pub fn compositor_snap_container(&mut self, container: CompositorSnapContainer) {
-        self.append_command(&container, &[]);
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn compositor_snap_area(&mut self, area: CompositorSnapArea) {
-        self.append_command(&area, &[]);
+    #[test]
+    fn noted_origins_name_the_innermost_open_origin_and_skip_detached_records() {
+        let mut recorder = DisplayListRecorder::new(None);
+        recorder.note_record_origins();
+        let (outer, inner) = (NodeSlotId::new(1, 1), NodeSlotId::new(2, 1));
+        let rect = IntRect::new(0, 0, 10, 10);
+        recorder.begin_record_origin(outer, "background");
+        recorder.fill_rect(rect, Color::from_rgb(1, 2, 3), ForceDarkRole::Background);
+        let group = recorder.begin_isolated_group();
+        recorder.begin_record_origin(inner, "foreground");
+        recorder.fill_rect(rect, Color::from_rgb(4, 5, 6), ForceDarkRole::Background);
+        recorder.end_record_origin();
+        recorder.finish_isolated_group(
+            group,
+            rect.to_float(),
+            CompositingAndBlendingOperator::Normal,
+            MaskKind::Alpha,
+        );
+        let detached = recorder.begin_detached_records();
+        recorder.fill_rect(rect, Color::from_rgb(7, 8, 9), ForceDarkRole::Background);
+        let _ = recorder.finish_detached_records(detached);
+        recorder.end_record_origin();
+
+        let notes = recorder.take_record_notes().unwrap();
+        let origin = |owner, phase| RecordOrigin { owner, phase };
+        let mut record_offsets = Vec::new();
+        crate::painting::display_list::nested_records::for_each_command_including_nested(
+            recorder.bytes(),
+            &mut |_, payload_offset, _| record_offsets.push((payload_offset - HEADER_SIZE) as u32),
+        );
+        assert_eq!(
+            notes.origins,
+            [
+                (record_offsets[0], origin(outer, "background")),
+                (record_offsets[1], origin(outer, "background")),
+                (record_offsets[2], origin(inner, "foreground")),
+            ]
+        );
     }
 }

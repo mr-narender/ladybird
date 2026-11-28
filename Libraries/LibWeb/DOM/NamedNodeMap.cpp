@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashTable.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/DOM/Attr.h>
@@ -75,10 +76,11 @@ Vector<Utf16FlyString> NamedNodeMap::supported_property_names() const
     // 1. Let names be the qualified names of the attributes in this NamedNodeMap object’s attribute list, with duplicates omitted, in order.
     Vector<Utf16FlyString> names;
     names.ensure_capacity(length());
+    HashTable<Utf16FlyString> seen_names;
 
     for (size_t index = 0; index < length(); ++index) {
         auto name = associated_element().m_attributes->at(index).name.as_string();
-        if (!names.contains_slow(name))
+        if (seen_names.set(name) == HashSetResult::InsertedNewEntry)
             names.append(move(name));
     }
 
@@ -91,6 +93,13 @@ Vector<Utf16FlyString> NamedNodeMap::supported_property_names() const
 
     // 3. Return names.
     return names;
+}
+
+// AD-HOC: DOM lists only lowercase property names for HTML elements in HTML documents, but sites also read
+// attributes by mixed-case names. Apply the same lookup as getNamedItem() when looking up a single property.
+bool NamedNodeMap::is_supported_property_name(Utf16FlyString const& name) const
+{
+    return associated_element().find_attribute_index(name).has_value();
 }
 
 // https://dom.spec.whatwg.org/#dom-namednodemap-item
@@ -257,7 +266,7 @@ void NamedNodeMap::append_attribute(GC::Ref<Attr> attribute)
 {
     // 1. Append attribute to element’s attribute list.
     auto value = attribute->value();
-    associated_element().ensure_attribute_list().empend(attribute->m_qualified_name, value);
+    associated_element().append_to_attribute_list(attribute->m_qualified_name, value);
 
     // 2. Set attribute’s element to element.
     attribute->set_owner_element(&associated_element());

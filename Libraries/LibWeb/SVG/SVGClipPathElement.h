@@ -34,21 +34,14 @@ public:
         return m_clip_path_units.value_or(ClipPathUnits::UserSpaceOnUse);
     }
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
+
+    GC::Ref<SVGAnimatedEnumeration> clip_path_units_for_bindings();
 
 private:
     SVGClipPathElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual bool is_svg_clip_path_element() const final { return true; }
-
     Optional<ClipPathUnits> m_clip_path_units = {};
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<SVG::SVGClipPathElement>() const { return is_svg_clip_path_element(); }
 
 }

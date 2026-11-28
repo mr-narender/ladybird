@@ -78,7 +78,7 @@ public:
     bool was_exit_requested();
 
     // The registration functions act upon the current loop of the current thread.
-    static intptr_t register_timer(EventReceiver&, int milliseconds, bool should_reload);
+    static intptr_t register_timer(EventReceiver&, AK::Duration interval, bool should_reload);
     static void unregister_timer(intptr_t timer_id);
 
     static void register_notifier(Badge<Notifier>, Notifier&);
@@ -107,6 +107,9 @@ class StrongEventLoopReference;
 class CORE_API WeakEventLoopReference : public AtomicRefCounted<WeakEventLoopReference> {
 public:
     StrongEventLoopReference take();
+
+    // Queues the function on the event loop if it still exists, and returns whether it did.
+    bool deferred_invoke(ESCAPING Function<void()>);
 
 private:
     friend class EventLoop;

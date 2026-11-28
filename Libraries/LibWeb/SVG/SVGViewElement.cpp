@@ -9,6 +9,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGAnimatedRect.h>
+#include <LibWeb/SVG/SVGSVGElement.h>
 
 namespace Web::SVG {
 
@@ -21,7 +22,7 @@ SVGViewElement::SVGViewElement(DOM::Document& document, DOM::QualifiedName quali
 
 void SVGViewElement::initialize_element()
 {
-    SVGFitToViewBox::initialize_fit_to_view_box();
+    SVGFitToViewBox::initialize_fit_to_view_box(*this);
 }
 
 void SVGViewElement::visit_edges(Visitor& visitor)
@@ -34,6 +35,15 @@ void SVGViewElement::attribute_changed(Utf16FlyString const& name, Optional<Utf1
 {
     Base::attribute_changed(name, old_value, value, namespace_);
     SVGFitToViewBox::attribute_changed(*this, name, value);
+
+    // An <svg> that has made this element its active view takes its view box from here, so the change has to reach
+    // that element's published facts as well as this one's.
+    if (name.equals_ignoring_ascii_case(AttributeNames::viewBox)) {
+        document().for_each_in_subtree_of_type<SVGSVGElement>([](auto& svg_element) {
+            svg_element.publish_svg_attribute_facts();
+            return TraversalDecision::Continue;
+        });
+    }
 }
 
 }

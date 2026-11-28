@@ -14,6 +14,13 @@ pub enum NestedRecordsRole {
     RepeatedTile,
     MaskContent,
     PatternTile,
+    VectorImage,
+}
+
+pub fn holds_nested_records(command_type: DisplayListCommandType, payload: &[u8]) -> bool {
+    let mut holds_nested_records = false;
+    for_each_nested_record_span(command_type, payload, |_, _| holds_nested_records = true);
+    holds_nested_records
 }
 
 pub fn for_each_nested_record_span(
@@ -45,6 +52,12 @@ pub fn for_each_nested_record_span(
             visit(
                 NestedRecordsRole::MaskContent,
                 read_command::<DeclareMaskContent>(payload).content,
+            );
+        }
+        DisplayListCommandType::PaintVectorImage => {
+            visit(
+                NestedRecordsRole::VectorImage,
+                read_command::<PaintVectorImage>(payload).records,
             );
         }
         DisplayListCommandType::FillPath => {

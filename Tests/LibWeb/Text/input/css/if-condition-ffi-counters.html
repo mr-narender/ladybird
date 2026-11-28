@@ -10,10 +10,7 @@
         `;
         document.body.appendChild(target);
 
-        internals.resetStyleFfiCounters();
         println(`${name} result: ${getComputedStyle(target).width}`);
-        println(`${name} callbacks: ${internals.styleFfiCounters().evaluateConditionCallbacks}`);
-        println(`${name} media environment callbacks: ${internals.styleFfiCounters().mediaEnvironmentCallbacks}`);
         target.remove();
     }
 
@@ -29,10 +26,8 @@
             document.body.appendChild(target);
         }
 
-        internals.resetStyleFfiCounters();
         internals.updateStyle();
         println(`shared results: ${targets.map(target => getComputedStyle(target).width).join(", ")}`);
-        println(`shared media environment callbacks: ${internals.styleFfiCounters().mediaEnvironmentCallbacks}`);
         targets.forEach(target => target.remove());
     }
 

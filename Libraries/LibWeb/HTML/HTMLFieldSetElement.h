@@ -42,7 +42,7 @@ public:
 
     virtual Optional<ARIA::Role> default_role() const override { return ARIA::Role::group; }
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     void refresh_disabled_state_of_descendant_form_controls();
 
@@ -54,16 +54,7 @@ private:
     virtual void children_changed(ChildrenChangedMetadata const&) override;
     virtual void inserted() override;
 
-    virtual bool is_html_fieldset_element() const override { return true; }
-
     GC::Ptr<DOM::HTMLCollection> m_elements;
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLFieldSetElement>() const { return is_html_fieldset_element(); }
 
 }

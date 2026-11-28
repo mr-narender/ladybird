@@ -4,9 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::css::style_value::{ConicGradientPayload, LinearGradientPayload, RadialGradientPayload};
 use crate::painting::record::trace::Observer;
+use ak::math;
 
-use crate::css::color_resolution::{ColorResolutionInput, Rgba, to_color};
+use crate::css::color_resolution::{ColorResolutionInput, to_color};
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixelSize};
 use crate::css::style_value::{RetainedColorStop, RetainedStyleValueData, StyleValueData};
@@ -16,7 +18,6 @@ use crate::painting::display_list::recorder::{
 };
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::record::PaintRecorder;
-use crate::painting::style_queries;
 use crate::painting::visual_context::basic_shapes::{position_resolved, resolve_circle_size, resolve_ellipse_size};
 use libgfx_rust::{
     Color, CompositingAndBlendingOperator, FloatRect, GradientInterpolationMethod, GradientInterpolationType,
@@ -115,11 +116,11 @@ fn ak_pow_f32(x: f32, y: f32) -> f32 {
         }
         return result;
     }
-    ((y * ak_log2_f32(x)) as f64).exp2() as f32
+    math::exp2((y * ak_log2_f32(x)) as f64) as f32
 }
 
 fn ak_log_f32(x: f32) -> f32 {
-    (x as f64).ln() as f32
+    math::log(x as f64) as f32
 }
 
 fn color_stop_step(previous_stop: &GradientStop, next_stop: &GradientStop, position: f32) -> f32 {
@@ -345,16 +346,32 @@ fn expand_color_stops_for_painting(
     replace_transition_hints_with_normal_color_stops(&expanded)
 }
 
-fn finalized_color_stops(mut resolved_color_stops: ResolvedColorStopData) -> ColorStops {
+/// The stops a gradient paints, with its transition hints replaced and a repeating gradient's stops repeated across its
+/// range.
+fn stops_for_painting(mut resolved_color_stops: ResolvedColorStopData) -> ResolvedColorStopData {
     if has_degenerate_repeat_length(&resolved_color_stops) {
         normalize_degenerate_repeating_gradient(&mut resolved_color_stops);
     }
-    // Expand color stops for painting (replace transition hints and expand repeat length)
     resolved_color_stops.list =
         expand_color_stops_for_painting(resolved_color_stops.list, resolved_color_stops.repeat_length);
-    to_color_stops(&resolved_color_stops.list, resolved_color_stops.repeating, |position| {
-        position
-    })
+    resolved_color_stops
+}
+
+/// Where a non-repeating gradient's stops run from, and how far, where they're outside of 0 to 1: The painter moves
+/// stops outside that range onto its ends, so such a gradient is painted across its stops' range instead, with its
+/// stops placed along that. Every other gradient runs from 0 to 1.
+fn stop_range(resolved_color_stops: &ResolvedColorStopData) -> (f32, f32) {
+    if resolved_color_stops.repeating {
+        return (0.0, 1.0);
+    }
+    let first = resolved_color_stops.list[0].position.min(0.0);
+    let last = resolved_color_stops
+        .list
+        .last()
+        .expect("a gradient has a stop")
+        .position
+        .max(1.0);
+    (first, last - first)
 }
 
 fn to_color_stops(
@@ -377,6 +394,102 @@ fn to_color_stops(
         positions,
         repeating,
     }
+}
+
+/// The color a gradient has at `position`, between its stops `previous` and `next`, interpolated in the gradient's
+/// interpolation space, from the same colors the painter interpolates.
+fn color_between_stops(
+    previous: &GradientStop,
+    next: &GradientStop,
+    position: f32,
+    interpolation: &GradientInterpolation<'_>,
+) -> Color {
+    let distance = next.position - previous.position;
+    let progress = if distance > 0.0 {
+        ((position - previous.position) / distance).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let resolved = |color: Color, percentage: f32| crate::css::color_interpolation::MixItem {
+        color: crate::css::color_interpolation::ResolvedColor {
+            color_type: crate::css::color_conversion::SRGB,
+            components: [
+                f32::from(color.red()) / 255.0,
+                f32::from(color.green()) / 255.0,
+                f32::from(color.blue()) / 255.0,
+                f32::from(color.alpha()) / 255.0,
+            ],
+            missing: [false; 4],
+            has_native_components: false,
+        },
+        percentage: f64::from(percentage * 100.0),
+    };
+    crate::css::color_interpolation::mix_colors(
+        vec![resolved(previous.color, 1.0 - progress), resolved(next.color, progress)],
+        &interpolation.method,
+        1.0,
+    )
+    .and_then(|mixed| to_color(&mixed, interpolation.color_input))
+    .map_or_else(
+        || previous.color.mixed_with(next.color, progress),
+        |rgba| Color::from_rgba(rgba.r, rgba.g, rgba.b, rgba.a),
+    )
+}
+
+/// How a gradient interpolates between its stops, for computing a color between two of them.
+struct GradientInterpolation<'a> {
+    method: StyleValueData,
+    color_input: &'a ColorResolutionInput<'a>,
+}
+
+impl<'a> GradientInterpolation<'a> {
+    fn new(
+        color_interpolation_method: &RetainedStyleValueData,
+        color_syntax: u8,
+        color_input: &'a ColorResolutionInput<'a>,
+    ) -> Self {
+        use crate::css::css_enums::rectangular_color_space;
+        // NB: An omitted method is the one gradient_interpolation_method() gives the painter: sRGB for a gradient
+        //     written with legacy colors only, and Oklab otherwise.
+        let method =
+            color_interpolation_method
+                .optional_data()
+                .cloned()
+                .unwrap_or(StyleValueData::ColorInterpolationMethod {
+                    is_polar: false,
+                    color_space: if color_syntax == 0 {
+                        rectangular_color_space::SRGB
+                    } else {
+                        rectangular_color_space::OKLAB
+                    },
+                    hue_interpolation_method: 0,
+                });
+        Self { method, color_input }
+    }
+}
+
+/// Drops the stops of a non-repeating gradient that are below 0, putting a stop at 0 in their place, with the color the
+/// gradient has there. A radial gradient paints nothing inside its center, but the painter would move such stops onto
+/// it, colors and all.
+fn clip_stops_below_zero(stops: Vec<GradientStop>, interpolation: &GradientInterpolation<'_>) -> Vec<GradientStop> {
+    let edge_stop = |color: Color, position: f32| GradientStop {
+        color,
+        position,
+        transition_hint: None,
+    };
+    let mut stops = stops;
+    if stops.first().is_some_and(|stop| stop.position < 0.0) {
+        stops = match stops.iter().position(|stop| stop.position >= 0.0) {
+            Some(first_in_range) => {
+                let edge = color_between_stops(&stops[first_in_range - 1], &stops[first_in_range], 0.0, interpolation);
+                std::iter::once(edge_stop(edge, 0.0))
+                    .chain(stops[first_in_range..].iter().copied())
+                    .collect()
+            }
+            None => vec![edge_stop(stops.last().expect("a gradient has a stop").color, 0.0)],
+        };
+    }
+    stops
 }
 
 fn resolve_color_stop_positions(
@@ -499,23 +612,6 @@ fn resolve_color_stop_positions(
         list: resolved_color_stops,
         repeat_length,
         repeating,
-    }
-}
-
-fn stop_color_resolution_input(style: ComputedValuesView<'_>) -> ColorResolutionInput<'_> {
-    let inherited_text = style.inherited_text();
-    let current_color = inherited_text.color;
-    ColorResolutionInput {
-        scheme: Some(style.inherited_ui().color_scheme),
-        current_color: Some(Rgba {
-            r: (current_color >> 16) as u8,
-            g: (current_color >> 8) as u8,
-            b: current_color as u8,
-            a: (current_color >> 24) as u8,
-        }),
-        current_color_value: style_queries::handle_value(&inherited_text.color_style_value),
-        length: None,
-        channels: None,
     }
 }
 
@@ -683,8 +779,10 @@ fn linear_gradient_angle_degrees(
             angle as f32
         }
     } else {
-        let corner_angle_degrees =
-            || gradient_size.height.to_double().atan2(gradient_size.width.to_double()) * 180.0 / std::f64::consts::PI;
+        let corner_angle_degrees = || {
+            math::atan2(gradient_size.height.to_double(), gradient_size.width.to_double()) * 180.0
+                / std::f64::consts::PI
+        };
         let angle = match SideOrCorner::from_computed_value(side_or_corner) {
             SideOrCorner::Top => 0.0,
             SideOrCorner::Bottom => 180.0,
@@ -707,8 +805,8 @@ fn linear_gradient_angle_degrees(
 fn calculate_gradient_length(gradient_size: CssPixelSize, gradient_angle: f32) -> f32 {
     let real_angle = 90.0 - gradient_angle;
     let radians = real_angle * std::f32::consts::PI / 180.0;
-    let sin_angle = (radians as f64).sin() as f32;
-    let cos_angle = (radians as f64).cos() as f32;
+    let sin_angle = math::sin(radians as f64) as f32;
+    let cos_angle = math::cos(radians as f64) as f32;
     (gradient_size.height.to_float() * sin_angle).abs() + (gradient_size.width.to_float() * cos_angle).abs()
 }
 
@@ -741,11 +839,9 @@ fn resolve_linear_gradient_paint(
     // Replace transition hints for painting; keep repeat_length for Skia's native tiling
     resolved_color_stops.list = replace_transition_hints_with_normal_color_stops(&resolved_color_stops.list);
 
-    let repeat_length = resolved_color_stops.repeat_length.unwrap_or(1.0);
-    let first_stop_position = if resolved_color_stops.repeat_length.is_some() {
-        resolved_color_stops.list[0].position
-    } else {
-        0.0
+    let (first_stop_position, repeat_length) = match resolved_color_stops.repeat_length {
+        Some(repeat_length) => (resolved_color_stops.list[0].position, repeat_length),
+        None => stop_range(&resolved_color_stops),
     };
     let color_stops = to_color_stops(&resolved_color_stops.list, resolved_color_stops.repeating, |position| {
         (position - first_stop_position) / repeat_length
@@ -772,7 +868,11 @@ fn resolve_conic_gradient_paint(
 ) -> (ConicGradientData, CssPixelPoint) {
     let resolved_color_stops =
         resolve_color_stop_positions(color_stop_list, color_input, stop_angle_fraction_of_turn, repeating);
-    let color_stops = finalized_color_stops(resolved_color_stops);
+    let resolved_color_stops = stops_for_painting(resolved_color_stops);
+    let (first_stop_position, repeat_length) = stop_range(&resolved_color_stops);
+    let color_stops = to_color_stops(&resolved_color_stops.list, resolved_color_stops.repeating, |position| {
+        (position - first_stop_position) / repeat_length
+    });
     let start_angle = match from_angle.optional_data() {
         Some(from_angle) => angle_to_degrees(from_angle) as f32,
         None => 0.0,
@@ -780,6 +880,8 @@ fn resolve_conic_gradient_paint(
     let data = ConicGradientData {
         start_angle,
         color_stops,
+        first_stop_position,
+        repeat_length,
         interpolation_method: gradient_interpolation_method(color_interpolation_method, color_syntax),
     };
     (data, position_resolved(position.optional_data(), gradient_box))
@@ -815,7 +917,29 @@ fn resolve_radial_gradient_paint(
         },
         repeating,
     );
-    let color_stops = finalized_color_stops(resolved_color_stops);
+    // NB: Stops past the ending shape are reached by the rays beyond it, so rather than being clipped, they scale the
+    //     shape the painter places the stops in.
+    let interpolation = GradientInterpolation::new(color_interpolation_method, color_syntax, color_input);
+    let mut resolved_color_stops = stops_for_painting(resolved_color_stops);
+    if !resolved_color_stops.repeating {
+        resolved_color_stops.list = clip_stops_below_zero(resolved_color_stops.list, &interpolation);
+    }
+    let mut color_stops = to_color_stops(&resolved_color_stops.list, resolved_color_stops.repeating, |position| {
+        position
+    });
+    let mut gradient_size = gradient_size;
+    if let Some(&last) = color_stops.positions.last()
+        && last > 1.0
+        && !color_stops.repeating
+    {
+        for position in &mut color_stops.positions {
+            *position /= last;
+        }
+        gradient_size = CssPixelSize::new(
+            gradient_size.width.scaled(f64::from(last)),
+            gradient_size.height.scaled(f64::from(last)),
+        );
+    }
     let data = RadialGradientData {
         color_stops,
         interpolation_method: gradient_interpolation_method(color_interpolation_method, color_syntax),
@@ -844,7 +968,7 @@ pub(crate) fn resolve_gradient_paint(
     gradient_value: &StyleValueData,
     tile_size: CssPixelSize,
 ) -> ResolvedGradientPaint {
-    resolve_gradient_paint_with_input(gradient_value, tile_size, &stop_color_resolution_input(style))
+    resolve_gradient_paint_with_input(gradient_value, tile_size, &ColorResolutionInput::for_style(style))
 }
 
 pub(crate) fn resolve_gradient_paint_with_input(
@@ -854,34 +978,38 @@ pub(crate) fn resolve_gradient_paint_with_input(
 ) -> ResolvedGradientPaint {
     let gradient_box = CssPixelRect::from_location_and_size(CssPixelPoint::default(), tile_size);
     match gradient_value {
-        StyleValueData::LinearGradient {
-            has_direction_value,
-            direction_value,
-            side_or_corner,
-            color_stop_list,
-            gradient_type,
-            repeating,
-            color_interpolation_method,
-            color_syntax,
-        } => ResolvedGradientPaint::Linear(resolve_linear_gradient_paint(
-            color_stop_list.as_slice(),
-            has_direction_value.then(|| direction_value.data()),
-            *side_or_corner,
-            *gradient_type,
-            *repeating,
-            color_interpolation_method,
-            *color_syntax,
-            tile_size,
-            color_input,
-        )),
-        StyleValueData::ConicGradient {
-            from_angle,
-            position,
-            color_stop_list,
-            repeating,
-            color_interpolation_method,
-            color_syntax,
-        } => {
+        StyleValueData::LinearGradient(linear_gradient_payload) => {
+            let LinearGradientPayload {
+                has_direction_value,
+                direction_value,
+                side_or_corner,
+                color_stop_list,
+                gradient_type,
+                repeating,
+                color_interpolation_method,
+                color_syntax,
+            } = &**linear_gradient_payload;
+            ResolvedGradientPaint::Linear(resolve_linear_gradient_paint(
+                color_stop_list.as_slice(),
+                has_direction_value.then(|| direction_value.data()),
+                *side_or_corner,
+                *gradient_type,
+                *repeating,
+                color_interpolation_method,
+                *color_syntax,
+                tile_size,
+                color_input,
+            ))
+        }
+        StyleValueData::ConicGradient(conic_gradient_payload) => {
+            let ConicGradientPayload {
+                from_angle,
+                position,
+                color_stop_list,
+                repeating,
+                color_interpolation_method,
+                color_syntax,
+            } = &**conic_gradient_payload;
             let (data, resolved_position) = resolve_conic_gradient_paint(
                 color_stop_list.as_slice(),
                 from_angle,
@@ -897,15 +1025,17 @@ pub(crate) fn resolve_gradient_paint_with_input(
                 position: resolved_position,
             }
         }
-        StyleValueData::RadialGradient {
-            ending_shape,
-            size,
-            position,
-            color_stop_list,
-            repeating,
-            color_interpolation_method,
-            color_syntax,
-        } => {
+        StyleValueData::RadialGradient(radial_gradient_payload) => {
+            let RadialGradientPayload {
+                ending_shape,
+                size,
+                position,
+                color_stop_list,
+                repeating,
+                color_interpolation_method,
+                color_syntax,
+                ..
+            } = &**radial_gradient_payload;
             let (data, center, gradient_size) = resolve_radial_gradient_paint(
                 color_stop_list.as_slice(),
                 *ending_shape,

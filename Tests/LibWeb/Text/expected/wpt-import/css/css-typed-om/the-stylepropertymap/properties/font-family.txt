@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 3 tests
+
+2 Pass
+1 Fail
+Pass	'font-family' does not support 'Georgia'
+Pass	'font-family' does not support '"Gill Sans"'
+Fail	'font-family' does not support 'sans-serif'

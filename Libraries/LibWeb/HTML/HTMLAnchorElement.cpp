@@ -36,9 +36,9 @@ void HTMLAnchorElement::attribute_changed(Utf16FlyString const& name, Optional<U
 
     if (name == HTML::AttributeNames::href) {
         href_content_attribute_changed();
-    } else if (name == HTML::AttributeNames::rel) {
+    } else if (!namespace_.has_value() && name == HTML::AttributeNames::rel) {
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+            m_rel_list->associated_attribute_changed(value);
     }
 }
 
@@ -49,6 +49,10 @@ bool HTMLAnchorElement::has_activation_behavior() const
 
 void HTMLAnchorElement::activation_behavior(Web::DOM::Event const& event)
 {
+    // INTEROP: Browsers do not follow a hyperlink that the user activates while it is being edited.
+    if (event.is_trusted() && is_editable_or_editing_host())
+        return;
+
     activate_the_hyperlink(event);
 }
 

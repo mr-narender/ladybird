@@ -39,10 +39,7 @@ protected:
 
 private:
     // https://dom.spec.whatwg.org/#concept-documentfragment-host
-    GC::Ptr<Element> m_host;
+    GC::Member<Element> m_host;
 };
-
-template<>
-inline bool Node::fast_is<DocumentFragment>() const { return is_document_fragment(); }
 
 }

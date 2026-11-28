@@ -22,6 +22,14 @@ test("literals in expressions", () => {
     expect(`foo ${"bar"}`).toBe("foo bar");
 });
 
+test("a single literal substitution becomes a string", () => {
+    expect(`${1}`).toBe("1");
+    expect(`${null}`).toBe("null");
+    expect(`${undefined}`).toBe("undefined");
+    expect(`${true}`).toBe("true");
+    expect(`${10n}`).toBe("10");
+});
+
 test("objects in expressions", () => {
     expect(`foo ${{}}`).toBe("foo [object Object]");
     expect(`foo ${{ bar: { baz: "qux" } }}`).toBe("foo [object Object]");
@@ -30,6 +38,56 @@ test("objects in expressions", () => {
 test("expressions at beginning of template literal", () => {
     expect(`${"foo"} bar baz`).toBe("foo bar baz");
     expect(`${"foo bar baz"}`).toBe("foo bar baz");
+});
+
+test("expressions of every kind, many times over", () => {
+    const object = { toString: () => "an object" };
+    const values = [
+        0,
+        7,
+        999,
+        1000,
+        100000,
+        -1,
+        -2147483648,
+        2147483647,
+        1.5,
+        -0,
+        NaN,
+        "",
+        "x",
+        "a longer string than most",
+    ];
+    values.push(true, null, undefined, 10n, object, [1, 2]);
+    const describe = value => `value ${value} of ${values.length}`;
+    for (let i = 0; i < 100; ++i) {
+        for (const value of values) {
+            const expected = "value " + String(value) + " of 20";
+            expect(describe(value)).toBe(expected);
+            expect(describe(value).length).toBe(expected.length);
+        }
+        expect(`${""}${""}`).toBe("");
+        expect(() => describe(Symbol())).toThrow(TypeError);
+    }
+});
+
+test("toString() of a substitution changing what the template literal read before", () => {
+    const object = { x: 1, value: 5 };
+    const bump = {
+        toString() {
+            object.x++;
+            return "bumped";
+        },
+    };
+    const read = (object, prefix) => {
+        const text = `${prefix}${object.x}${object.value}`;
+        return object.x;
+    };
+    for (let i = 0; i < 1000; ++i) {
+        object.value = i % 2 ? bump : i;
+        const expected = object.x + (i % 2);
+        expect(read(object, "prefix")).toBe(expected);
+    }
 });
 
 test("multiple template literals", () => {

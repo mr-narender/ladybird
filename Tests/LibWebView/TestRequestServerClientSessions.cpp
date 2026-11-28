@@ -4,34 +4,35 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
-#include <LibCore/Directory.h>
-#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SystemTheme.h>
-#include <LibMain/Main.h>
 #include <LibRequests/RequestClient.h>
 #include <LibRequests/RequestControlClient.h>
+#include <LibTest/TestCase.h>
+#include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowsingSession.h>
+#include <LibWebView/HSTSStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/ProcessManager.h>
+#include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/RequestServerManager.h>
+#include <LibWebView/RequestServerSiteBindings.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace {
 
-class TestApplication : public WebView::Application {
+class TestApplication : public Test::HeadlessApplication {
     WEB_VIEW_APPLICATION(TestApplication)
 
 public:
     explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
+        : Test::HeadlessApplication(move(ladybird_binary_path))
     {
     }
 
@@ -41,8 +42,6 @@ public:
         browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
         browser_options.allow_popups = WebView::AllowPopups::Yes;
     }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
 };
 
 // Connects a new RequestServer client the way the UI process does for its helpers, and asks RequestServer which ID
@@ -56,8 +55,8 @@ int client_id_of(Requests::RequestClient& client)
 
 int connect_request_server_client(WebView::BrowsingSession& session)
 {
-    auto handle = MUST(WebView::connect_new_request_server_client(session));
-    auto client = make_ref_counted<Requests::RequestClient>(MUST(handle.create_transport()));
+    auto connection = MUST(WebView::connect_new_request_server_client(session, RequestServer::SiteBinding::Bound));
+    auto client = make_ref_counted<Requests::RequestClient>(MUST(connection.handle.create_transport()));
     auto client_id = client->send_sync<Messages::RequestServer::GetClientId>()->client_id();
     s_clients.append(move(client));
     return client_id;
@@ -65,24 +64,42 @@ int connect_request_server_client(WebView::BrowsingSession& session)
 
 }
 
+TEST_CASE(request_server_snapshots_report_session_privacy)
+{
+    Test::HeadlessTestEnvironment environment { "TestRequestServerSnapshots"sv };
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
+
+    auto& manager = WebView::Application::request_server_manager();
+    auto& regular_session = WebView::Application::default_session();
+    auto private_session = WebView::Application::session_for_new_view(WebView::IsPrivate::Yes);
+    auto site = "https://example.com"_utf16;
+    (void)TRY_OR_FAIL(manager.instance_for_site(regular_session, site));
+    (void)TRY_OR_FAIL(manager.instance_for_site(*private_session, site));
+    (void)TRY_OR_FAIL(manager.browser_instance(*private_session));
+
+    auto snapshots = WebView::process_snapshots(WebView::Application::process_manager());
+    auto site_url = URL::Parser::basic_parse(site);
+    auto has_request_server = [&](Optional<URL::URL> const& url, WebView::IsPrivate is_private) {
+        auto match = snapshots.first_matching([&](auto const& snapshot) {
+            return snapshot.type == WebView::ProcessType::RequestServer && snapshot.site_url == url && snapshot.is_private == is_private;
+        });
+        return match.has_value();
+    };
+    for (auto is_private : { WebView::IsPrivate::No, WebView::IsPrivate::Yes }) {
+        EXPECT(has_request_server(site_url, is_private));
+        EXPECT(has_request_server({}, is_private));
+    }
+}
+
 // RequestServer asks the UI process for the cookies of a request by the ID of the client that made it. The UI process
 // uses the browsing session that it created the client for, so a client of a private session that has since been
 // restarted never gets the new session's cookies.
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(request_server_client_sessions)
 {
-    auto test_config_directory = ByteString::formatted("{}/Ladybird-TestRequestServerClientSessions-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_config_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_config_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_config_directory, FileSystem::RecursionMode::Allowed));
-    });
-    MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, test_config_directory, Core::Environment::Overwrite::Yes));
+    Test::HeadlessTestEnvironment environment { "TestRequestServerClientSessions"sv };
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
 
     auto normal_client = connect_request_server_client(WebView::Application::default_session());
     VERIFY(app->session_for_request_server_client(normal_client).ptr() == &WebView::Application::default_session());
@@ -90,7 +107,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     // The views of the first private session keep it alive after the user restarts private browsing.
     auto first_private_session = WebView::Application::session_for_new_view(WebView::IsPrivate::Yes);
     auto first_private_client = connect_request_server_client(*first_private_session);
-    auto first_ui_private_client = client_id_of(WebView::Application::request_server_client(WebView::IsPrivate::Yes));
+    auto first_ui_private_client = client_id_of(*TRY_OR_FAIL(WebView::Application::request_server_client(WebView::IsPrivate::Yes)));
     VERIFY(app->session_for_request_server_client(first_ui_private_client) == first_private_session);
 
     app->reset_private_browsing_session();
@@ -98,7 +115,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto second_private_client = connect_request_server_client(*second_private_session);
 
     // The UI process's own private client is replaced along with the session, so its requests use the new cookies.
-    auto second_ui_private_client = client_id_of(WebView::Application::request_server_client(WebView::IsPrivate::Yes));
+    auto second_ui_private_client = client_id_of(*TRY_OR_FAIL(WebView::Application::request_server_client(WebView::IsPrivate::Yes)));
     VERIFY(app->session_for_request_server_client(second_ui_private_client) == second_private_session);
 
     VERIFY(first_private_session.ptr() != second_private_session.ptr());
@@ -110,20 +127,20 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     // When RequestServer restarts, every WebContent process gets a replacement client. The one for a view of the old
     // private session must keep using that session's cookies.
-    auto theme = TRY(Gfx::load_system_theme(LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv).string()));
+    auto theme = TRY_OR_FAIL(Gfx::load_system_theme(LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv).string()));
     app->reset_private_browsing_session();
     auto old_private_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
-    auto& old_private_session = old_private_view->client().session();
+    auto& old_private_session = old_private_view->page().client().session();
     app->reset_private_browsing_session();
     auto new_private_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
-    auto& new_private_session = new_private_view->client().session();
+    auto& new_private_session = new_private_view->page().client().session();
     VERIFY(&old_private_session != &new_private_session);
 
     // Pages that a private view opens are private too, whether they share its process or get their own.
     Vector<bool> popups_are_private;
     auto open_popup = move(new_private_view->on_new_web_view);
-    new_private_view->on_new_web_view = [&](auto activate_tab, auto hints, WebView::WebContentClient& page_process, Optional<Web::PageId> page_index) {
-        auto handle = open_popup(activate_tab, hints, page_process, page_index);
+    new_private_view->on_new_web_view = [&](auto activate_tab, auto hints, WebView::CanonicalTraversable& traversable) {
+        auto handle = open_popup(activate_tab, hints, traversable);
         popups_are_private.append(WebView::ViewImplementation::find_view_by_handle(handle)->is_private() == WebView::IsPrivate::Yes);
         return handle;
     };
@@ -149,6 +166,81 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(app->session_for_request_server_client(disconnecting_client));
     s_clients.clear();
     Core::EventLoop::current().spin_until([&] { return !app->session_for_request_server_client(disconnecting_client); });
+
+    // A worker uses the cookies of the browsing session of the process it runs in, also one that a page's worker
+    // starts after the page's private session was restarted, whether or not the next private session has begun.
+    auto worker_owner_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
+    worker_owner_view->load_from_browser_ui(URL::Parser::basic_parse("data:text/html,<title>workers</title>"sv).release_value());
+    Core::EventLoop::current().spin_until([&] { return worker_owner_view->title() == "workers"sv; });
+    auto& worker_owner_session = worker_owner_view->page().client().session();
+    worker_owner_view->run_javascript(R"js(
+        const script = `
+            const nestedWorkers = [];
+            onmessage = () => {
+                const nestedWorker = new Worker("data:text/javascript,postMessage(0)");
+                nestedWorker.onmessage = () => postMessage(nestedWorkers.length);
+                nestedWorkers.push(nestedWorker);
+            };
+            postMessage(0);
+        `;
+        window.worker = new Worker(`data:text/javascript,${encodeURIComponent(script)}`);
+        worker.onmessage = event => document.title = `nested workers: ${event.data}`;
+    )js"_string);
+    auto wait_for_nested_workers = [&](size_t count) {
+        auto title = ByteString::formatted("nested workers: {}", count);
+        Core::EventLoop::current().spin_until([&] { return worker_owner_view->title() == title.view(); });
+    };
+    wait_for_nested_workers(0);
+
+    app->reset_private_browsing_session();
+    worker_owner_view->run_javascript("worker.postMessage(null);"_string);
+    wait_for_nested_workers(1);
+    auto next_private_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
+    VERIFY(&next_private_view->page().client().session() != &worker_owner_session);
+    worker_owner_view->run_javascript("worker.postMessage(null);"_string);
+    wait_for_nested_workers(2);
+
+    size_t worker_count = 0;
+    WebView::WorkerAgentManager::the().for_each_request_server_site_bindings([&](WebView::RequestServerSiteBindings& bindings) {
+        VERIFY(app->session_for_request_server_client(*bindings.client_id()).ptr() == &worker_owner_session);
+        ++worker_count;
+        return IterationDecision::Continue;
+    });
+    VERIFY(worker_count == 3);
     outln("PASS: RequestServer clients use the cookies of the browsing session they were created for");
-    return 0;
+}
+
+TEST_CASE(request_server_clients_look_up_known_hsts_hosts_of_their_session)
+{
+    Test::HeadlessTestEnvironment environment { "TestRequestServerKnownHSTSHosts"sv };
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
+
+    auto& normal_session = WebView::Application::default_session();
+    auto private_session = WebView::Application::session_for_new_view(WebView::IsPrivate::Yes);
+    normal_session.hsts_store->store_policy("normal.test"_string, { AK::Duration::from_seconds(3600), false });
+    private_session->hsts_store->store_policy("private.test"_string, { AK::Duration::from_seconds(3600), false });
+
+    auto connect_client = [](WebView::BrowsingSession& session) {
+        auto connection = MUST(WebView::connect_new_request_server_client(session, RequestServer::SiteBinding::Bound));
+        return make_ref_counted<Requests::RequestClient>(MUST(connection.handle.create_transport()));
+    };
+    auto look_up = [](Requests::RequestClient& client, String const& host) {
+        Optional<bool> answer;
+        client.look_up_known_hsts_host(host, [&](bool is_known) { answer = is_known; });
+        Core::EventLoop::current().spin_until([&] { return answer.has_value(); });
+        return *answer;
+    };
+
+    auto normal_client = connect_client(normal_session);
+    auto private_client = connect_client(*private_session);
+    EXPECT(look_up(*normal_client, "normal.test"_string));
+    EXPECT(!look_up(*normal_client, "private.test"_string));
+    EXPECT(look_up(*private_client, "private.test"_string));
+    EXPECT(!look_up(*private_client, "normal.test"_string));
+
+    auto& manager = WebView::Application::request_server_manager();
+    auto normal_instance = TRY_OR_FAIL(manager.browser_instance(normal_session));
+    auto& on_look_up = normal_instance->control_client().on_look_up_known_hsts_host;
+    EXPECT(!on_look_up(client_id_of(*normal_client), "unknown.test"_string));
+    EXPECT(on_look_up(client_id_of(*private_client), "unknown.test"_string));
 }

@@ -18,6 +18,12 @@ enum class NetworkError {
     TooManyRedirects,
     SSLHandshakeFailed,
     SSLVerificationFailed,
+    SSLSelfSignedCertificate,
+    SSLCertificateUnknownIssuer,
+    SSLCertificateExpired,
+    SSLCertificateNotYetValid,
+    SSLCertificateNameMismatch,
+    SSLCertificateInvalid,
     MalformedUrl,
     IncompleteContent,
     InvalidContentEncoding,
@@ -43,6 +49,18 @@ constexpr StringView network_error_to_string(NetworkError network_error)
         return "SSL handshake failed"sv;
     case NetworkError::SSLVerificationFailed:
         return "SSL verification failed"sv;
+    case NetworkError::SSLSelfSignedCertificate:
+        return "The server's certificate is self-signed"sv;
+    case NetworkError::SSLCertificateUnknownIssuer:
+        return "The server's certificate comes from an issuer that isn't trusted"sv;
+    case NetworkError::SSLCertificateExpired:
+        return "The server's certificate has expired"sv;
+    case NetworkError::SSLCertificateNotYetValid:
+        return "The server's certificate isn't valid yet"sv;
+    case NetworkError::SSLCertificateNameMismatch:
+        return "The server's certificate was issued for another site"sv;
+    case NetworkError::SSLCertificateInvalid:
+        return "The server's certificate is invalid"sv;
     case NetworkError::MalformedUrl:
         return "The URL is not formatted properly"sv;
     case NetworkError::IncompleteContent:

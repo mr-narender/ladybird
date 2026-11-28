@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
-<script src="layout-test.js"></script>
+<script src="work-test.js"></script>
 <style>
     body { margin: 0; }
     #spacer { height: 30px; }
@@ -24,7 +24,7 @@
                     layout FULL
                       @viewport/block RUN (cache=bypass)
                         BlockContainer<HTML>/block RUN (cache=miss)
-                          BlockContainer<DIV>#cached/block REUSE SUBTREE
+                          BlockContainer(anonymous) REUSE IN-FLOW SUBTREE
                 `,
                 check: equal => {
                     const rect = cached.getBoundingClientRect();

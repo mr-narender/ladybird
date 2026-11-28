@@ -6,26 +6,25 @@
     // This page is served over HTTP so that the iframe's first document is same site with it.
     promiseTest(async () => {
         const httpServer = httpTestServer();
-        const runId = crypto.randomUUID();
 
         const firstUrl = new URL(
-            await httpServer.createEcho("GET", `/local-handoff-first-${runId}`, {
+            await httpServer.createEcho("GET", "/local-handoff-first", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
-                    addEventListener("unload", () => { document.cookie = "unloadPing=1; path=/"; });
-                    document.cookie = "loaded=1; path=/";
+                    addEventListener("unload", () => { document.cookie = "unloadPing=1; path=/; SameSite=None; Secure"; });
+                    document.cookie = "loaded=1; path=/; SameSite=None; Secure";
                 <\/script>`,
             })
         );
 
         const secondUrl = new URL(
-            await httpServer.createEcho("GET", `/local-handoff-second-${runId}`, {
+            await httpServer.createEcho("GET", "/local-handoff-second", {
                 status: 200,
                 headers: { "Content-Type": "text/html" },
                 body: `<!DOCTYPE html><script>
                     const firstUnloaded = internals.hasCookieForURL(${JSON.stringify(firstUrl.href)}, "unloadPing", "1");
-                    document.cookie = "order=" + (firstUnloaded ? "unload-first" : "activate-first") + "; path=/";
+                    document.cookie = "order=" + (firstUnloaded ? "unload-first" : "activate-first") + "; path=/; SameSite=None; Secure";
                 <\/script>`,
             })
         );

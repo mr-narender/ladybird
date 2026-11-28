@@ -11,16 +11,16 @@
 
 namespace GC {
 
-template<typename T>
+template<typename T, bool IsOrdered = false>
 class WeakHashSet {
     struct InternalTraits : public DefaultTraits<Weak<T>> {
         static unsigned hash(Weak<T> const& value)
         {
-            return Traits<T*>::hash(value.ptr().ptr());
+            return weak_key_hash(value.ptr().ptr());
         }
     };
 
-    using TableType = HashTable<Weak<T>, InternalTraits>;
+    using TableType = HashTable<Weak<T>, InternalTraits, IsOrdered>;
 
 public:
     WeakHashSet() = default;
@@ -34,7 +34,7 @@ public:
     bool remove(T& value)
     {
         maybe_prune();
-        auto it = m_table.find(Traits<T*>::hash(&value), [&](auto& entry) { return entry.ptr().ptr() == &value; });
+        auto it = m_table.find(weak_key_hash(&value), [&](auto& entry) { return entry.ptr().ptr() == &value; });
         if (it == m_table.end())
             return false;
         m_table.remove(it);
@@ -43,7 +43,7 @@ public:
 
     bool contains(T& value) const
     {
-        auto it = m_table.find(Traits<T*>::hash(&value), [&](auto& entry) { return entry.ptr().ptr() == &value; });
+        auto it = m_table.find(weak_key_hash(&value), [&](auto& entry) { return entry.ptr().ptr() == &value; });
         return it != m_table.end();
     }
 
@@ -152,5 +152,8 @@ private:
     TableType m_table;
     size_t m_mutations_since_last_prune { 0 };
 };
+
+template<typename T>
+using OrderedWeakHashSet = WeakHashSet<T, true>;
 
 }

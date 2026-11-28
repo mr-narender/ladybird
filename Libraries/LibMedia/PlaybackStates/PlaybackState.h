@@ -19,6 +19,8 @@ enum class PlaybackState : u8 {
     Suspended,
     Seeking,
     Ended,
+    // Only RemotePlaybackManager enters this, until the server decides whether a seek goes ahead.
+    BeginningSeek,
 };
 
 constexpr StringView playback_state_to_string(PlaybackState state)
@@ -34,6 +36,8 @@ constexpr StringView playback_state_to_string(PlaybackState state)
         return "Paused"sv;
     case PlaybackState::Suspended:
         return "Suspended"sv;
+    case PlaybackState::BeginningSeek:
+        return "BeginningSeek"sv;
     case PlaybackState::Seeking:
         return "Seeking"sv;
     case PlaybackState::Ended:
@@ -47,7 +51,7 @@ constexpr StringView playback_state_to_string(PlaybackState state)
 namespace AK {
 
 template<>
-struct Formatter<Media::PlaybackState> final : Formatter<StringView> {
+struct Formatter<Media::PlaybackState> : Formatter<StringView> {
     ErrorOr<void> format(FormatBuilder& builder, Media::PlaybackState state)
     {
         return Formatter<StringView>::format(builder, Media::playback_state_to_string(state));

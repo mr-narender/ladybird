@@ -7,6 +7,7 @@
 
 #include <LibTest/TestCase.h>
 #include <LibWebView/Autocomplete.h>
+#include <LibWebView/AutocompleteMuxer.h>
 #include <LibWebView/SearchEngine.h>
 #include <LibWebView/URL.h>
 
@@ -81,14 +82,28 @@ static void expect_context_menu_text_not_url(StringView text)
     EXPECT(!WebView::url_from_text(text).has_value());
 }
 
+static WebView::AutocompleteSuggestion typed_text_row(StringView text)
+{
+    WebView::AutocompleteSuggestion row;
+    row.source = WebView::AutocompleteSuggestionSource::LiteralURL;
+    row.text = MUST(String::from_utf8(text));
+    return row;
+}
+
+static bool autocomplete_rows_go_to_the_same_place(StringView left, StringView right)
+{
+    auto right_row = typed_text_row(right);
+    return WebView::index_of_suggestion_with_same_destination(typed_text_row(left), { &right_row, 1 }).has_value();
+}
+
 static void expect_autocomplete_urls_match(StringView left, StringView right)
 {
-    EXPECT(WebView::autocomplete_urls_match(left, right));
+    EXPECT(autocomplete_rows_go_to_the_same_place(left, right));
 }
 
 static void expect_autocomplete_urls_do_not_match(StringView left, StringView right)
 {
-    EXPECT(!WebView::autocomplete_urls_match(left, right));
+    EXPECT(!autocomplete_rows_go_to_the_same_place(left, right));
 }
 
 static void expect_autocomplete_url_can_complete(StringView query, StringView suggestion)
@@ -242,11 +257,11 @@ TEST_CASE(location_to_search_or_url)
     expect_url_equals_sanitized_url("https://example.com/some%20cool%20page"sv, "https://example.com/some cool page"sv);
     expect_url_equals_sanitized_url("https://example.com/%22what%22"sv, "https://example.com/\"what\""sv);
 
-    expect_url_equals_sanitized_url("https://example.org/"sv, "example.org"sv);            // Valid domain.
-    expect_url_equals_sanitized_url("https://example.abc/"sv, "example.abc"sv);            // .abc is a recognized TLD.
-    expect_url_equals_sanitized_url("https://example.test/path"sv, "example.test/path"sv); // Reserved TLDs.
-    expect_url_equals_sanitized_url("https://example.example/path"sv, "example.example/path"sv);
-    expect_url_equals_sanitized_url("https://example.invalid/path"sv, "example.invalid/path"sv);
+    expect_url_equals_sanitized_url("https://example.org/"sv, "example.org"sv);           // Valid domain.
+    expect_url_equals_sanitized_url("https://example.abc/"sv, "example.abc"sv);           // .abc is a recognized TLD.
+    expect_url_equals_sanitized_url("http://example.test/path"sv, "example.test/path"sv); // Reserved TLDs get the http guess below.
+    expect_url_equals_sanitized_url("http://example.example/path"sv, "example.example/path"sv);
+    expect_url_equals_sanitized_url("http://example.invalid/path"sv, "example.invalid/path"sv);
     expect_url_equals_sanitized_url("http://example.localhost/path"sv, "example.localhost/path"sv); // .localhost names get the http guess below.
 
     expect_search_url_equals_sanitized_url("example.def"sv); // Invalid domain but no scheme: search (Like Firefox or Chrome).
@@ -268,6 +283,11 @@ TEST_CASE(location_to_search_or_url)
     expect_url_equals_sanitized_url("http://[::1]:8000/"sv, "[::1]:8000"sv);
     expect_url_equals_sanitized_url("http://0.0.0.0:8000/"sv, "0.0.0.0:8000"sv); // The unspecified address reaches loopback in practice.
 
+    // Numbers that the URL parser would read as abbreviated IPv4 addresses are searched for instead.
+    expect_search_url_equals_sanitized_url("127"sv);
+    expect_search_url_equals_sanitized_url("2026"sv);
+    expect_search_url_equals_sanitized_url("1.5"sv);
+
     // Private-use and link-local addresses also get the http guess. Like loopback hosts, they can't obtain publicly-
     // trusted TLS certs.
     expect_url_equals_sanitized_url("http://192.168.0.42:8000/"sv, "192.168.0.42:8000"sv);
@@ -277,6 +297,18 @@ TEST_CASE(location_to_search_or_url)
     expect_url_equals_sanitized_url("http://169.254.1.1/"sv, "169.254.1.1"sv);
     expect_url_equals_sanitized_url("http://[fe80::1]/"sv, "[fe80::1]"sv);
     expect_url_equals_sanitized_url("http://[fd00::1]:8080/"sv, "[fd00::1]:8080"sv);
+
+    // Names without a known public suffix only resolve on a local network or the machine itself, so they get http.
+    expect_url_equals_sanitized_url("http://devbox:8080/"sv, "devbox:8080"sv);
+    expect_url_equals_sanitized_url("http://nas.local:8080/"sv, "nas.local:8080"sv);
+    expect_url_equals_sanitized_url("http://box.internal:3000/"sv, "box.internal:3000"sv);
+    expect_url_equals_sanitized_url("http://router.lan:8080/path"sv, "router.lan:8080/path"sv);
+    expect_url_equals_sanitized_url("http://box.localdomain:8000/"sv, "box.localdomain:8000"sv);
+    // Without a port, such a name is still a search.
+    expect_search_url_equals_sanitized_url("nas.local"sv);
+    // A name under a known public suffix keeps the https guess, with a port too: home.arpa is on the list.
+    expect_url_equals_sanitized_url("https://example.org:8080/"sv, "example.org:8080"sv);
+    expect_url_equals_sanitized_url("https://printer.home.arpa:631/"sv, "printer.home.arpa:631"sv);
 
     // Addresses just outside those ranges keep the https guess.
     expect_url_equals_sanitized_url("https://172.32.0.1/"sv, "172.32.0.1"sv);
@@ -310,11 +342,30 @@ TEST_CASE(location_to_search_or_url)
 
     expect_search_url_equals_sanitized_url("whatever:example.com"sv);
     expect_search_url_equals_sanitized_url("site:example.com"sv);
-    expect_url_equals_sanitized_url("https://host:8080/"sv, "host:8080"sv);
+    expect_url_equals_sanitized_url("https://host:8080/"sv, "host:8080"sv); // .host is a top-level domain, so this keeps the https guess.
     expect_search_url_equals_sanitized_url("steam://launch/1536610"sv);
     expect_search_url_equals_sanitized_url("mailto:hello@example.com"sv);
     expect_search_url_equals_sanitized_url("geo:23.4,12.4"sv);
     expect_search_url_equals_sanitized_url("javascript:alert(1)"sv);
+}
+
+TEST_CASE(abbreviated_ipv4_user_input)
+{
+    for (auto input : { "127\\notes"sv, "127\\notes:8000"sv, "0x7f"sv, "0X7F"sv, "0x7f.1"sv, "127.0x1/path"sv, "0177"sv, "%31%32%37"sv, "127.0.0.1."sv }) {
+        expect_search_url_equals_sanitized_url(input);
+        expect_user_input_classification(input, WebView::UserInputClassification::Search);
+        expect_location_does_not_look_like_url(input);
+        expect_context_menu_text_not_url(input);
+    }
+
+    // A complete address, an explicit scheme or a port still requests navigation.
+    expect_url_equals_sanitized_url("http://127.0.0.1/notes"sv, "127.0.0.1\\notes"sv);
+    expect_url_equals_sanitized_url("http://127.0.0.1/"sv, "0x7f.0.0.1"sv);
+    expect_url_equals_sanitized_url("https://0.0.0.127/"sv, "https://0x7f"sv);
+    expect_url_equals_sanitized_url("http://0.0.0.127:8000/"sv, "0x7f:8000"sv);
+    expect_url_equals_sanitized_url("http://0.0.0.127:8000/notes"sv, "0x7f:8000\\notes"sv);
+    expect_context_menu_text_url("0x7f.0.0.1"sv, "http://127.0.0.1/"sv);
+    expect_url_equals_sanitized_url("http://0x7f.example/"sv, "0x7f.example"sv);
 }
 
 TEST_CASE(classify_user_input)
@@ -360,6 +411,8 @@ TEST_CASE(location_looks_like_url)
     expect_location_does_not_look_like_url("example.org hello"sv);
     expect_location_does_not_look_like_url("example.def"sv);
     expect_location_does_not_look_like_url("javascript://alert"sv);
+    expect_location_does_not_look_like_url("f"sv);
+    expect_location_does_not_look_like_url("cafe"sv);
 
     expect_location_looks_like_url("example"sv, WebView::AppendTLD::Yes);
 }
@@ -379,14 +432,21 @@ TEST_CASE(context_menu_url_text)
     expect_context_menu_text_not_url("192.168"sv);
     expect_context_menu_text_not_url("192.168.0"sv);
     expect_context_menu_text_not_url("192.168.0.999"sv);
+    expect_context_menu_text_not_url("12:30"sv);
     expect_context_menu_text_not_url("./Meta/ladybird.py"sv);
     expect_context_menu_text_not_url("../ladybird.org"sv);
     expect_context_menu_text_not_url("/tmp/ladybird.org"sv);
+    expect_context_menu_text_not_url("\\example.com"sv);
+    expect_context_menu_text_not_url("\\127.0.0.1"sv);
+    expect_context_menu_text_not_url(":8080/foo"sv);
+    expect_context_menu_text_not_url("?x"sv);
+    expect_context_menu_text_not_url("#top"sv);
 }
 
 TEST_CASE(autocomplete_url_matching)
 {
-    expect_autocomplete_urls_match("example.com/path?q=1"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_match("example.com/path?q=1#fragment"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_match("https://example.com/page#:~:text=target"sv, "https://example.com/page#:~:text=target"sv);
 
     expect_autocomplete_urls_do_not_match("google.com"sv, "https://www.google.com/"sv);
     expect_autocomplete_urls_do_not_match("http://example.com"sv, "https://example.com/"sv);
@@ -394,6 +454,9 @@ TEST_CASE(autocomplete_url_matching)
     expect_autocomplete_urls_do_not_match("https://example.com"sv, "https://example.com:8443"sv);
     expect_autocomplete_urls_do_not_match("hello"sv, "https://hello.example/"sv);
     expect_autocomplete_urls_do_not_match("steam://launch/1536610"sv, "https://steam://launch/1536610"sv);
+    expect_autocomplete_urls_do_not_match("example.com/path?q=1"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_do_not_match("https://example.com/page"sv, "https://example.com/page#:~:text=target"sv);
+    expect_autocomplete_urls_do_not_match("https://example.com/page#section"sv, "https://example.com/page#section:~:text=target"sv);
 }
 
 TEST_CASE(autocomplete_url_completion)
@@ -402,6 +465,7 @@ TEST_CASE(autocomplete_url_completion)
     expect_autocomplete_url_can_complete("reddit.co"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_can_complete("https://reddit.co"sv, "https://www.reddit.com/"sv);
     expect_autocomplete_url_can_complete("www.reddit.co"sv, "https://www.reddit.com/"sv);
+    expect_autocomplete_url_can_complete("example.com/page#sec"sv, "https://example.com/page#section"sv);
 
     expect_autocomplete_url_cannot_complete("reddit.com"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_cannot_complete("reddit.co"sv, "https://reddit.co/"sv);
@@ -425,4 +489,29 @@ TEST_CASE(autocomplete_suggestion_display_text)
     search_suggestion.source = WebView::AutocompleteSuggestionSource::Search;
     search_suggestion.text = "https://example.com/"_string;
     EXPECT_EQ(WebView::autocomplete_suggestion_display_text(search_suggestion), "https://example.com/"sv);
+}
+
+TEST_CASE(search_query_percent_encoding)
+{
+    expect_url_equals_sanitized_url("https://ecosia.org/search?q=a%26b"sv, "a&b"sv);
+    expect_url_equals_sanitized_url("https://ecosia.org/search?q=c%2B%2B"sv, "c++"sv);
+    expect_url_equals_sanitized_url("https://ecosia.org/search?q=100%25%20of%20%2441"sv, "100% of $41"sv);
+    expect_url_equals_sanitized_url("https://ecosia.org/search?q=a%2Cb%20%2341"sv, "a,b #41"sv);
+
+    WebView::SearchEngine engine_with_suggestions {
+        .name = "Test"_string,
+        .query_url = "https://ecosia.org/search?q=%s"_string,
+        .suggestions_url = "https://ac.ecosia.org/autocomplete?q=%s&type=list"_string,
+    };
+    auto suggestions_url = engine_with_suggestions.suggestions_url_for_query("a&b"sv);
+    EXPECT(suggestions_url.has_value());
+    EXPECT_EQ(suggestions_url->to_string(), "https://ac.ecosia.org/autocomplete?q=a%26b&type=list"sv);
+}
+
+TEST_CASE(search_query_display_truncation)
+{
+    EXPECT_EQ(s_test_engine.format_search_query_for_display("short"sv), "Search Test for “short”"sv);
+
+    // The 32nd byte falls in the middle of the first "é".
+    EXPECT_EQ(s_test_engine.format_search_query_for_display("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaéé"sv), "Search Test for “aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé…”"sv);
 }

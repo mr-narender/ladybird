@@ -9,8 +9,9 @@
 *.cflags
 *.cxxflags
 *.autosave
-build*/
-Build*/
+# Build directories live at the root of the tree (see Meta/CMake/presets), and source directories may have such names.
+/build*/
+/Build*/
 target/
 # ...but Flap's backend sources live in a directory of that name.
 !Libraries/LibJS/Flap/src/target/
@@ -35,13 +36,6 @@ output/
 .venv/
 .venv*/
 venv*/
-
-# Gradle/AndroidStudio
-.gradle/
-.cxx/
-local.properties
-# We can't build from cmd.exe anyway
-gradlew.bat
 
 Libraries/LibWasm/Tests/Fixtures/SpecTests
 Libraries/LibWasm/Tests/Spec

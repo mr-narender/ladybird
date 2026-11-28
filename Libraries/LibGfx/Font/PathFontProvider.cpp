@@ -8,6 +8,7 @@
 #include <AK/Endian.h>
 #include <AK/Format.h>
 #include <AK/LexicalPath.h>
+#include <LibCore/MappedFile.h>
 #include <LibCore/Resource.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibGfx/Font/Font.h>
@@ -46,6 +47,15 @@ void PathFontProvider::load_all_fonts_from_uri(StringView uri)
         auto& family = m_typeface_by_family.ensure(font->family(), [] {
             return Vector<NonnullRefPtr<Typeface>> {};
         });
+        // A face of text goes ahead of the faces of symbol fonts in its family, so that it's the one found for its
+        // weight, width and slope.
+        if (!font->description().is_symbol_font()) {
+            auto index = family.find_first_index_if([](auto const& typeface) { return typeface->description().is_symbol_font(); });
+            if (index.has_value()) {
+                family.insert(*index, move(font));
+                return;
+            }
+        }
         family.append(move(font));
     });
 }
@@ -62,7 +72,7 @@ void PathFontProvider::for_each_typeface_in_uri(StringView uri, HashTable<String
     }
     auto root = root_or_error.release_value();
 
-    root->for_each_descendant_file([&](Core::Resource const& resource) -> IterationDecision {
+    root->for_each_descendant_file([&](Core::Resource& resource) -> IterationDecision {
         auto uri = resource.uri();
         auto path = LexicalPath(uri.bytes_as_string_view());
         auto is_truetype = path.has_extension(".ttf"sv) || path.has_extension(".ttc"sv) || path.has_extension(".otf"sv);
@@ -82,9 +92,12 @@ void PathFontProvider::for_each_typeface_in_uri(StringView uri, HashTable<String
 
         if (is_truetype) {
             auto font_count = number_of_fonts_in_ttc(resource.data());
+            auto backing = make_ref_counted<Typeface::FontDataBacking>(resource.release_mapped_file());
             for (u32 ttc_index = 0; ttc_index < font_count; ++ttc_index) {
-                if (auto font_or_error = Typeface::try_load_from_resource(resource, ttc_index); !font_or_error.is_error()) {
-                    callback(filesystem_path, ttc_index, FontFileFormat::OpenType, font_or_error.release_value());
+                if (auto font_or_error = Typeface::try_load_from_font_data(backing, ttc_index); !font_or_error.is_error()) {
+                    auto font = font_or_error.release_value();
+                    font->set_file_path(filesystem_path);
+                    callback(filesystem_path, ttc_index, FontFileFormat::OpenType, move(font));
                 }
             }
         } else {

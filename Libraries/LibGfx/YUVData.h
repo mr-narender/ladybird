@@ -11,15 +11,10 @@
 #include <AK/Span.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
-#include <LibMedia/Color/CodingIndependentCodePoints.h>
-#include <LibMedia/Subsampling.h>
-
-class SkYUVAPixmaps;
-enum SkYUVColorSpace : int;
+#include <LibMediaCodecs/Color/CodingIndependentCodePoints.h>
+#include <LibMediaCodecs/Subsampling.h>
 
 namespace Gfx {
-
-SkYUVColorSpace skia_yuv_color_space(Media::CodingIndependentCodePoints);
 
 // A non-owning view of planar YUV data with the metadata needed for conversion to RGB.
 // The plane memory's lifetime is guaranteed by the object handing out the view
@@ -51,8 +46,6 @@ public:
 
     ErrorOr<NonnullRefPtr<Bitmap>> to_bitmap() const;
 
-    SkYUVAPixmaps make_pixmaps() const;
-
 private:
     YUVData(IntSize size, u8 bit_depth, Media::Subsampling, Media::CodingIndependentCodePoints, Bytes y_data, Bytes u_data, Bytes v_data);
 
@@ -71,7 +64,9 @@ struct BiplanarYUVPlane {
     size_t stride;
 };
 
-// Converts NV12 pixels, or P010 for bit depths above 8, the 4:2:0 layouts hardware decoders hand back.
-ErrorOr<NonnullRefPtr<Bitmap>> biplanar_yuv_to_bitmap(IntSize, u8 bit_depth, Media::CodingIndependentCodePoints, BiplanarYUVPlane luma, BiplanarYUVPlane chroma);
+// Converts the bi-planar layouts hardware decoders hand back, such as NV12, or P010 for bit depths above 8. Samples deeper
+// than 8 bits sit in the high bits of each 16-bit component. Every row of each plane, the last included, must be
+// padded up to its stride.
+ErrorOr<NonnullRefPtr<Bitmap>> biplanar_yuv_to_bitmap(IntSize, u8 bit_depth, Media::Subsampling, Media::CodingIndependentCodePoints, BiplanarYUVPlane luma, BiplanarYUVPlane chroma);
 
 }

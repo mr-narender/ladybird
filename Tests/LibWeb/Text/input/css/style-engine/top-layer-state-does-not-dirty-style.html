@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <style>
     #popover { color: rgb(1, 2, 3); }
     #popover:popover-open { color: rgb(4, 5, 6); }
@@ -8,33 +9,21 @@
 <script>
     test(() => {
         const popover = document.getElementById("popover");
-        internals.updateStyle();
+        const output = [];
+        const restyledNames = work => `[${work.restyled().map(shortStyleName).join(", ")}]`;
+        let color;
+        const readColor = () => styleWork(() => color = getComputedStyle(popover).color, internals, { flush: false });
 
-        internals.resetStyleInvalidationCounters();
-        popover.showPopover();
-        internals.updateStyle();
-        const shownUpdateCounters = internals.getStyleInvalidationCounters();
-        const shownColor = getComputedStyle(popover).color;
-        const shownReadCounters = internals.getStyleInvalidationCounters();
+        output.push(`shown restyled: ${restyledNames(styleWork(() => popover.showPopover()))}`);
+        const shownRead = readColor();
+        output.push("shown color: " + color);
+        output.push(`shown read restyled: ${restyledNames(shownRead)}`);
 
-        popover.hidePopover();
-        internals.updateStyle();
-        const hiddenUpdateCounters = internals.getStyleInvalidationCounters();
-        const hiddenColor = getComputedStyle(popover).color;
-        const hiddenReadCounters = internals.getStyleInvalidationCounters();
-
-        println("shown color: " + shownColor);
-        println("shown reaction batch runs: " + shownUpdateCounters.styleEngineReactionBatchRuns);
-        println("shown reaction elements: " + shownUpdateCounters.styleEngineReactionElements);
-        println("shown published reactions: " + shownUpdateCounters.styleEnginePublishedReactions);
-        println("shown recomputations: " + shownUpdateCounters.elementStyleRecomputations);
-        println("shown read recomputations: " + (shownReadCounters.elementStyleRecomputations - shownUpdateCounters.elementStyleRecomputations));
-        println("hidden color: " + hiddenColor);
-        println("hidden reaction batch runs: " + (hiddenUpdateCounters.styleEngineReactionBatchRuns - shownReadCounters.styleEngineReactionBatchRuns));
-        println("hidden reaction elements: " + (hiddenUpdateCounters.styleEngineReactionElements - shownReadCounters.styleEngineReactionElements));
-        println("hidden published reactions: " + (hiddenUpdateCounters.styleEnginePublishedReactions - shownReadCounters.styleEnginePublishedReactions));
-        // Record verification can materialize the hidden style before this reaction.
-        println("hidden recomputations within budget: " + (hiddenUpdateCounters.elementStyleRecomputations - shownReadCounters.elementStyleRecomputations <= 1));
-        println("hidden read recomputations: " + (hiddenReadCounters.elementStyleRecomputations - hiddenUpdateCounters.elementStyleRecomputations));
+        output.push(`hidden restyled: ${restyledNames(styleWork(() => popover.hidePopover()))}`);
+        const hiddenRead = readColor();
+        output.push("hidden color: " + color);
+        output.push(`hidden read restyled: ${restyledNames(hiddenRead)}`);
+        for (const line of output)
+            println(line);
     });
 </script>

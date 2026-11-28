@@ -6,10 +6,23 @@
 
 #pragma once
 
+namespace Gfx {
+
+class PaintingSurface;
+class SkiaBackendContext;
+
+}
+
 namespace Compositor {
 
+class CanvasHost;
+class CanvasSurfaceRegistry;
 class ConnectionFromClient;
+class ConnectionFromPresentation;
 class ConnectionFromWebContent;
 class CompositorState;
+class DisplayListPlayerSkia;
+class DisplayListRasterCache;
+class OwnedCanvasSurfaces;
 
 }

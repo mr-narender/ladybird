@@ -1,0 +1,3 @@
+plain: restyled [], rotate(45deg)
+inactive: restyled [], rotate(45deg)
+ordinary: restyled [ordinary], rotate(45deg)

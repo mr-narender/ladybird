@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16View.h>
@@ -136,7 +137,11 @@ public:
     bool autocorrect() const;
     void set_autocorrect(bool);
 
-    bool fire_a_synthetic_pointer_event(Utf16FlyString const& type, DOM::Element& target, bool not_trusted);
+    enum class NotTrusted {
+        No,
+        Yes,
+    };
+    static bool fire_a_synthetic_pointer_event(Utf16FlyString const& type, DOM::Element& target, NotTrusted not_trusted, u32 modifiers = 0);
 
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const { return is_form_associated_custom_element(); }
@@ -144,6 +149,12 @@ public:
     GC::Ptr<DOM::NodeList> labels();
 
     virtual Optional<ARIA::Role> default_role() const override;
+    virtual Optional<Utf16String> default_aria_state_or_property_value(Utf16FlyString const&) const override;
+    Optional<GC::RootVector<GC::Ref<DOM::Element>>> default_aria_state_or_property_elements(Utf16FlyString const&) const;
+
+    // https://html.spec.whatwg.org/multipage/custom-elements.html#internal-content-attribute-map
+    OrderedHashMap<Utf16FlyString, Utf16String>& internal_content_attribute_map();
+    Optional<Utf16String> internal_content_attribute(Utf16FlyString const&) const;
 
     WebIDL::ExceptionOr<GC::Ref<ElementInternals>> attach_internals();
 
@@ -187,6 +198,11 @@ public:
     // https://html.spec.whatwg.org/multipage/rendering.html#button-layout
     virtual bool uses_button_layout() const { return false; }
 
+    // https://drafts.csswg.org/css-ui/#devolvable
+    // https://html.spec.whatwg.org/multipage/rendering.html#button-layout
+    // When an element uses button layout, it is a devolvable widget [...]
+    virtual bool is_devolvable_widget() const { return uses_button_layout(); }
+
     WebIDL::UnsignedLong computed_heading_level() const;
     WebIDL::UnsignedLong computed_heading_offset() const;
 
@@ -204,6 +220,11 @@ protected:
 
     [[nodiscard]] Utf16String get_the_text_steps();
 
+    static void set_own_inline_style(DOM::Element&, CSS::CSSStyleProperties const& defaults);
+
+    // Gives the slider track of a progress or meter element the style of the element's appearance.
+    void update_slider_track_style(DOM::Element& slider_track) const;
+
 private:
     struct RareData;
     virtual OwnPtr<DOM::Node::RareData> create_rare_data() const override;
@@ -214,8 +235,6 @@ private:
     virtual FormAssociatedElement::RareData* form_associated_rare_data() override;
     virtual FormAssociatedElement::RareData const* form_associated_rare_data() const override;
     virtual FormAssociatedElement::RareData& ensure_form_associated_rare_data() override;
-
-    virtual bool is_html_element() const final { return true; }
 
     // ^FormAssociatedElement
     virtual HTMLElement& form_associated_element_to_html_element() override { return *this; }
@@ -253,12 +272,5 @@ private:
     // https://html.spec.whatwg.org/multipage/popover.html#popover-showing-or-hiding
     bool m_popover_showing_or_hiding { false };
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLElement>() const { return is_html_element(); }
 
 }

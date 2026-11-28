@@ -16,9 +16,6 @@
 #include <AK/ThreadID.h>
 #include <AK/Time.h>
 #include <LibCore/Forward.h>
-#include <LibMedia/CodedFrame.h>
-#include <LibMedia/DecoderError.h>
-#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
@@ -28,7 +25,11 @@
 #include <LibMedia/SynchronizedWakeHandler.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoDecoder.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/DecoderError.h>
+#include <LibMediaCodecs/NonReferenceFrameDetector.h>
+#include <LibMediaCodecs/VideoDecoder.h>
+#include <LibMediaCodecs/VideoDecoderRegistry.h>
 
 namespace Media {
 
@@ -52,16 +53,22 @@ public:
     ~DecodedVideoProducer();
 
     void set_error_handler(ErrorHandler&&);
-    void set_read_blocked_change_handler(ReadBlockedChangeHandler);
 
     virtual void start() override;
+    virtual void suspend() override;
 
     virtual VideoProducerOutput peek() override;
     virtual void consume() override;
     virtual void set_wake_handler(PipelineWakeHandler) override;
 
+    // Called once a blocked read is able to continue, after the producer has stopped reporting Blocked. It runs on the
+    // thread that delivered the data, under the demuxer's lock, so it must not block or take other locks.
+    void set_read_unblocked_handler(Function<void()>);
+    // Callable from any thread.
+    void set_checkpoint(PipelineCheckpoint);
+
     AK::Duration select_fast_seek_target(AK::Duration timestamp, SeekMode);
-    virtual void seek(AK::Duration timestamp) override;
+    virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
 
 private:
     class ThreadData final : public AtomicRefCounted<ThreadData> {
@@ -70,16 +77,19 @@ private:
         ~ThreadData();
 
         void set_error_handler(ErrorHandler&&);
-        void set_read_blocked_change_handler(ReadBlockedChangeHandler);
         void set_wake_handler(PipelineWakeHandler);
 
         void start();
+        void suspend();
         VideoDecoderSelection select_decoder_for_frame(CodedFrame const&, VideoDecoderSelection after = {}) const;
         void replace_decoder_once_drained(CodedFrame const&, DecodeIntent);
         DecoderErrorOr<void> receive_into_decoder(CodedFrame const&, DecodeIntent);
         DecoderErrorOr<void> create_decoder_for_frame(CodedFrame const&);
         DecoderErrorOr<void> receive_coded_frame(CodedFrame const&, DecodeIntent);
         DecoderErrorOr<bool> replace_drained_decoder();
+        bool check_if_seek_is_needed_or_allow_demuxer_reads(u32 seek_id);
+        void note_whether_decoder_has_decode_in_progress();
+        void wait_for_another_seek_or_exit(u32 seek_id);
         void release_decoder();
         void exit();
 
@@ -89,27 +99,35 @@ private:
         VideoProducerOutput peek_while_locked();
         void consume();
 
-        void seek(AK::Duration timestamp);
+        void seek(AK::Duration timestamp, InvalidateHeldData);
         AK::Duration select_fast_seek_target(AK::Duration target, SeekMode) const;
+        void set_read_unblocked_handler(Function<void()>);
+        void set_checkpoint(PipelineCheckpoint);
 
         void register_decode_thread();
         void wait_for_start();
-        bool should_thread_exit_while_locked() const;
+        bool should_break_out_of_loop_while_locked() const;
         bool should_thread_exit() const;
         bool handle_auto_suspension();
         template<typename Invokee>
         void invoke_on_main_thread_while_locked(Invokee);
         void queue_frame(NonnullRefPtr<VideoFrame> const&);
         void dispatch_error(DecoderError&&);
-        bool handle_seek();
+        void handle_seek();
         void resolve_seek(u32 seek_id);
+        bool seek_to_resubmit_if_decoder_lost_its_state(DecoderError const&);
+        bool seek_to_replace_decoder_if_it_cannot_decode_the_stream(DecoderError const&);
+        void seek_to_resubmit_while_locked();
         bool is_within_available_range_while_locked(AK::Duration) const;
         void re_emit_last_frame_if_at_end_of_stream_while_locked();
+        void note_frame_passed_by_decoder(AK::Duration timestamp, AK::Duration earliest_target_reachable_without_moving_demuxer);
+        bool decoder_has_passed_a_frame_needed_for(AK::Duration target) const;
         void push_data_and_decode_some_frames();
 
         void enter_halting_state(PipelineStatus, Optional<DecoderError>);
 
         void dispatch_wake_if_needed_while_locked();
+        void dispatch_wake_later();
 
         [[nodiscard]] MutexLocker<Mutex> take_lock() const { return MutexLocker(m_wait_state->mutex); }
         void wake() const { m_wait_state->condition.broadcast(); }
@@ -122,8 +140,12 @@ private:
         };
 
         void note_consumer_activity_while_locked() const;
-        void wait_to_decode_or_auto_suspend_while_locked();
-        void dispatch_read_blocked_change(ReadBlocked blocked);
+        enum class WaitResult : u8 {
+            ContinueDecoding,
+            ExitDecodeLoop,
+        };
+        WaitResult wait_for_frame_storage_while_locked();
+        bool read_is_blocked_while_locked() const;
 
         Core::EventLoop& m_main_thread_event_loop;
 
@@ -134,6 +156,7 @@ private:
             Mutex mutex;
             ConditionVariable condition { mutex };
             bool frame_storage_was_freed { false };
+            Atomic<bool> output_should_interrupt_demuxer_reads { false };
         };
         NonnullRefPtr<WaitState> m_wait_state { make_ref_counted<WaitState>() };
         RequestedState m_requested_state { RequestedState::None };
@@ -147,28 +170,46 @@ private:
         Optional<CodedFrame> m_frame_awaiting_decoder_replacement;
         DecodeIntent m_intent_awaiting_decoder_replacement { DecodeIntent::Output };
         OwnPtr<VideoDecoder> m_decoder;
+        NonReferenceFrameDetector m_non_reference_frame_detector;
         bool m_decoder_needs_keyframe_next_seek { false };
-        bool m_decoder_needs_codec_configuration_next_seek { true };
+        bool m_decoder_is_draining_before_unavailable_data { false };
+        struct FramePassedByDecoder {
+            AK::Duration timestamp;
+            AK::Duration earliest_target_reachable_without_moving_demuxer;
+        };
+        Optional<FramePassedByDecoder> m_latest_frame_passed_by_decoder;
 
         FrameQueue m_queue;
         RefPtr<VideoFrame> m_last_queued_frame;
-        AK::Duration m_earliest_available_timestamp;
-        AK::Duration m_latest_available_timestamp;
         ErrorHandler m_error_handler;
-        ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };
+        // Set by the demuxer under its own lock, which may be taken while ours is held.
+        Atomic<bool> m_demuxer_read_is_blocked { false };
+        Atomic<PipelineCheckpoint> m_checkpoint { 0 };
+        bool m_decoder_has_decode_in_progress { false };
+
+        enum class SeekReason : u8 {
+            Normal,
+            DecoderResetNeeded,
+            DataInvalidated,
+        };
 
         Atomic<u32> m_last_processed_seek_id { 0 };
         Atomic<u32> m_seek_id { 0 };
         AK::Duration m_seek_timestamp;
+        Atomic<SeekReason> m_seek_reason { SeekReason::Normal };
 
         SynchronizedWakeHandler m_wake_handler;
         mutable bool m_downstream_needs_wake { true };
 
         AK::Duration const m_auto_suspend_idle_timeout;
         mutable MonotonicTime m_last_consumer_activity { MonotonicTime::now() };
-        bool m_auto_suspended { false };
-        mutable bool m_auto_suspend_requested { false };
+        enum class SuspensionRequest : u8 {
+            None,
+            Automatic,
+            FromConsumer,
+        };
+        mutable SuspensionRequest m_suspension_request { SuspensionRequest::None };
     };
 
     NonnullRefPtr<ThreadData> m_thread_data;

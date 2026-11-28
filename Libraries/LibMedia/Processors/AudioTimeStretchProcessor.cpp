@@ -57,23 +57,29 @@ void AudioTimeStretchProcessor::disconnect_input(NonnullRefPtr<AudioProducer> co
 
 void AudioTimeStretchProcessor::seek(AK::Duration timestamp)
 {
-    RefPtr<AudioProducer> input;
+    seek_with_output_frame(timestamp, {});
+}
+
+void AudioTimeStretchProcessor::seek_continuing_at_output_frame(AK::Duration timestamp, i64 output_frame_index)
+{
+    seek_with_output_frame(timestamp, output_frame_index);
+}
+
+void AudioTimeStretchProcessor::seek_with_output_frame(AK::Duration timestamp, Optional<i64> output_frame_index)
+{
     {
         MutexLocker locker { m_mutex };
         VERIFY(m_sample_specification.is_valid());
         auto target_frame = timestamp.to_time_units(1, m_sample_specification.sample_rate());
-        prime_stretcher_for_input_seek_while_locked(target_frame, target_frame);
+        prime_stretcher_for_input_seek_while_locked(target_frame, output_frame_index.value_or(target_frame));
 
         m_pending_block.clear();
         m_stretcher_reached_eos = false;
 
-        input = m_input;
-        timestamp = m_next_emit_media_time;
-    }
-
-    if (input != nullptr) {
-        input->seek(timestamp);
-        return;
+        if (m_input != nullptr) {
+            m_input->seek(m_next_emit_media_time);
+            return;
+        }
     }
 
     dispatch_wake();
@@ -165,7 +171,9 @@ bool AudioTimeStretchProcessor::input_is_suspended_while_locked() const
 {
     if (m_input == nullptr || !m_sample_specification.is_valid())
         return false;
-    return m_input->peek().status == PipelineStatus::Suspended;
+    auto output = m_input->peek();
+    m_input_checkpoint = output.checkpoint;
+    return output.status == PipelineStatus::Suspended;
 }
 
 PipelineStatus AudioTimeStretchProcessor::produce_block_while_locked(AudioBlock& into) const
@@ -194,6 +202,7 @@ PipelineStatus AudioTimeStretchProcessor::produce_block_while_locked(AudioBlock&
             return PipelineStatus::Error;
 
         auto output = m_input->peek();
+        m_input_checkpoint = output.checkpoint;
         if (output.status == PipelineStatus::EndOfStream) {
             m_stretcher->signal_end_of_stream();
             m_stretcher_reached_eos = false;
@@ -219,7 +228,7 @@ AudioProducerOutput AudioTimeStretchProcessor::peek()
     }
     if (!m_pending_block.is_empty())
         status = PipelineStatus::HaveData;
-    return { m_pending_block.is_empty() ? nullptr : &m_pending_block, status };
+    return { m_pending_block.is_empty() ? nullptr : &m_pending_block, status, m_input_checkpoint };
 }
 
 void AudioTimeStretchProcessor::consume()

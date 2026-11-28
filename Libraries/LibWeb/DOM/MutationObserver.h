@@ -29,7 +29,10 @@ namespace Web::DOM {
 class RegisteredObserver;
 
 struct MutationObserverOptions {
-    Optional<Vector<Utf16FlyString>> attribute_filter;
+    // NB: The attribute filter is present if has_attribute_filter is set. It is no Optional, whose padding would leave
+    //     no room for the observer of a RegisteredObserver before the options.
+    Vector<Utf16FlyString> attribute_filter;
+    bool has_attribute_filter { false };
     Optional<bool> attribute_old_value;
     Optional<bool> attributes;
     Optional<bool> character_data;
@@ -44,7 +47,7 @@ class MutationObserver final : public Bindings::GCAllocatedWrappable {
     GC_DECLARE_ALLOCATOR(MutationObserver);
 
 public:
-    static WebIDL::ExceptionOr<GC::Ref<MutationObserver>> create(GC::Ptr<WebIDL::CallbackType>);
+    static GC::Ref<MutationObserver> create_for_constructor(JS::Object& relevant_global_object, GC::Ptr<WebIDL::CallbackType>);
     virtual ~MutationObserver() override;
 
     WebIDL::ExceptionOr<void> observe(Node& target, MutationObserverOptions options);
@@ -55,10 +58,12 @@ public:
     Vector<GC::Weak<Node>>& node_list() { return m_node_list; }
     Vector<GC::Weak<Node>> const& node_list() const { return m_node_list; }
 
-    void add_transient_registered_node(Badge<Node>, Node&);
-    void remove_transient_registered_observers(RegisteredObserver const* source = nullptr);
+    void append_to_transient_node_set(Badge<Node>, Node&);
+    void remove_transient_registered_observers();
 
     WebIDL::CallbackType& callback() { return *m_callback; }
+
+    u64 creation_index() const { return m_creation_index; }
 
     void enqueue_record(Badge<Node>, GC::Ref<MutationRecord> mutation_record)
     {
@@ -66,19 +71,22 @@ public:
     }
 
 private:
-    explicit MutationObserver(GC::Ptr<WebIDL::CallbackType>);
+    MutationObserver(GC::Ptr<WebIDL::CallbackType>, HTML::SimilarOriginWindowAgent& relevant_agent);
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
 
     // https://dom.spec.whatwg.org/#concept-mo-callback
-    GC::Ptr<WebIDL::CallbackType> m_callback;
+    GC::Member<WebIDL::CallbackType> m_callback;
+
+    // https://dom.spec.whatwg.org/#mutationobserver-creation-index
+    u64 m_creation_index { 0 };
 
     // https://dom.spec.whatwg.org/#mutationobserver-node-list
     // Registered observers in a node’s registered observer list have a weak reference to the node.
     Vector<GC::Weak<Node>> m_node_list;
 
-    // Nodes that currently have transient registered observers for this observer.
-    Vector<GC::Weak<Node>> m_transient_registered_node_list;
+    // https://dom.spec.whatwg.org/#mutationobserver-transient-node-set
+    Vector<GC::Weak<Node>> m_transient_node_set;
 
     // https://dom.spec.whatwg.org/#concept-mo-queue
     Vector<GC::Ref<MutationRecord>> m_record_queue;
@@ -109,7 +117,7 @@ protected:
     virtual void visit_edges(Cell::Visitor&) override;
 
 private:
-    GC::Ref<MutationObserver> m_observer;
+    GC::NonnullMember<MutationObserver> m_observer;
     MutationObserverOptions m_options;
 };
 
@@ -131,7 +139,7 @@ private:
 
     virtual void visit_edges(Cell::Visitor&) override;
 
-    GC::Ref<RegisteredObserver> m_source;
+    GC::NonnullMember<RegisteredObserver> m_source;
 };
 
 template<>

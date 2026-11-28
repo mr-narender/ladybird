@@ -1,0 +1,4 @@
+inherited keyframes: animations tint, target rgb(100, 50, 0), child rgb(100, 50, 0)
+sibling-index() keyframes: animations grow-by-index, width 30px
+url() keyframes: animations picture, background-image true
+keyframe custom property: animations vary, child width 17px

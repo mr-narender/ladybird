@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/SourceLocation.h>
@@ -21,6 +22,7 @@
 #include <unicode/stringpiece.h>
 #include <unicode/uiter.h>
 #include <unicode/uloc.h>
+#include <unicode/ulocdata.h>
 #include <unicode/unistr.h>
 #include <unicode/utypes.h>
 #include <unicode/uversion.h>
@@ -44,7 +46,12 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static Optional<LocaleData&> for_locale(StringView locale);
-    static Utf16String canonicalize(StringView locale);
+    static Optional<LocaleData&> for_locale(Utf16View const& locale);
+
+    // The data of the locale, or of the default locale where the locale isn't one ICU can parse, such as the raw value
+    // of an element's lang attribute can be.
+    static LocaleData& for_locale_or_default(Utf16View const& locale);
+    static Optional<Utf16String> canonicalize(StringView locale);
 
     ALWAYS_INLINE icu::Locale& locale() { return m_locale; }
 
@@ -53,9 +60,10 @@ public:
 
     icu::NumberingSystem& numbering_system();
 
-    icu::DateTimePatternGenerator& date_time_pattern_generator();
+    Optional<icu::DateTimePatternGenerator&> date_time_pattern_generator();
 
     icu::TimeZoneNames& time_zone_names();
+    icu::UnicodeString const& quotation_mark(ULocaleDataDelimiterType);
 
     Optional<DigitalFormat> const& digital_format() { return m_digital_format; }
     void set_digital_format(DigitalFormat digital_format) { m_digital_format = move(digital_format); }
@@ -72,6 +80,7 @@ private:
     OwnPtr<icu::DateTimePatternGenerator> m_date_time_pattern_generator;
     OwnPtr<icu::TimeZoneNames> m_time_zone_names;
     Optional<DigitalFormat> m_digital_format;
+    Optional<Array<icu::UnicodeString, 4>> m_quotation_marks;
 };
 
 // Cache entries and their ICU objects are confined to the calling thread.
@@ -117,12 +126,21 @@ ALWAYS_INLINE icu::UnicodeString icu_string(StringView string)
     return icu::UnicodeString::fromUTF8(icu_string_piece(string));
 }
 
-// If the Utf16View has ASCII storage, this creates an owned icu::UnicodeString. Otherwise, the icu::UnicodeString is
+// If the Utf16View has Latin-1 storage, this creates an owned icu::UnicodeString. Otherwise, the icu::UnicodeString is
 // unowned (i.e. it is effectively a view).
 ALWAYS_INLINE icu::UnicodeString icu_string(Utf16View const& string)
 {
     if (string.has_ascii_storage())
-        return icu::UnicodeString::fromUTF8(icu_string_piece(string.bytes()));
+        return icu::UnicodeString::fromUTF8(icu_string_piece(string.ascii_bytes()));
+    if (string.has_latin1_storage()) {
+        auto latin1 = string.latin1_span();
+        icu::UnicodeString result;
+        auto* buffer = result.getBuffer(static_cast<i32>(latin1.size()));
+        for (size_t i = 0; i < latin1.size(); ++i)
+            buffer[i] = latin1[i];
+        result.releaseBuffer(static_cast<i32>(latin1.size()));
+        return result;
+    }
     return { false, string.utf16_span().data(), static_cast<i32>(string.length_in_code_units()) };
 }
 

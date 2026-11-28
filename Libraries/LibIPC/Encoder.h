@@ -14,7 +14,6 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Variant.h>
 #include <LibCore/Forward.h>
-#include <LibCore/SharedCircularQueue.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Concepts.h>
 #include <LibIPC/File.h>
@@ -202,13 +201,6 @@ ErrorOr<void> encode(Encoder& encoder, T const& hashmap)
     return {};
 }
 
-template<Concepts::SharedSingleProducerCircularQueue T>
-ErrorOr<void> encode(Encoder& encoder, T const& queue)
-{
-    TRY(encoder.encode(TRY(IPC::File::clone_fd(queue.fd()))));
-    return {};
-}
-
 template<Concepts::Optional T>
 ErrorOr<void> encode(Encoder& encoder, T const& optional)
 {
@@ -228,6 +220,13 @@ ErrorOr<void> encode(Encoder& encoder, T const& variant)
     return variant.visit([&](auto const& value) {
         return encoder.encode(value);
     });
+}
+
+template<Concepts::Encoded T>
+ErrorOr<void> encode(Encoder& encoder, T const& value)
+{
+    TRY(encoder.encode_size(value.bytes().size()));
+    return encoder.append(value.bytes().data(), value.bytes().size());
 }
 
 // This must be last so that it knows about the above specializations.

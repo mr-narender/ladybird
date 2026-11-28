@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<svg>
+    <text id="text" style="--caps: small-caps" font-variant="var(--caps)">x</text>
+</svg>
+<script>
+    // A presentation attribute naming a shorthand written with var() declares each longhand it pends, as a
+    // declaration block does.
+    test(() => {
+        const text = document.getElementById("text");
+        text.style.setProperty("--caps", "all-small-caps");
+        internals.updateStyle();
+        println(`font-variant-caps: ${getComputedStyle(text).fontVariantCaps}`);
+    });
+</script>

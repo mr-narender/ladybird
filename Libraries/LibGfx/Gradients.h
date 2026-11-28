@@ -7,21 +7,9 @@
 #pragma once
 
 #include <AK/Math.h>
-#include <LibGfx/Color.h>
 #include <LibGfx/Size.h>
-#include <LibIPC/Forward.h>
 
 namespace Gfx {
-
-struct ColorStop {
-    Color color;
-    float position = AK::NaN<float>;
-    Optional<float> transition_hint = {};
-
-    bool operator==(ColorStop const&) const = default;
-};
-
-float color_stop_step(ColorStop const& previous_stop, ColorStop const& next_stop, float position);
 
 inline float normalized_gradient_angle_radians(float gradient_angle)
 {
@@ -44,15 +32,5 @@ inline float calculate_gradient_length(Size<T> gradient_size, float gradient_ang
     AK::sincos(angle, sin_angle, cos_angle);
     return calculate_gradient_length(gradient_size, sin_angle, cos_angle);
 }
-
-}
-
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder&, Gfx::ColorStop const&);
-
-template<>
-ErrorOr<Gfx::ColorStop> decode(Decoder&);
 
 }

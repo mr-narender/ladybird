@@ -23,11 +23,6 @@ class RequestClient;
 
 class WebSocket : public RefCounted<WebSocket> {
 public:
-    struct CertificateAndKey {
-        ByteString certificate;
-        ByteString key;
-    };
-
     struct Message {
         ByteBuffer data;
         bool is_text { false };
@@ -65,16 +60,16 @@ public:
 
     Function<void()> on_open;
     Function<void(Message)> on_message;
+    Function<void(u64 message_byte_count)> on_message_bytes_transmitted;
     Function<void(Error)> on_error;
     Function<void(u16 code, ByteString reason, bool was_clean)> on_close;
     Function<void()> on_ready_state_change;
-    Function<CertificateAndKey()> on_certificate_requested;
 
     void did_open(Badge<RequestClient>);
     void did_receive(Badge<RequestClient>, ByteBuffer, bool);
+    void did_transmit(Badge<RequestClient>, u64 message_byte_count);
     void did_error(Badge<RequestClient>, i32);
     void did_close(Badge<RequestClient>, u16, ByteString, bool);
-    void did_request_certificates(Badge<RequestClient>);
     void detach_from_client(Badge<RequestClient>);
 
 private:

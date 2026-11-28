@@ -6,6 +6,7 @@
  */
 
 #include <AK/Assertions.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/Optional.h>
 #include <AK/TypeCasts.h>
 #include <LibWeb/DOM/AbortSignal.h>
@@ -21,13 +22,20 @@
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/DOM/Utils.h>
+#include <LibWeb/EventTiming/EventTiming.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
 #include <LibWeb/HTML/HTMLButtonElement.h>
+#include <LibWeb/HTML/HTMLLabelElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/MouseEvent.h>
+#include <LibWeb/UIEvents/PointerEvent.h>
+#include <LibWeb/UIEvents/TouchEvent.h>
 
 namespace Web::DOM {
 
@@ -42,6 +50,11 @@ static Optional<Utf16FlyString> legacy_event_type_for_event_type(Utf16FlyString 
         return HTML::EventNames::webkitAnimationStart;
     if (event_type == HTML::EventNames::transitionend)
         return HTML::EventNames::webkitTransitionEnd;
+    // INTEROP: Other browsers use mousewheel as the legacy event type for trusted wheel events.
+    if (event_type == UIEvents::EventNames::wheel) {
+        static NeverDestroyed<Utf16FlyString> mousewheel_event_type { "mousewheel"_utf16_fly_string };
+        return *mousewheel_event_type;
+    }
     return {};
 }
 
@@ -51,9 +64,13 @@ bool EventDispatcher::inner_invoke(Event& event, EventTarget::ClonedEventListene
     // 1. Let found be false.
     bool found = false;
 
+    // NB: Event's currentTarget stays the same while its listeners run, so it's only checked once for being a node —
+    //     and not at all when it has no listeners for the event, as most targets in an event's path don't.
+    auto* current_target_node = listeners.is_empty() ? nullptr : as_if<Node>(event.current_target().ptr());
+
     // 2. For each listener of listeners, whose removed is false:
     for (auto& listener : listeners) {
-        if (listener->removed)
+        if (listener->removed())
             continue;
 
         // 1. If event’s type attribute value is not listener’s type, then continue.
@@ -64,41 +81,58 @@ bool EventDispatcher::inner_invoke(Event& event, EventTarget::ClonedEventListene
         found = true;
 
         // 3. If phase is "capturing" and listener’s capture is false, then continue.
-        if (phase == Event::Phase::CapturingPhase && !listener->capture)
+        if (phase == Event::Phase::CapturingPhase && !listener->capture())
             continue;
 
         // 4. If phase is "bubbling" and listener’s capture is true, then continue.
-        if (phase == Event::Phase::BubblingPhase && listener->capture)
+        if (phase == Event::Phase::BubblingPhase && listener->capture())
             continue;
 
         // 5. If listener’s once is true, then remove an event listener given event’s currentTarget attribute value and listener.
-        if (listener->once)
+        if (listener->once())
             event.current_target()->remove_an_event_listener(*listener);
 
-        // 6. Let global be listener callback’s associated Realm’s global object.
         auto& callback = listener->callback->callback();
 
-        // 7. Let currentEvent be undefined.
-        Event* current_event = nullptr;
+        // 6. Let targetGlobal be event's currentTarget's node document's relevant global object if event's currentTarget
+        //    is a node; otherwise event's currentTarget's relevant global object.
+        auto* target_global = current_target_node
+            ? current_target_node->document().relevant_global_event_target().ptr()
+            : Bindings::current_target_global(callback, event);
 
-        // 8. If global is a Window object, then:
-        auto* window = Bindings::window_from_callback(callback);
-        if (window) {
-            // 1. Set currentEvent to global’s current event.
-            current_event = window->current_event();
+        // 7. Let listenerGlobal be listener callback's associated realm's global object.
+        auto* listener_window = Bindings::window_from_callback(callback);
 
-            // 2. If invocationTargetInShadowTree is false, then set global’s current event to event.
-            if (!invocation_target_in_shadow_tree)
-                window->set_current_event(&event);
+        // 8. If targetGlobal or listenerGlobal is a Window object whose associated Document is not fully active, then
+        //    continue.
+        if (listener_window && !listener_window->associated_document().is_fully_active())
+            continue;
+        // NB: Mostly, targetGlobal is listenerGlobal, which was just checked.
+        if (target_global != listener_window) {
+            if (auto* target_window = as_if<HTML::Window>(target_global); target_window && !target_window->associated_document().is_fully_active())
+                continue;
         }
 
-        // 9. If listener’s passive is true, then set event’s in passive listener flag.
-        if (listener->passive == true)
+        // 9. Let currentEvent be undefined.
+        Event* current_event = nullptr;
+
+        // 10. If listenerGlobal is a Window object:
+        if (listener_window) {
+            // 1. Set currentEvent to listenerGlobal's current event.
+            current_event = listener_window->current_event();
+
+            // 2. If invocationTargetInShadowTree is false, then set listenerGlobal's current event to event.
+            if (!invocation_target_in_shadow_tree)
+                listener_window->set_current_event(&event);
+        }
+
+        // 11. If listener’s passive is true, then set event’s in passive listener flag.
+        if (listener->passive() == true)
             event.set_in_passive_listener(true);
 
-        // FIXME: 10. If global is a Window object, then record timing info for event listener given event and listener.
+        // FIXME: 12. If listenerGlobal is a Window object, then record timing info for event listener given event and listener.
 
-        // 11. Call a user object’s operation with listener’s callback, "handleEvent", « event », and event’s currentTarget attribute value.
+        // 13. Call a user object’s operation with listener’s callback, "handleEvent", « event », and event’s currentTarget attribute value.
         auto result = Bindings::invoke_event_listener(callback, event);
 
         // If this throws an exception, then:
@@ -110,14 +144,14 @@ bool EventDispatcher::inner_invoke(Event& event, EventTarget::ClonedEventListene
             legacy_output_did_listeners_throw = true;
         }
 
-        // 12. Unset event’s in passive listener flag.
+        // 14. Unset event’s in passive listener flag.
         event.set_in_passive_listener(false);
 
-        // 13. If global is a Window object, then set global’s current event to currentEvent.
-        if (window)
-            window->set_current_event(current_event);
+        // 15. If listenerGlobal is a Window object, then set listenerGlobal's current event to currentEvent.
+        if (listener_window)
+            listener_window->set_current_event(current_event);
 
-        // 14. If event’s stop immediate propagation flag is set, then break.
+        // 16. If event’s stop immediate propagation flag is set, then break.
         if (event.should_stop_immediate_propagation())
             break;
     }
@@ -139,11 +173,22 @@ void EventDispatcher::invoke(Event::PathEntry& struct_, Event& event, Event::Pha
     // that is either struct or preceding struct, whose shadow-adjusted target is non-null.
     event.set_target(last_valid_shadow_adjusted_target.value().shadow_adjusted_target.ptr());
 
+    // AD-HOC: Coalesced events have the same target as the trusted pointer event they were coalesced into.
+    if (event.is_trusted()) {
+        if (auto* pointer_event = as_if<UIEvents::PointerEvent>(event))
+            pointer_event->set_target_of_coalesced_events(event.target());
+    }
+
     // 2. Set event’s relatedTarget to struct’s relatedTarget.
     event.set_related_target(struct_.related_target.ptr());
 
     // 3. Set event’s touch target list to struct’s touch target list.
-    event.set_touch_target_list(struct_.touch_target_list);
+    // OPTIMIZATION: Every path entry has the same touch target count. Ordinary events keep their empty list.
+    if (!struct_.touch_target_list.is_empty()) {
+        event.set_touch_target_list(struct_.touch_target_list);
+        if (auto* touch_event = as_if<UIEvents::TouchEvent>(&event))
+            touch_event->retarget_touch_lists();
+    }
 
     // 4. If event’s stop propagation flag is set, then return.
     if (event.should_stop_propagation())
@@ -195,11 +240,72 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
     return dispatch(target, event, legacy_target_override, legacy_output_did_listeners_throw);
 }
 
+static bool button_submits_or_resets_its_form(HTML::HTMLButtonElement const& button)
+{
+    return button.form() && (button.is_submit_button() || button.type_state() == HTML::HTMLButtonElement::TypeAttributeState::Reset);
+}
+
+static GC::Ptr<EventTarget> link_activation_target_above_button(Event const& event, HTML::HTMLButtonElement const& button)
+{
+    bool passed_button = false;
+    GC::Ptr<EventTarget> intervening_activation_target;
+    for (auto const& entry : event.path()) {
+        auto& invocation_target = *entry.invocation_target;
+        if (&invocation_target == &button) {
+            passed_button = true;
+            continue;
+        }
+        if (!passed_button || !invocation_target.has_activation_behavior())
+            continue;
+
+        // INTEROP: An intervening form-associated submit or reset button consumes activation
+        //          before it can reach the link, even when its form action is canceled.
+        if (auto* ancestor_button = as_if<HTML::HTMLButtonElement>(invocation_target); ancestor_button
+            && ancestor_button->enabled() && button_submits_or_resets_its_form(*ancestor_button)) {
+            if (!intervening_activation_target)
+                intervening_activation_target = ancestor_button;
+            continue;
+        }
+
+        if (is<HTML::HTMLAnchorElement>(invocation_target))
+            return intervening_activation_target ? intervening_activation_target : GC::Ptr<EventTarget> { invocation_target };
+
+        // NB: Keep other intervening activation behaviors, such as labels, as boundaries.
+        //     The link fallback must not bypass them just because the clicked button is plain.
+        return {};
+    }
+    return {};
+}
+
 // https://dom.spec.whatwg.org/#concept-event-dispatch
 bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool legacy_target_override, bool& legacy_output_did_listeners_throw)
 {
     // 1. Set event’s dispatch flag.
     event.set_dispatched(true);
+
+    // https://w3c.github.io/largest-contentful-paint/#sec-modifications-DOM
+    // If target's relevant global object is a Window object, event's type is scroll and its isTrusted is true, set
+    // target's relevant global object's has dispatched scroll event to true.
+    if (event.is_trusted() && event.type() == HTML::EventNames::scroll) {
+        if (auto* window = EventTiming::relevant_window_of_event_target(*target))
+            window->set_has_dispatched_scroll_event();
+    }
+
+    // https://w3c.github.io/event-timing/#sec-modifications-DOM
+    // OPTIMIZATION: Only trusted events of some types are timed, so nothing else needs to look up the window.
+    GC::Ptr<EventTiming::PerformanceEventTiming> timing_entry;
+    GC::Ptr<HTML::Window> timing_window;
+    if (EventTiming::is_considered_for_event_timing(event)) {
+        timing_window = EventTiming::relevant_window_of_event_target(*target);
+        if (timing_window) {
+            // 1. Let interactionId be the result of computing interactionId given event.
+            auto interaction_id = EventTiming::compute_interaction_id(event, *timing_window);
+
+            // 2. Let timingEntry be the result of initializing event timing given event, the current high resolution
+            //    time, and interactionId.
+            timing_entry = EventTiming::initialize_event_timing(event, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*timing_window)), interaction_id);
+        }
+    }
 
     // 2. Let targetOverride be target, if legacy target override flag is not given, and target’s associated Document otherwise. [HTML]
     // NOTE: legacy target override flag is only used by HTML and only when target is a Window object.
@@ -212,6 +318,9 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
 
     // 3. Let activationTarget be null.
     GC::Ptr<EventTarget> activation_target;
+    // NB: Labels need the click target relative to their tree, even after dispatch retargets or clears event.target.
+    GC::Ptr<EventTarget> activation_event_target;
+    bool activation_target_is_interactive_label_descendant = false;
 
     // 4. Let relatedTarget be the result of retargeting event’s relatedTarget against target.
     GC::Ptr<EventTarget> related_target = retarget(event.related_target().ptr(), target.ptr());
@@ -223,20 +332,64 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
     //               events are always dispatched. This saves us from going through the path building and dispatch
     //               phases for events that will be dropped on the floor anyway.
     bool is_activation_event = is<UIEvents::MouseEvent>(event) && event.type() == HTML::EventNames::click;
+
+    // AD-HOC: The spec only has a disabled form control prevent the click events queued on the user interaction task
+    //         source from being dispatched on it:
+    //         https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#enabling-and-disabling-form-controls:-the-disabled-attribute
+    //         But no mousedown, mouseup, click, or dblclick from the user reaches a disabled form control, or anything
+    //         above it: The path of such an event ends below the control, so a press on the control's own box
+    //         dispatches nothing. Every other event (pointer events, mouseover, mousemove, wheel, ...) reaches it as
+    //         usual. See https://github.com/whatwg/html/issues/2368.
+    bool const path_ends_below_disabled_form_control = event.is_trusted() && is<UIEvents::MouseEvent>(event)
+        && (event.type() == UIEvents::EventNames::mousedown || event.type() == UIEvents::EventNames::mouseup
+            || event.type() == UIEvents::EventNames::click || event.type() == UIEvents::EventNames::dblclick);
+    auto is_disabled_form_control = [](EventTarget const& event_target) {
+        auto const* element = as_if<Element>(event_target);
+        return element && element->is_disabled_form_control();
+    };
     bool should_dispatch = is_activation_event;
     if (!should_dispatch) {
         auto const* node = as_if<Node>(*target);
-        should_dispatch = !node || node->has_inclusive_ancestor_with_event_listener(event.type());
+        auto has_listener_on_event_path = [&](Utf16FlyString const& type) {
+            for (auto* ancestor = target.ptr(); ancestor;) {
+                if (ancestor->has_event_listener(type))
+                    return true;
+                // NB: ShadowRoot::get_parent() reads the first path entry for non-composed events. The path is not
+                //     built yet, so apply that boundary check here before calling it.
+                if (!event.composed() && is<ShadowRoot>(*ancestor)) {
+                    if (node && &node->root() == ancestor)
+                        break;
+                    ancestor = as<ShadowRoot>(*ancestor).host();
+                    continue;
+                }
+                ancestor = ancestor->get_parent(event);
+            }
+            return false;
+        };
+        should_dispatch = !node || has_listener_on_event_path(event.type());
         if (!should_dispatch && event.is_trusted()) {
             if (auto legacy_event_type = legacy_event_type_for_event_type(event.type()); legacy_event_type.has_value())
-                should_dispatch = node->has_inclusive_ancestor_with_event_listener(*legacy_event_type);
+                should_dispatch = has_listener_on_event_path(*legacy_event_type);
+        }
+
+        // NB: The script that dispatched an untrusted event can read the target that dispatch leaves on it. For a node
+        //     outside any shadow tree, with no related target or touch targets, that's targetOverride itself, so set
+        //     it, and skip the dispatch. Anywhere else, retargeting decides what's left, so dispatch.
+        if (!should_dispatch && !event.is_trusted()) {
+            if (is<ShadowRoot>(node->root()) || event.related_target() || !event.touch_target_list().is_empty())
+                should_dispatch = true;
+            else
+                event.set_target(target_override.ptr());
         }
     }
+
+    if (path_ends_below_disabled_form_control && is_disabled_form_control(*target))
+        should_dispatch = false;
 
     // 6. If target is not relatedTarget or target is event’s relatedTarget, then:
     if (should_dispatch && (related_target != target || event.related_target() == target)) {
         // 1. Let touchTargets be a new list.
-        Event::TouchTargetList touch_targets;
+        GC::RootVector<GC::Ptr<EventTarget>> touch_targets;
 
         // 2. For each touchTarget of event’s touch target list, append the result of retargeting touchTarget against target to touchTargets.
         for (auto& touch_target : event.touch_target_list()) {
@@ -251,8 +404,10 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
         // NB: Step 4 is executed above as part of an optimization.
 
         // 5. If isActivationEvent is true and target has activation behavior, then set activationTarget to target.
-        if (is_activation_event && target->has_activation_behavior())
+        if (is_activation_event && target->has_activation_behavior()) {
             activation_target = target;
+            activation_event_target = target;
+        }
 
         // 6. Let slottable be target, if target is a slottable and is assigned, and null otherwise.
         GC::Ptr<EventTarget> slottable;
@@ -268,6 +423,9 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
 
         // 9. While parent is non-null:
         while (parent) {
+            if (path_ends_below_disabled_form_control && is_disabled_form_control(*parent))
+                break;
+
             // 1. If slottable is non-null:
             if (slottable != nullptr) {
                 // 1. Assert: parent is a slot.
@@ -299,11 +457,17 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
             }
 
             // 6. If parent is a Window object, or parent is a node and target’s root is a shadow-including inclusive ancestor of parent, then:
+            // INTEROP: A parent that is neither a Window object nor a node, such as the transaction and the connection
+            //          an IndexedDB request propagates its events to, is handled like a Window object too. This keeps
+            //          the event's target as it propagates, as other browsers do.
             if (is<HTML::Window>(parent)
+                || !is<Node>(parent)
                 || (is<Node>(parent) && as<Node>(*target).root().is_shadow_including_inclusive_ancestor_of(as<Node>(*parent)))) {
                 // 1. If isActivationEvent is true, event’s bubbles attribute is true, activationTarget is null, and parent has activation behavior, then set activationTarget to parent.
-                if (is_activation_event && event.bubbles() && !activation_target && parent->has_activation_behavior())
+                if (is_activation_event && event.bubbles() && !activation_target && parent->has_activation_behavior()) {
                     activation_target = parent;
+                    activation_event_target = target;
+                }
 
                 // 2. Append to an event path with event, parent, null, relatedTarget, touchTargets, and slot-in-closed-tree.
                 event.append_to_path(*parent, nullptr, related_target, touch_targets, slot_in_closed_tree);
@@ -318,8 +482,10 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
                 target = *parent;
 
                 // 1. If isActivationEvent is true, activationTarget is null, and target has activation behavior, then set activationTarget to target.
-                if (is_activation_event && !activation_target && target->has_activation_behavior())
+                if (is_activation_event && !activation_target && target->has_activation_behavior()) {
                     activation_target = target;
+                    activation_event_target = target;
+                }
 
                 // 2. Append to an event path with event, parent, target, relatedTarget, touchTargets, and slot-in-closed-tree.
                 event.append_to_path(*parent, target, related_target, touch_targets, slot_in_closed_tree);
@@ -368,6 +534,10 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
             }
         }
 
+        // NB: Keep the original interactive ancestry if listeners remove or reparent the clicked node.
+        if (auto* label = as_if<HTML::HTMLLabelElement>(activation_target.ptr()))
+            activation_target_is_interactive_label_descendant = label->is_interactive_descendant_event_target(activation_event_target.ptr());
+
         // 12. If activationTarget is non-null and activationTarget has legacy-pre-activation behavior, then run activationTarget’s legacy-pre-activation behavior.
         if (activation_target)
             activation_target->legacy_pre_activation_behavior();
@@ -406,42 +576,20 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
         }
     }
 
-    // INTEROP: Plain buttons inside links allow the link's default action. Check after event listeners
-    //          have run, since a click listener can give the button a submit, reset, command, or popover action.
-    if (auto* button = as_if<HTML::HTMLButtonElement>(activation_target.ptr()); button && event.bubbles() && button->enabled()
-        && button->type_state() == HTML::HTMLButtonElement::TypeAttributeState::Button
-        && !button->get_the_attribute_associated_element(HTML::AttributeNames::commandfor, button->command_for_element())
-        && !HTML::PopoverTargetAttributes::get_the_popover_target_element(*button)) {
-        bool passed_button = false;
-        GC::Ptr<EventTarget> intervening_activation_target;
-        for (auto const& entry : event.path()) {
-            if (entry.invocation_target.ptr() == button) {
-                passed_button = true;
-                continue;
-            }
-            if (!passed_button)
-                continue;
-
-            // INTEROP: An intervening form-associated submit or reset button consumes activation
-            //          before it can reach the link, even when its form action is canceled.
-            if (auto* ancestor_button = as_if<HTML::HTMLButtonElement>(entry.invocation_target.ptr()); ancestor_button
-                && ancestor_button->enabled() && ancestor_button->form()
-                && (ancestor_button->is_submit_button() || ancestor_button->type_state() == HTML::HTMLButtonElement::TypeAttributeState::Reset)) {
-                if (!intervening_activation_target)
-                    intervening_activation_target = ancestor_button;
-                continue;
-            }
-            if (is<HTML::HTMLAnchorElement>(*entry.invocation_target) && entry.invocation_target->has_activation_behavior()) {
-                activation_target = intervening_activation_target ? intervening_activation_target : entry.invocation_target;
-                break;
-            }
-
-            // NB: Keep other intervening activation behaviors, such as labels, as boundaries.
-            //     The link fallback must not bypass them just because the clicked button is plain.
-            if (entry.invocation_target->has_activation_behavior())
-                break;
+    // INTEROP: Buttons inside links that neither submit nor reset a form allow the link's default action. Check after
+    //          event listeners have run, since a click listener can give the button a submit, reset, command, or
+    //          popover action.
+    if (auto* button = as_if<HTML::HTMLButtonElement>(activation_target.ptr()); button && event.bubbles()) {
+        if (auto link_activation_target = link_activation_target_above_button(event, *button); link_activation_target
+            && button->enabled() && !button_submits_or_resets_its_form(*button)
+            && !button->get_the_attribute_associated_element(HTML::AttributeNames::commandfor, button->command_for_element())
+            && !HTML::PopoverTargetAttributes::get_the_popover_target_element(*button)) {
+            activation_target = link_activation_target;
         }
     }
+
+    // NB: The last target of the event, which finalizing event timing below uses, is cleared by the next steps.
+    GC::Ptr<EventTarget> last_event_target = event.target() ? event.target() : target.ptr();
 
     // 7. Set event’s eventPhase attribute to NONE.
     event.set_phase(Event::Phase::None);
@@ -469,11 +617,21 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
         event.clear_touch_target_list();
     }
 
+    // AD-HOC: The coalesced events of a trusted pointer event keep its final target, also when script dispatches the
+    //         event again.
+    if (event.is_trusted()) {
+        if (auto* pointer_event = as_if<UIEvents::PointerEvent>(event))
+            pointer_event->set_target_of_coalesced_events(event.target());
+    }
+
     // 12. If activationTarget is non-null, then:
     if (activation_target) {
         // 1. If event’s canceled flag is unset, then run activationTarget’s activation behavior with event.
         if (!event.cancelled()) {
-            activation_target->activation_behavior(event);
+            if (auto* label = as_if<HTML::HTMLLabelElement>(*activation_target))
+                label->activation_behavior(event, activation_target_is_interactive_label_descendant);
+            else
+                activation_target->activation_behavior(event);
             activation_target->legacy_cancelled_activation_behavior_was_not_called();
         }
         // 2. Otherwise, if activationTarget has legacy-canceled-activation behavior, then run activationTarget’s legacy-canceled-activation behavior.
@@ -481,6 +639,11 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
             activation_target->legacy_cancelled_activation_behavior();
         }
     }
+
+    // https://w3c.github.io/event-timing/#sec-modifications-DOM
+    // 1. Finalize event timing passing timingEntry, event, target, and the current high resolution time as inputs.
+    if (timing_entry)
+        EventTiming::finalize_event_timing(timing_entry, event, *last_event_target, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*timing_window)));
 
     // 13. Return false if event’s canceled flag is set; otherwise true.
     return !event.cancelled();

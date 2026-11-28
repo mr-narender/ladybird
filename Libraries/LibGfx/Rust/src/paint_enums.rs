@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+use libipc_rust::wire::{Decode, Encode};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 #[repr(i32)]
 pub enum WindingRule {
     #[default]
@@ -31,7 +33,7 @@ pub enum LineStyle {
     Dashed,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 #[repr(i32)]
 pub enum ScalingMode {
     #[default]
@@ -41,13 +43,7 @@ pub enum ScalingMode {
     NearestNeighbor,
 }
 
-impl ScalingMode {
-    pub fn from_raw(value: i32) -> Self {
-        Self::from_i32(value).unwrap_or_default()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 #[repr(i32)]
 pub enum CompositingAndBlendingOperator {
     #[default]
@@ -84,6 +80,21 @@ pub enum CompositingAndBlendingOperator {
 }
 
 impl CompositingAndBlendingOperator {
+    /// Whether drawing with the operator can lower the alpha of what is already drawn below, where it draws or around it.
+    pub fn lowers_destination_alpha(self) -> bool {
+        matches!(
+            self,
+            Self::Clear
+                | Self::Copy
+                | Self::SourceIn
+                | Self::DestinationIn
+                | Self::SourceOut
+                | Self::DestinationOut
+                | Self::DestinationATop
+                | Self::Xor
+        )
+    }
+
     pub fn from_i32(value: i32) -> Option<Self> {
         if (Self::Normal as i32..=Self::PlusLighter as i32).contains(&value) {
             // SAFETY: the enum is a dense i32 range from Normal to PlusLighter.
@@ -94,7 +105,7 @@ impl CompositingAndBlendingOperator {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 #[repr(i32)]
 pub enum MaskKind {
     #[default]
@@ -110,7 +121,7 @@ pub enum ShouldAntiAlias {
     No = 1,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 #[repr(i32)]
 pub enum InterpolationColorSpace {
     LinearRGB,
@@ -136,17 +147,6 @@ pub enum RectangularColorSpace {
     XyzD65,
 }
 
-impl RectangularColorSpace {
-    pub fn from_u8(value: u8) -> Self {
-        if value <= Self::XyzD65 as u8 {
-            // SAFETY: the enum is a dense u8 range starting at zero.
-            unsafe { std::mem::transmute::<u8, Self>(value) }
-        } else {
-            Self::default()
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PolarColorSpace {
@@ -155,17 +155,6 @@ pub enum PolarColorSpace {
     Lch,
     #[default]
     Oklch,
-}
-
-impl PolarColorSpace {
-    pub fn from_u8(value: u8) -> Self {
-        if value <= Self::Oklch as u8 {
-            // SAFETY: the enum is a dense u8 range starting at zero.
-            unsafe { std::mem::transmute::<u8, Self>(value) }
-        } else {
-            Self::default()
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -178,34 +167,12 @@ pub enum HueInterpolationMethod {
     Decreasing,
 }
 
-impl HueInterpolationMethod {
-    pub fn from_u8(value: u8) -> Self {
-        if value <= Self::Decreasing as u8 {
-            // SAFETY: the enum is a dense u8 range starting at zero.
-            unsafe { std::mem::transmute::<u8, Self>(value) }
-        } else {
-            Self::default()
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum GradientInterpolationType {
     #[default]
     Rectangular,
     Polar,
-}
-
-impl GradientInterpolationType {
-    pub fn from_u8(value: u8) -> Self {
-        if value <= Self::Polar as u8 {
-            // SAFETY: the enum is a dense u8 range starting at zero.
-            unsafe { std::mem::transmute::<u8, Self>(value) }
-        } else {
-            Self::default()
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -235,7 +202,7 @@ pub enum JoinStyle {
     Bevel,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 #[repr(i32)]
 pub enum ColorFilterType {
     #[default]
@@ -246,27 +213,6 @@ pub enum ColorFilterType {
     Opacity,
     Saturate,
     Sepia,
-}
-
-impl ScalingMode {
-    pub fn from_i32(value: i32) -> Option<Self> {
-        if (Self::None as i32..=Self::NearestNeighbor as i32).contains(&value) {
-            // SAFETY: the enum is a dense i32 range starting at zero.
-            Some(unsafe { std::mem::transmute::<i32, Self>(value) })
-        } else {
-            None
-        }
-    }
-}
-
-impl InterpolationColorSpace {
-    pub fn from_i32(value: i32) -> Option<Self> {
-        match value {
-            value if value == Self::LinearRGB as i32 => Some(Self::LinearRGB),
-            value if value == Self::SRGB as i32 => Some(Self::SRGB),
-            _ => None,
-        }
-    }
 }
 
 impl ColorFilterType {

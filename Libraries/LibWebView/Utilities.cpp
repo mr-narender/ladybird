@@ -11,9 +11,18 @@
 #include <AK/Utf16String.h>
 #include <LibCore/Directory.h>
 #include <LibCore/File.h>
+#include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebView/Utilities.h>
+
+#if defined(AK_OS_WINDOWS)
+#    include <AK/Windows.h>
+#endif
+
+#if defined(AK_OS_LINUX)
+#    include <linux/magic.h>
+#endif
 
 namespace WebView {
 
@@ -31,6 +40,39 @@ ErrorOr<Web::HTML::SelectedFile> create_selected_file(ByteString const& file_pat
 
     auto file = TRY(Core::File::open(file_path, Core::File::OpenMode::Read));
     return Web::HTML::SelectedFile { move(name), IPC::File::adopt_file(move(file)) };
+}
+
+ErrorOr<IPC::File> open_local_file_for_renderer(ByteString const& path)
+{
+#if defined(AK_OS_WINDOWS)
+    auto file = TRY(Core::File::open(path, Core::File::OpenMode::Read));
+
+    // Files and directories are disk handles, while devices and pipes are not.
+    if (GetFileType(to_handle(file->fd())) != FILE_TYPE_DISK)
+        return Error::from_errno(EACCES);
+    return IPC::File::adopt_file(move(file));
+#else
+    auto canonical_path = TRY(FileSystem::real_path(path));
+
+#    if defined(AK_OS_MACOS)
+    // A /dev/fd entry opens a descriptor of the UI process, which reads as whatever file is behind it. Only the path
+    // says it's on devfs, so this is checked before the open.
+    auto path_file_system = TRY(Core::System::statfs(canonical_path));
+    if (StringView { path_file_system.f_fstypename, strnlen(path_file_system.f_fstypename, sizeof(path_file_system.f_fstypename)) } == "devfs"sv)
+        return Error::from_errno(EACCES);
+#    endif
+
+    auto file = TRY(Core::File::open_regular_file_or_directory(canonical_path));
+
+#    if defined(AK_OS_LINUX)
+    // procfs and sysfs can be mounted anywhere and expose information about the opening process.
+    auto file_system = TRY(Core::System::fstatfs(file->fd()));
+    if (file_system.f_type == PROC_SUPER_MAGIC || file_system.f_type == SYSFS_MAGIC)
+        return Error::from_errno(EACCES);
+#    endif
+
+    return IPC::File::adopt_file(move(file));
+#endif
 }
 
 ErrorOr<JsonObject> read_json_file(ByteString const& path)

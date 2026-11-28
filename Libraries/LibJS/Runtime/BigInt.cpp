@@ -1,49 +1,67 @@
 /*
- * Copyright (c) 2020-2022, Linus Groh <linusg@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCrypto/BigInt/SignedBigInteger.h>
-#include <LibGC/Heap.h>
+#include <AK/Vector.h>
+#include <LibJS/EmbeddingABIConversions.h>
 #include <LibJS/Runtime/BigInt.h>
-#include <LibJS/Runtime/GlobalObject.h>
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(BigInt);
+using namespace EmbeddingABI;
 
-GC::Ref<BigInt> BigInt::create(VM& vm, Crypto::SignedBigInteger big_integer)
+GC::Ref<BigInt> BigInt::create(VM& vm, bool is_negative, ReadonlySpan<u32> magnitude_words)
 {
-    return vm.heap().allocate<BigInt>(move(big_integer));
+    auto* bigint = js_bigint_create_from_magnitude(vm_to_abi(vm), is_negative, magnitude_words.data(), magnitude_words.size());
+    VERIFY(bigint);
+    return cell_ref_from_abi<BigInt>(bigint);
 }
 
-BigInt::BigInt(Crypto::SignedBigInteger big_integer)
-    : m_big_integer(move(big_integer))
+GC::Ref<BigInt> BigInt::create_from_i64(VM& vm, i64 value)
 {
+    // NB: The magnitude of i64's minimum is 2^63, which fits in a u64.
+    auto magnitude = value < 0 ? static_cast<u64>(0) - static_cast<u64>(value) : static_cast<u64>(value);
+    u32 const words[] = { static_cast<u32>(magnitude), static_cast<u32>(magnitude >> 32) };
+    return create(vm, value < 0, words);
 }
 
+GC::Ref<BigInt> BigInt::create_from_u64(VM& vm, u64 value)
+{
+    u32 const words[] = { static_cast<u32>(value), static_cast<u32>(value >> 32) };
+    return create(vm, false, words);
+}
+
+GC::Ptr<BigInt> BigInt::create_from_string(VM& vm, Utf16View const& string)
+{
+    return cell_from_abi<BigInt>(js_bigint_create_from_string(vm_to_abi(vm), utf16_view_to_abi(string)));
+}
+
+bool BigInt::is_negative() const
+{
+    return js_bigint_is_negative(bigint_to_abi(*this));
+}
+
+Vector<u32> BigInt::magnitude_words() const
+{
+    auto* bigint = bigint_to_abi(*this);
+    Vector<u32> magnitude_words;
+    magnitude_words.resize(js_bigint_magnitude_word_count(bigint));
+    js_bigint_copy_magnitude_words(bigint, magnitude_words.data(), magnitude_words.size());
+    return magnitude_words;
+}
+
+String BigInt::to_string() const
+{
+    return owned_utf16_string_from_abi(js_bigint_to_string(bigint_to_abi(*this), 10)).to_utf8();
+}
+
+// The decimal digits with the "n" of a BigInt literal.
 Utf16String BigInt::to_utf16_string() const
 {
-    return Utf16String::formatted("{}n", MUST(m_big_integer.to_base_utf16(10)));
-}
-
-size_t BigInt::external_memory_size() const
-{
-    return m_big_integer.external_memory_size();
-}
-
-// 21.2.1.1.1 NumberToBigInt ( number ), https://tc39.es/ecma262/#sec-numbertobigint
-ThrowCompletionOr<GC::Ref<BigInt>> number_to_bigint(VM& vm, Value number)
-{
-    VERIFY(number.is_number());
-
-    // 1. If IsIntegralNumber(number) is false, throw a RangeError exception.
-    if (!number.is_integral_number())
-        return vm.throw_completion<RangeError>(ErrorType::BigIntFromNonIntegral);
-
-    // 2. Return the BigInt value that represents ℝ(number).
-    return BigInt::create(vm, Crypto::SignedBigInteger { number.as_double() });
+    auto digits = owned_utf16_string_from_abi(js_bigint_to_string(bigint_to_abi(*this), 10));
+    return Utf16String::formatted("{}n", digits);
 }
 
 }

@@ -5,7 +5,7 @@
  */
 
 use crate::css::css_string::CssString;
-use crate::css::ffi_support::FfiUtf16View;
+use crate::css::ffi_support::{FfiUtf16View, OwnedArc};
 use crate::css::parser::query_parser::{
     CONTAINER_QUERY_REQUIRES_BLOCK_SIZE, CONTAINER_QUERY_REQUIRES_HEIGHT, CONTAINER_QUERY_REQUIRES_INLINE_SIZE,
     CONTAINER_QUERY_REQUIRES_SCROLL_STATE, CONTAINER_QUERY_REQUIRES_WIDTH, FfiQueryHandle,
@@ -63,37 +63,31 @@ pub unsafe extern "C" fn rust_container_conditions_retain(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_container_conditions_release(conditions: *const ContainerConditionsData) {
-    if !conditions.is_null() {
-        unsafe { Arc::decrement_strong_count(conditions) };
-    }
+pub extern "C" fn rust_container_conditions_release(conditions: OwnedArc<ContainerConditionsData>) {
+    drop(conditions);
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_container_conditions_count(conditions: *const ContainerConditionsData) -> usize {
-    unsafe { &*conditions }.conditions.len()
+pub extern "C" fn rust_container_conditions_count(conditions: &ContainerConditionsData) -> usize {
+    conditions.conditions.len()
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_container_conditions_name(
-    conditions: *const ContainerConditionsData,
+pub extern "C" fn rust_container_conditions_name(
+    conditions: &ContainerConditionsData,
     index: usize,
-) -> FfiUtf16View {
-    let name = unsafe { &*conditions }.conditions[index].name.as_ref();
+) -> FfiUtf16View<'_> {
+    let name = conditions.conditions[index].name.as_ref();
     let units = name.map_or(&[][..], CssString::units);
-    FfiUtf16View {
-        ascii: std::ptr::null(),
-        utf16: units.as_ptr(),
-        length: units.len(),
-    }
+    FfiUtf16View::from_utf16(units)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_container_conditions_query(
-    conditions: *const ContainerConditionsData,
+pub extern "C" fn rust_container_conditions_query(
+    conditions: &ContainerConditionsData,
     index: usize,
 ) -> *const FfiQueryHandle {
-    unsafe { &*conditions }.conditions[index]
+    conditions.conditions[index]
         .query
         .as_ref()
         .map_or(std::ptr::null(), Arc::as_ptr)

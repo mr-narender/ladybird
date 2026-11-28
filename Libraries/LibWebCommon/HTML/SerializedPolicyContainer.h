@@ -10,6 +10,7 @@
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/HTML/EmbedderPolicy.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
+#include <LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.h>
 
 namespace Web::HTML {
 
@@ -17,6 +18,9 @@ struct SerializedPolicyContainer {
     Vector<ContentSecurityPolicy::SerializedPolicy> csp_list;
     EmbedderPolicy embedder_policy;
     ReferrerPolicy::ReferrerPolicy referrer_policy;
+    bool force_load_at_top { false };
+    UpgradeInsecureRequests::InsecureRequestsPolicy insecure_requests_policy { UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade };
+    UpgradeInsecureRequests::UpgradeInsecureNavigationsSet upgrade_insecure_navigations_set {};
 };
 
 }

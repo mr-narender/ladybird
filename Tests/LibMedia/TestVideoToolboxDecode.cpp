@@ -4,16 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/HashMap.h>
 #include <AK/HashTable.h>
-#include <LibMedia/CodecParameters.h>
-#include <LibMedia/Codecs/AV1.h>
-#include <LibMedia/Codecs/H264.h>
 #include <LibMedia/DemuxerRegistry.h>
-#include <LibMedia/VideoFrame.h>
-#include <LibMedia/VideoFramePool.h>
-#include <LibMedia/VideoSurface.h>
-#include <LibMedia/VideoToolbox/VideoToolboxVideoDecoder.h>
+#include <LibMediaCodecs/CodecParameters.h>
+#include <LibMediaCodecs/Codecs/AV1.h>
+#include <LibMediaCodecs/Codecs/H264.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <LibMediaCodecs/VideoFramePool.h>
+#include <LibMediaCodecs/VideoSurface.h>
+#include <LibMediaCodecs/VideoToolbox/VideoToolboxVideoDecoder.h>
 
 #include "TestMediaCommon.h"
 
@@ -27,7 +26,7 @@ struct Decoding {
     Media::DecoderErrorOr<NonnullRefPtr<Media::VideoFrame>> next_frame() const
     {
         while (true) {
-            auto frame_result = decoder->take_next_output(track.video_data().cicp);
+            auto frame_result = decoder->take_next_output(track.video_data().color_metadata);
             if (!frame_result.is_error() || frame_result.error().category() != Media::DecoderErrorCategory::NeedsMoreInput)
                 return frame_result;
 
@@ -126,7 +125,7 @@ TEST_CASE(surfaces_are_not_reused_while_their_frames_are_held)
     // one in use. Were that claim missing, these frames would be a handful of surfaces overwriting one another.
     Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
     HashTable<u32> held_surface_ids;
-    while (held_frames.size() < Media::VideoFrameSurfacePool::MAX_SLOT_COUNT) {
+    while (held_frames.size() < Media::VideoSurfaceBudget::MAX_HELD_SURFACE_COUNT) {
         auto frame_result = decoding.next_frame();
         if (frame_result.is_error() && decoding_is_unavailable(frame_result.error()))
             return;
@@ -139,45 +138,12 @@ TEST_CASE(surfaces_are_not_reused_while_their_frames_are_held)
     }
 }
 
-TEST_CASE(a_recycled_surface_does_not_cost_a_fresh_announcement)
-{
-    auto decoding = open_decoding("./vp9_in_webm.webm"sv, Media::CodecID::VP9);
-
-    // A consumer is told about a slot whenever its buffer generation moves, so this counts what it would hear.
-    HashTable<u32> distinct_surface_ids;
-    HashMap<u32, u64> announced_buffer_id_by_slot;
-    size_t announcements = 0;
-    size_t frame_count = 0;
-
-    while (frame_count < 24) {
-        auto frame_result = decoding.next_frame();
-        if (frame_result.is_error() && decoding_is_unavailable(frame_result.error()))
-            return;
-        auto frame = TRY_OR_FAIL(move(frame_result));
-        auto const* slot = frame->pool_slot();
-        EXPECT_NE(slot, nullptr);
-
-        auto announced = announced_buffer_id_by_slot.get(slot->slot_index());
-        if (!announced.has_value() || *announced != slot->allocated_buffer_id()) {
-            announcements++;
-            announced_buffer_id_by_slot.set(slot->slot_index(), slot->allocated_buffer_id());
-        }
-        distinct_surface_ids.set(frame->surface()->id());
-        frame_count++;
-    }
-
-    // Releasing a frame lets the media engine decode into its surface again, and the slot that kept hold of that
-    // surface recognizes it, so a surface costs one announcement however many frames it carries.
-    EXPECT(distinct_surface_ids.size() < frame_count);
-    EXPECT(announcements <= distinct_surface_ids.size());
-}
-
 TEST_CASE(storage_runs_out_while_every_frame_is_held)
 {
     auto decoding = open_decoding("./vp9_in_webm.webm"sv, Media::CodecID::VP9);
 
     Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
-    while (held_frames.size() < Media::VideoFrameSurfacePool::MAX_SLOT_COUNT) {
+    while (held_frames.size() < Media::VideoSurfaceBudget::MAX_HELD_SURFACE_COUNT) {
         auto frame_result = decoding.next_frame();
         if (frame_result.is_error() && decoding_is_unavailable(frame_result.error()))
             return;
@@ -188,7 +154,7 @@ TEST_CASE(storage_runs_out_while_every_frame_is_held)
     EXPECT(exhausted_result.is_error());
     EXPECT_EQ(exhausted_result.error().category(), Media::DecoderErrorCategory::TryAgain);
 
-    // Letting the first frame go returns its slot to the pool.
+    // Letting the first frame go makes room for another.
     held_frames.remove(0);
     EXPECT(!decoding.next_frame().is_error());
 }
@@ -485,6 +451,28 @@ TEST_CASE(h264_parameter_sets_can_arrive_separately_and_outlive_their_frames)
     }
 }
 
+TEST_CASE(a_vp9_stream_starting_without_a_keyframe_is_corrupted)
+{
+    auto decoding = open_decoding("./vp9_in_webm.webm"sv, Media::CodecID::VP9);
+    MUST(decoding.demuxer->get_next_sample_for_track(decoding.track));
+    auto inter_frame = MUST(decoding.demuxer->get_next_sample_for_track(decoding.track));
+
+    auto result = decoding.decoder->receive_coded_data(inter_frame, Media::DecodeIntent::Output);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Corrupted);
+}
+
+TEST_CASE(an_h264_stream_without_parameter_sets_is_corrupted)
+{
+    auto decoding = open_decoding("./avc.mp4"sv, Media::CodecID::H264);
+    auto sample = MUST(decoding.demuxer->get_next_sample_for_track(decoding.track));
+    Media::CodedFrame frame_without_configuration { sample.codec_id(), sample.presentation_timestamp(), sample.decode_timestamp(), sample.duration(), sample.flags(), MUST(FixedArray<u8>::create(sample.data())) };
+
+    auto result = decoding.decoder->receive_coded_data(frame_without_configuration, Media::DecodeIntent::Output);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Corrupted);
+}
+
 TEST_CASE(input_after_the_end_of_stream_is_rejected_until_flushed)
 {
     auto decoding = open_decoding("./vp9_in_webm.webm"sv, Media::CodecID::VP9);
@@ -503,4 +491,118 @@ TEST_CASE(input_after_the_end_of_stream_is_rejected_until_flushed)
 
     decoding.decoder->flush();
     EXPECT(!decoding.decoder->receive_coded_data(first_frame, Media::DecodeIntent::Output).is_error());
+}
+
+// The file's mastering display and content light levels are only in its SEI, not in its sample entry.
+TEST_CASE(h265_frames_carry_the_high_dynamic_range_metadata_in_their_bitstream)
+{
+    auto decoding = open_decoding("./hevc_hdr_metadata_in_sei.mp4"sv, Media::CodecID::H265);
+    EXPECT(!decoding.track.video_data().color_metadata.mastering_display_color_volume.has_value());
+
+    size_t frame_count = 0;
+    while (true) {
+        auto frame_result = decoding.next_frame();
+        if (frame_result.is_error()) {
+            if (decoding_is_unavailable(frame_result.error()))
+                return;
+            EXPECT_EQ(frame_result.error().category(), Media::DecoderErrorCategory::EndOfStream);
+            break;
+        }
+        auto const& color_metadata = frame_result.value()->color_metadata();
+        EXPECT(color_metadata.mastering_display_color_volume.has_value());
+        if (color_metadata.mastering_display_color_volume.has_value()) {
+            EXPECT_APPROXIMATE(color_metadata.mastering_display_color_volume->maximum_luminance, 1000.0);
+            EXPECT_APPROXIMATE(color_metadata.mastering_display_color_volume->red.x, 0.68);
+        }
+        EXPECT(color_metadata.content_light_level_information.has_value());
+        if (color_metadata.content_light_level_information.has_value()) {
+            EXPECT_EQ(color_metadata.content_light_level_information->maximum_content_light_level, 1000);
+            EXPECT_EQ(color_metadata.content_light_level_information->maximum_frame_average_light_level, 400);
+        }
+        frame_count++;
+    }
+    EXPECT_EQ(frame_count, 6u);
+}
+
+// The file's mastering display and content light levels are only in metadata OBUs, not in its Matroska Colour element.
+TEST_CASE(av1_frames_carry_the_high_dynamic_range_metadata_in_their_bitstream)
+{
+    auto decoding = open_decoding("./av1_hdr_metadata_in_webm.webm"sv, Media::CodecID::AV1);
+    auto frame_result = decoding.next_frame();
+    if (frame_result.is_error() && decoding_is_unavailable(frame_result.error()))
+        return;
+    auto frame = MUST(move(frame_result));
+    auto const& color_metadata = frame->color_metadata();
+
+    EXPECT(color_metadata.content_light_level_information.has_value());
+    if (color_metadata.content_light_level_information.has_value()) {
+        EXPECT_EQ(color_metadata.content_light_level_information->maximum_content_light_level, 1005);
+        EXPECT_EQ(color_metadata.content_light_level_information->maximum_frame_average_light_level, 315);
+    }
+    EXPECT(color_metadata.mastering_display_color_volume.has_value());
+    if (color_metadata.mastering_display_color_volume.has_value()) {
+        EXPECT_APPROXIMATE(color_metadata.mastering_display_color_volume->maximum_luminance, 1000.0);
+        EXPECT_APPROXIMATE_WITH_ERROR(color_metadata.mastering_display_color_volume->red.x, 0.708, 1.0 / (1 << 16));
+    }
+}
+
+TEST_CASE(h265_frames_carry_their_own_hdr10_plus_scene_peaks)
+{
+    ScenePeakChecker scene_peaks { hevc_hdr10_plus_in_sei_scene_peaks };
+    auto decoding = open_decoding("./hevc_hdr10_plus_in_sei.mkv"sv, Media::CodecID::H265);
+
+    size_t frame_count = 0;
+    while (true) {
+        auto frame_result = decoding.next_frame();
+        if (frame_result.is_error()) {
+            if (decoding_is_unavailable(frame_result.error()))
+                return;
+            EXPECT_EQ(frame_result.error().category(), Media::DecoderErrorCategory::EndOfStream);
+            break;
+        }
+        auto const& frame = *frame_result.value();
+        auto const& color_metadata = frame.color_metadata();
+        scene_peaks.check(frame.timestamp(), color_metadata.maximum_scene_luminance);
+        EXPECT(color_metadata.content_light_level_information.has_value());
+        frame_count++;
+    }
+    EXPECT_EQ(frame_count, 6u);
+    scene_peaks.expect_every_frame_checked();
+}
+
+TEST_CASE(h265_frames_carry_their_own_dolby_vision_scene_peaks)
+{
+    ScenePeakChecker scene_peaks { hevc_dolby_vision_rpus_scene_peaks };
+    auto decoding = open_decoding("./hevc_dolby_vision_rpus.mkv"sv, Media::CodecID::H265);
+
+    size_t frame_count = 0;
+    while (true) {
+        auto frame_result = decoding.next_frame();
+        if (frame_result.is_error()) {
+            if (decoding_is_unavailable(frame_result.error()))
+                return;
+            EXPECT_EQ(frame_result.error().category(), Media::DecoderErrorCategory::EndOfStream);
+            break;
+        }
+        auto const& frame = *frame_result.value();
+        scene_peaks.check(frame.timestamp(), frame.color_metadata().maximum_scene_luminance);
+        frame_count++;
+    }
+    EXPECT_EQ(frame_count, 6u);
+    scene_peaks.expect_every_frame_checked();
+}
+
+TEST_CASE(a_four_two_two_stream_keeps_its_chroma_rows)
+{
+    auto decoding = open_decoding("./h264_422.mp4"sv, Media::CodecID::H264);
+
+    auto frame_result = decoding.next_frame();
+    if (frame_result.is_error()) {
+        EXPECT(decoding_is_unavailable(frame_result.error()));
+        return;
+    }
+    auto frame = frame_result.release_value();
+    EXPECT_NE(frame->surface(), nullptr);
+    EXPECT_EQ(frame->subsampling(), Media::Subsampling::yuv422());
+    EXPECT_EQ(frame->size(), Gfx::Size<u32>(64, 64));
 }

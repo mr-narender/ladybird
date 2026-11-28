@@ -1,3 +1,0 @@
-PASS: document stylesheet add stays bounded (at most 4 recomputations)
-PASS: shadow stylesheet add stays bounded (at most 4 recomputations)
-PASS: pseudo-only stylesheet removal stays bounded (at most 2 recomputations)

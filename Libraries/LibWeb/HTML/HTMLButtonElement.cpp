@@ -4,13 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
+#include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/CommandEvent.h>
 #include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
+#include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Namespace.h>
@@ -82,8 +86,11 @@ void HTMLButtonElement::form_associated_element_attribute_changed(Utf16FlyString
 {
     PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
 
-    if (name == AttributeNames::type && !namespace_.has_value())
+    if (name == AttributeNames::type && !namespace_.has_value()) {
         m_type_state = parse_type_attribute(value);
+        // The type decides whether the button is a candidate for constraint validation.
+        CSS::Invalidation::invalidate_style_after_validity_change(*this);
+    }
 
     if (name.is_one_of(AttributeNames::type, AttributeNames::command, AttributeNames::commandfor)) {
         submit_button_state_changed();
@@ -184,6 +191,12 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
     if (!this->document().is_fully_active())
         return;
 
+    if (associated_shadow_host_pseudo_element() == CSS::PseudoElement::WebkitSearchCancelButton) {
+        if (auto root = containing_shadow_root())
+            static_cast<HTMLInputElement&>(*root->host()).clear_search_value({});
+        return;
+    }
+
     // 3. If element has a form owner:
     if (form() != nullptr) {
         // 1. If element is a submit button, then submit element's form owner from element with userInvolvement set to event's user navigation involvement, and return.
@@ -219,13 +232,7 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
         // NOTE: DOM standard issue #1328 tracks how to better standardize associated event data in a way which makes
         //       sense on Events. Currently an event attribute initialized to a value cannot also have a getter, and so
         //       an internal slot (or map of additional fields) is required to properly specify this.
-        CommandEventInit event_init {};
-        event_init.command = command;
-        event_init.source = this;
-        event_init.cancelable = true;
-
-        auto event = CommandEvent::create(HTML::EventNames::command, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
-        event->set_is_trusted(true);
+        auto event = create_command_event(relevant_realm(*this), HTML::EventNames::command, { .cancelable = true }, *this, command);
         auto continue_ = target->dispatch_event(event);
 
         // 4. If continue is false, then return.
@@ -291,7 +298,7 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
 
 bool HTMLButtonElement::is_focusable() const
 {
-    return enabled() && meets_focusable_area_rendering_requirements();
+    return associated_shadow_host_pseudo_element() != CSS::PseudoElement::WebkitSearchCancelButton && enabled() && meets_focusable_area_rendering_requirements();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-button-command

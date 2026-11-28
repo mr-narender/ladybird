@@ -25,7 +25,7 @@ class WEB_API HTMLIFrameElement final
 public:
     virtual ~HTMLIFrameElement() override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     // ^EventTarget
     virtual bool is_focusable() const override
@@ -34,6 +34,8 @@ public:
     }
 
     void set_current_navigation_was_lazy_loaded(bool value);
+
+    void stop_lazy_loading();
 
     Optional<HighResolutionTime::DOMHighResTimeStamp> const& pending_resource_start_time() const { return m_pending_resource_start_time; }
     void set_pending_resource_start_time(Optional<HighResolutionTime::DOMHighResTimeStamp> time) { m_pending_resource_start_time = time; }
@@ -57,10 +59,10 @@ private:
     HTMLIFrameElement(DOM::Document&, DOM::QualifiedName);
 
     // ^DOM::Node
-    virtual bool is_html_iframe_element() const override { return true; }
 
     // ^DOM::Element
     virtual void post_connection() override;
+    virtual bool has_post_connection_steps() const override { return true; }
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual i32 default_tab_index_value() const override;
@@ -94,12 +96,5 @@ private:
 WEB_API void run_iframe_load_event_steps(HTML::HTMLIFrameElement&);
 
 ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<DOM::Element> embedder);
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLIFrameElement>() const { return is_html_iframe_element(); }
 
 }

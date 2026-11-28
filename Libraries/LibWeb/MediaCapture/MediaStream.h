@@ -23,19 +23,21 @@ public:
     static GC::Ref<MediaStream> create();
     static GC::Ref<MediaStream> create(ReadonlySpan<GC::Ref<MediaStreamTrack>> const&);
     static GC::Ref<MediaStream> create(GC::RootVector<GC::Ref<MediaStreamTrack>> const&);
+    static GC::Ref<MediaStream> create_with_id(Utf16String id);
 
     virtual ~MediaStream() override = default;
 
     Utf16String const& id() const { return m_id; }
 
-    Vector<GC::Ref<MediaStreamTrack>> get_audio_tracks() const;
-    Vector<GC::Ref<MediaStreamTrack>> get_video_tracks() const;
-    Vector<GC::Ref<MediaStreamTrack>> get_tracks() const;
+    GC::RootVector<GC::Ref<MediaStreamTrack>> get_audio_tracks() const;
+    GC::RootVector<GC::Ref<MediaStreamTrack>> get_video_tracks() const;
+    GC::RootVector<GC::Ref<MediaStreamTrack>> get_tracks() const;
     GC::Ptr<MediaStreamTrack> get_track_by_id(Utf16String const& track_id) const;
 
     void add_track(GC::Ref<MediaStreamTrack> track);
-    void append_track(GC::Ref<MediaStreamTrack>);
+    void add_a_track(GC::Ref<MediaStreamTrack> track);
     void remove_track(GC::Ref<MediaStreamTrack> track);
+    void remove_a_track(GC::Ref<MediaStreamTrack> track);
 
     GC::Ref<MediaStream> clone() const;
     bool active() const;
@@ -48,9 +50,6 @@ public:
 private:
     explicit MediaStream();
     virtual void visit_edges(Cell::Visitor&) override;
-
-    void add_track(JS::Object& global_object, GC::Ref<MediaStreamTrack> track);
-    void remove_track(JS::Object& global_object, GC::Ref<MediaStreamTrack> track);
 
     Utf16String m_id;
     Vector<GC::Ref<MediaStreamTrack>> m_tracks;

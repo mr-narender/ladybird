@@ -1,0 +1,4 @@
+inserted: 600 children, 0 with the style of another
+inserted: self-check: []
+restyled: 600 children, 0 with the style of another
+restyled: self-check: []

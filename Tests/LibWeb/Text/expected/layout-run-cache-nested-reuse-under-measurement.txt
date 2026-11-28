@@ -1,0 +1,2 @@
+PASS: the cell lays out its changed inline-block once (work + checks)
+PASS: the cell reuses its unchanged inline-block from the previous pass (work + checks)

@@ -16,6 +16,8 @@
 
 namespace Web::SVG {
 
+class SVGAnimatedTransformList;
+
 class SVGGradientElement
     : public SVGElement
     , public SVGURIReferenceMixin<SupportsXLinkHref::Yes> {
@@ -36,6 +38,15 @@ public:
 
     Optional<Gfx::AffineTransform> gradient_transform() const;
 
+    static constexpr u16 SVG_SPREADMETHOD_UNKNOWN = 0;
+    static constexpr u16 SVG_SPREADMETHOD_PAD = 1;
+    static constexpr u16 SVG_SPREADMETHOD_REFLECT = 2;
+    static constexpr u16 SVG_SPREADMETHOD_REPEAT = 3;
+
+    GC::Ref<SVGAnimatedEnumeration> gradient_units_for_bindings();
+    GC::Ref<SVGAnimatedEnumeration> spread_method_for_bindings();
+    GC::Ref<SVGAnimatedTransformList> gradient_transform_for_bindings();
+
 protected:
     SVGGradientElement(DOM::Document&, DOM::QualifiedName);
 
@@ -54,8 +65,6 @@ protected:
     void push_color_stops(void* sink) const;
 
 private:
-    virtual bool is_svg_gradient_element() const final { return true; }
-
     template<VoidFunction<SVGStopElement> Callback>
     void for_each_color_stop_impl(Callback const& callback, GC::RootHashTable<SVGGradientElement const*>& seen_gradients) const
     {
@@ -80,13 +89,7 @@ private:
 
     Optional<SpreadMethod> m_spread_method = {};
     Optional<Gfx::AffineTransform> m_gradient_transform = {};
+    GC::Ptr<SVGAnimatedTransformList> m_gradient_transform_for_bindings;
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<SVG::SVGGradientElement>() const { return is_svg_gradient_element(); }
 
 }

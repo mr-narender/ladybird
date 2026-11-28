@@ -6,40 +6,154 @@ if (APPLE)
     else()
         set(LADYBIRD_ENTITLEMENTS_FILE "${LADYBIRD_SOURCE_DIR}/Meta/Entitlements.plist")
     endif()
+
+    # Icon Composer icons need the asset catalog compiler from Xcode 26 or later.
+    execute_process(COMMAND xcrun actool --version OUTPUT_VARIABLE actool_version ERROR_QUIET)
+    if (actool_version MATCHES "<key>short-bundle-version</key>[ \t\r\n]*<string>([0-9]+)" AND CMAKE_MATCH_1 GREATER_EQUAL 26)
+        set(LADYBIRD_COMPILE_ICON_COMPOSER_ICON TRUE)
+        set(LADYBIRD_ICON_COMPOSER_PLIST_ENTRY "<key>CFBundleIconName</key>\n        <string>AppIcon</string>")
+    else()
+        set(LADYBIRD_ICON_COMPOSER_PLIST_ENTRY "")
+        message(STATUS "actool is older than Xcode 26, so the app bundle only gets the flat icon")
+    endif()
+
+    set(LADYBIRD_SPARKLE_PLIST_ENTRIES "")
+
+    # NB: The application bundle is put together here rather than by CMake, which would name the bundle after the
+    #     executable. The executable shares its lowercase name with the other platforms, so that pgrep finds it along
+    #     with the helpers, which live next to it.
+    set(LADYBIRD_BUNDLE_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/Ladybird.app")
+endif()
+
+if (APPLE AND LADYBIRD_ENABLE_SPARKLE)
+    set(LADYBIRD_SPARKLE_FEED_URL "https://download.ladybird.org/macos/appcast.xml" CACHE STRING "The appcast that Sparkle finds updates in")
+    set(LADYBIRD_SPARKLE_PUBLIC_KEY "30mib/1Ke84cNc8KkKajhTkCP9Zu3iZRgophONX53Ik=" CACHE STRING "The public EdDSA key, in base64, that the appcast and its updates are signed with")
+
+    # The feed URL goes into the Info.plist as XML text, so a query string's & has to be escaped.
+    set(sparkle_feed_url_xml "${LADYBIRD_SPARKLE_FEED_URL}")
+    string(REPLACE "&" "&amp;" sparkle_feed_url_xml "${sparkle_feed_url_xml}")
+    string(REPLACE "<" "&lt;" sparkle_feed_url_xml "${sparkle_feed_url_xml}")
+    string(REPLACE ">" "&gt;" sparkle_feed_url_xml "${sparkle_feed_url_xml}")
+
+    # Sparkle verifies the appcast, and each update before it unpacks it, with the key. It only looks for updates when
+    # the user asks, and so never asks whether it may look by itself.
+    foreach (entry IN ITEMS
+        "<key>SUFeedURL</key>\n        <string>${sparkle_feed_url_xml}</string>"
+        "<key>SUPublicEDKey</key>\n        <string>${LADYBIRD_SPARKLE_PUBLIC_KEY}</string>"
+        "<key>SURequireSignedFeed</key>\n        <true/>"
+        "<key>SUVerifyUpdateBeforeExtraction</key>\n        <true/>"
+        "<key>SUEnableAutomaticChecks</key>\n        <false/>"
+    )
+        string(APPEND LADYBIRD_SPARKLE_PLIST_ENTRIES "${entry}\n        ")
+    endforeach()
 endif()
 
 function(create_ladybird_bundle target_name)
     set_target_properties(${target_name} PROPERTIES
-        OUTPUT_NAME "Ladybird"
-        MACOSX_BUNDLE_GUI_IDENTIFIER org.ladybird.Ladybird
-        MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
-        MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}
-        MACOSX_BUNDLE_INFO_PLIST "${LADYBIRD_SOURCE_DIR}/UI/Info.plist"
-        MACOSX_BUNDLE TRUE
+        OUTPUT_NAME "ladybird"
         WIN32_EXECUTABLE TRUE
-        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER org.ladybird.Ladybird
     )
 
     if (APPLE)
-        set(bundle_dir "$<TARGET_BUNDLE_DIR:${target_name}>")
+        set(bundle_dir "${LADYBIRD_BUNDLE_DIR}")
+        set_target_properties(${target_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${bundle_dir}/Contents/MacOS")
+
+        set(MACOSX_BUNDLE_GUI_IDENTIFIER ${LADYBIRD_BUNDLE_IDENTIFIER})
+        set(MACOSX_BUNDLE_BUNDLE_VERSION ${LADYBIRD_BROWSER_VERSION})
+        set(MACOSX_BUNDLE_SHORT_VERSION_STRING ${LADYBIRD_BROWSER_VERSION})
+        set(info_plist "${CMAKE_CURRENT_BINARY_DIR}/${target_name}-Info.plist")
+        configure_file("${LADYBIRD_SOURCE_DIR}/UI/Info.plist" "${info_plist}")
+        set_property(TARGET ${target_name} APPEND PROPERTY LINK_DEPENDS "${info_plist}")
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${info_plist}" "${bundle_dir}/Contents/Info.plist"
+            VERBATIM
+        )
+
+        # The bundle's icon is made after linking, so a changed icon relinks the target.
+        set(app_icon_images)
+        foreach (size IN ITEMS 16 32 128 256 512)
+            list(APPEND app_icon_images
+                "${LADYBIRD_SOURCE_DIR}/UI/Icons/macos/app_icon.iconset/icon_${size}x${size}.png"
+                "${LADYBIRD_SOURCE_DIR}/UI/Icons/macos/app_icon.iconset/icon_${size}x${size}@2x.png"
+            )
+        endforeach()
+        set_property(TARGET ${target_name} APPEND PROPERTY LINK_DEPENDS ${app_icon_images})
+
         add_custom_command(TARGET ${target_name} POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${bundle_dir}/Contents/Resources"
             COMMAND "iconutil" --convert icns "${LADYBIRD_SOURCE_DIR}/UI/Icons/macos/app_icon.iconset" --output "${bundle_dir}/Contents/Resources/app_icon.icns"
         )
 
-        # Note: This symlink is removed in the install commands
-        # This makes the bundle in the build directory *NOT* relocatable
+        # macOS 26 and later show the Icon Composer icon from the asset catalog, which adapts to the system's icon
+        # styles. Earlier versions show the flat app_icon.icns.
+        if (LADYBIRD_COMPILE_ICON_COMPOSER_ICON)
+            set(icon_composer_icon "${LADYBIRD_SOURCE_DIR}/UI/Icons/macos/AppIcon.icon")
+            set_property(TARGET ${target_name} APPEND PROPERTY LINK_DEPENDS
+                "${icon_composer_icon}/icon.json"
+                "${icon_composer_icon}/Assets/mark.svg"
+                "${icon_composer_icon}/Assets/mark-dark.svg"
+                "${icon_composer_icon}/Assets/mark-mono.svg"
+            )
+
+            set(asset_catalog_dir "${CMAKE_CURRENT_BINARY_DIR}/${target_name}_asset_catalog")
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${asset_catalog_dir}"
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DLOG=${CMAKE_CURRENT_BINARY_DIR}/${target_name}-actool.log"
+                    -P "${LADYBIRD_SOURCE_DIR}/Meta/CMake/run_quiet.cmake"
+                    --
+                    xcrun actool "${icon_composer_icon}" --compile "${asset_catalog_dir}"
+                    --app-icon AppIcon --platform macosx --target-device mac
+                    --minimum-deployment-target "${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                    --output-partial-info-plist "${asset_catalog_dir}/partial.plist"
+                    --errors --warnings --output-format human-readable-text
+                COMMAND "${CMAKE_COMMAND}" -E copy "${asset_catalog_dir}/Assets.car" "${bundle_dir}/Contents/Resources/Assets.car"
+                VERBATIM
+            )
+        endif()
+
+        if (LADYBIRD_ENABLE_SPARKLE)
+            # Sparkle installs updates with programs of its own in its framework, which are signed before the app.
+            get_target_property(sparkle_framework unofficial::sparkle::Sparkle IMPORTED_LOCATION)
+            set(bundled_sparkle_framework "${bundle_dir}/Contents/Frameworks/Sparkle.framework")
+            set_property(TARGET ${target_name} APPEND PROPERTY BUILD_RPATH "@executable_path/../Frameworks")
+            set_property(TARGET ${target_name} APPEND PROPERTY INSTALL_RPATH "@executable_path/../Frameworks")
+
+            ladybird_codesign_command(sparkle_autoupdate_codesign_command "${target_name}-sparkle-autoupdate" -o runtime "${bundled_sparkle_framework}/Versions/B/Autoupdate")
+            ladybird_codesign_command(sparkle_updater_codesign_command "${target_name}-sparkle-updater" -o runtime "${bundled_sparkle_framework}/Versions/B/Updater.app")
+            ladybird_codesign_command(sparkle_codesign_command "${target_name}-sparkle" "${bundled_sparkle_framework}")
+
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bundled_sparkle_framework}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${bundle_dir}/Contents/Frameworks"
+                COMMAND ditto "${sparkle_framework}" "${bundled_sparkle_framework}"
+                COMMAND "${CMAKE_COMMAND}" -E rm -rf
+                    "${bundled_sparkle_framework}/Headers" "${bundled_sparkle_framework}/Versions/B/Headers"
+                    "${bundled_sparkle_framework}/PrivateHeaders" "${bundled_sparkle_framework}/Versions/B/PrivateHeaders"
+                    "${bundled_sparkle_framework}/Modules" "${bundled_sparkle_framework}/Versions/B/Modules"
+                COMMAND ${sparkle_autoupdate_codesign_command}
+                COMMAND ${sparkle_updater_codesign_command}
+                COMMAND ${sparkle_codesign_command}
+                VERBATIM
+            )
+        else()
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bundle_dir}/Contents/Frameworks/Sparkle.framework"
+                VERBATIM
+            )
+        endif()
+
+        # NB: The install does not copy this symlink, but it makes the bundle in the build directory *NOT* relocatable.
         add_custom_command(TARGET ${target_name} POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E create_symlink "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}" "${bundle_dir}/Contents/lib"
         )
 
-        add_custom_command(TARGET ${target_name} POST_BUILD
-            COMMAND codesign -s - -v -f --entitlements "${LADYBIRD_ENTITLEMENTS_FILE}" "${bundle_dir}"
-        )
+        ladybird_codesign_command(codesign_command "${target_name}" --entitlements "${LADYBIRD_ENTITLEMENTS_FILE}" -v "${bundle_dir}")
+        add_custom_command(TARGET ${target_name} POST_BUILD COMMAND ${codesign_command} VERBATIM)
     endif()
 
     if (APPLE)
-        set(resource_base_dir "$<TARGET_BUNDLE_DIR:${target_name}>/Contents/Resources")
+        set(resource_base_dir "${LADYBIRD_BUNDLE_DIR}/Contents/Resources")
     else()
         set(resource_base_dir "${CMAKE_BINARY_DIR}/${IN_BUILD_PREFIX}${CMAKE_INSTALL_DATADIR}/Lagom")
     endif()
@@ -47,11 +161,7 @@ function(create_ladybird_bundle target_name)
     copy_resources_to_build(${resource_base_dir} ${target_name})
 endfunction()
 
-if (ANDROID OR VCPKG_TARGET_ANDROID)
-    add_subdirectory("Android")
-else()
-    add_subdirectory("Qt")
-endif()
+add_subdirectory("Qt")
 
 if (NOT TARGET ladybird)
     message(FATAL_ERROR "UI Framework selection must declare a ladybird target")
@@ -63,7 +173,13 @@ else()
     set(LADYBIRD_TARGET ladybird PRIVATE)
 endif()
 
-set(LADYBIRD_LIBS AK LibCore LibGfx LibIPC LibMain LibWebView LibURL LibWakeLock)
+set(LADYBIRD_LIBS AK LibCore LibGfx LibIPC LibMain LibThreading LibWebView LibURL LibWakeLock LibGamepad hubipc)
+# NB: Where the Hub is a process of its own, the UI must not be able to reach into it.
+if (LINUX OR APPLE)
+    target_compile_definitions(${LADYBIRD_TARGET} LADYBIRD_HUB_IN_OWN_PROCESS)
+else()
+    list(APPEND LADYBIRD_LIBS hubservice)
+endif()
 target_link_libraries(${LADYBIRD_TARGET} ${LADYBIRD_LIBS})
 target_link_libraries(${LADYBIRD_TARGET} OpenSSL::Crypto OpenSSL::SSL)
 
@@ -93,7 +209,7 @@ add_custom_target(run
 
 if (APPLE)
     add_custom_target(debug-ladybird
-        COMMAND "${CMAKE_COMMAND}" -E env "LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}" lldb "$<TARGET_BUNDLE_DIR:ladybird>"
+        COMMAND "${CMAKE_COMMAND}" -E env "LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}" lldb "${LADYBIRD_BUNDLE_DIR}"
         USES_TERMINAL
     )
 else()
@@ -116,11 +232,14 @@ if (APPLE)
     # WebDriver and the helpers can link into the bundle after ladybird has signed it — and that leaves the seal stale
     # until something later relinks ladybird. Sign once more with everything in place.
     set(bundle_signed_stamp "${CMAKE_CURRENT_BINARY_DIR}/ladybird_bundle_signed.stamp")
+    get_property(resource_outputs GLOBAL PROPERTY LADYBIRD_RESOURCE_OUTPUTS)
+    ladybird_codesign_command(codesign_command ladybird-bundle --entitlements "${LADYBIRD_ENTITLEMENTS_FILE}" -v "${LADYBIRD_BUNDLE_DIR}")
+
     add_custom_command(
         OUTPUT "${bundle_signed_stamp}"
-        COMMAND codesign -s - -v -f --entitlements "${LADYBIRD_ENTITLEMENTS_FILE}" "$<TARGET_BUNDLE_DIR:ladybird>"
+        COMMAND ${codesign_command}
         COMMAND "${CMAKE_COMMAND}" -E touch "${bundle_signed_stamp}"
-        DEPENDS ladybird WebDriver ${ladybird_helper_processes} "${LADYBIRD_ENTITLEMENTS_FILE}"
+        DEPENDS ladybird WebDriver ${ladybird_helper_processes} "${LADYBIRD_ENTITLEMENTS_FILE}" ${resource_outputs}
         VERBATIM
     )
     add_custom_target(sign_ladybird_bundle ALL DEPENDS "${bundle_signed_stamp}")

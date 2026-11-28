@@ -7,10 +7,8 @@
 
 #pragma once
 
-#include <LibGfx/Path.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLHyperlinkElementUtils.h>
-#include <LibWebCommon/PixelUnits.h>
 
 namespace Web::HTML {
 
@@ -31,14 +29,11 @@ public:
         Rectangle,
     };
     ShapeState shape_state() const;
-
-    Optional<Gfx::Path> shape_path(CSSPixelSize image_size) const;
-    bool shape_contains_point(CSSPixelPoint, CSSPixelSize image_size) const;
+    Vector<double> shape_coords() const;
 
 private:
     HTMLAreaElement(DOM::Document&, DOM::QualifiedName);
 
-    virtual bool is_html_area_element() const override { return true; }
     virtual void visit_edges(Cell::Visitor&) override;
 
     virtual Optional<URL::Origin> extract_an_origin() const final { return hyperlink_element_utils_extract_an_origin(); }
@@ -46,6 +41,10 @@ private:
     // ^DOM::EventTarget
     virtual bool has_activation_behavior() const override;
     virtual void activation_behavior(Web::DOM::Event const&) override;
+
+    // ^DOM::Node
+    virtual void inserted() override;
+    virtual void removed_from(IsSubtreeRoot, DOM::Node* old_ancestor, DOM::Node& old_root) override;
 
     // ^DOM::Element
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
@@ -64,12 +63,5 @@ private:
 
     GC::Ptr<DOM::DOMTokenList> m_rel_list;
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLAreaElement>() const { return is_html_area_element(); }
 
 }

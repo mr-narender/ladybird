@@ -119,10 +119,10 @@ static void remove_empty_inline_staging_wrappers(DOM::DocumentFragment& fragment
     }
 }
 
-ReplacementFragment::ReplacementFragment(DOM::Range& range, TrustedTypes::TrustedHTMLOrString const& value)
+ReplacementFragment::ReplacementFragment(DOM::Range& range, DOM::DocumentFragment& fragment)
+    : m_fragment(fragment)
 {
     EditingHistory::ProxyMutationScope mutation_scope { *range.start_container() };
-    m_fragment = MUST(range.create_contextual_fragment(value));
     remove_formatting_whitespace_between_blocks(*m_fragment);
 
     auto* first_leaf = m_fragment->first_child();

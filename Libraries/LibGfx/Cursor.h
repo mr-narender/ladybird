@@ -31,11 +31,14 @@ enum class StandardCursor {
     OpenHand,
     Drag,
     DragCopy,
+    DragLink,
     Move,
     Wait,
+    Progress,
     Disallowed,
     Eyedropper,
-    Zoom,
+    ZoomIn,
+    ZoomOut,
 };
 
 struct ImageCursor {
@@ -82,16 +85,22 @@ constexpr StringView standard_cursor_to_string(StandardCursor cursor)
         return "Drag"sv;
     case StandardCursor::DragCopy:
         return "DragCopy"sv;
+    case StandardCursor::DragLink:
+        return "DragLink"sv;
     case StandardCursor::Move:
         return "Move"sv;
     case StandardCursor::Wait:
         return "Wait"sv;
+    case StandardCursor::Progress:
+        return "Progress"sv;
     case StandardCursor::Disallowed:
         return "Disallowed"sv;
     case StandardCursor::Eyedropper:
         return "Eyedropper"sv;
-    case StandardCursor::Zoom:
-        return "Zoom"sv;
+    case StandardCursor::ZoomIn:
+        return "ZoomIn"sv;
+    case StandardCursor::ZoomOut:
+        return "ZoomOut"sv;
     }
     VERIFY_NOT_REACHED();
 }

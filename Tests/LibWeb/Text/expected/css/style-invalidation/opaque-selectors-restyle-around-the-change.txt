@@ -1,0 +1,9 @@
+unrelated class: restyled []
+:nth-child(… of S) sibling: restyled [first, second, third, li, li@2]
+second: rgb(0, 0, 0), third: rgb(0, 128, 0)
+@scope root: restyled [scope, scoped, limit, limited]
+scoped: rgb(0, 0, 255)
+@scope limit: restyled [limit, limited]
+limited: rgb(0, 0, 0)
+host or ancestor: restyled [host, style, shadow-child]
+shadow child: rgb(255, 0, 0)

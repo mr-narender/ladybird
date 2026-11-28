@@ -6,23 +6,26 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Function.h>
+#include <AK/Mutex.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Optional.h>
+#include <LibAudio/ChannelMap.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibMedia/Audio/ChannelMap.h>
-#include <LibMedia/CodedFrame.h>
+#include <LibCore/System.h>
 #include <LibMedia/Containers/Matroska/MatroskaDemuxer.h>
 #include <LibMedia/Containers/Matroska/Reader.h>
 #include <LibMedia/Containers/Matroska/Utilities.h>
 #include <LibMedia/Demuxer.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Producers/DecodedAudioProducer.h>
 #include <LibMedia/Producers/VideoProducer.h>
-#include <LibMedia/VideoDecoder.h>
-#include <LibMedia/VideoFrame.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/VideoDecoder.h>
+#include <LibMediaCodecs/VideoFrame.h>
 #include <LibTest/TestCase.h>
 
 static inline Core::EventLoop& never_destroyed_event_loop()
@@ -92,12 +95,7 @@ static inline void decode_audio(StringView path, u32 sample_rate, u8 channel_cou
 
     auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
-    auto demuxer = MUST([&] -> Media::DecoderErrorOr<NonnullRefPtr<Media::Demuxer>> {
-        auto matroska_result = Media::Matroska::MatroskaDemuxer::from_stream(stream);
-        if (!matroska_result.is_error())
-            return matroska_result.release_value();
-        return Media::FFmpeg::FFmpegDemuxer::from_stream(stream);
-    }());
+    auto demuxer = MUST(Media::create_demuxer(stream));
     auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Audio));
     VERIFY(!tracks.is_empty());
     auto producer = TRY_OR_FAIL(Media::DecodedAudioProducer::try_create(loop, demuxer, tracks[0]));
@@ -109,7 +107,7 @@ static inline void decode_audio(StringView path, u32 sample_rate, u8 channel_cou
     });
     producer->start();
 
-    auto time_limit = AK::Duration::from_seconds(1);
+    auto time_limit = AK::Duration::from_seconds(10);
     auto start_time = MonotonicTime::now_coarse();
 
     i64 last_frame = 0;
@@ -160,9 +158,10 @@ public:
         append_output(move(frame), Media::PipelineStatus::HaveData);
     }
 
-    void append_output(RefPtr<Media::VideoFrame> frame, Media::PipelineStatus status)
+    void append_output(RefPtr<Media::VideoFrame> frame, Media::PipelineStatus status, Media::PipelineCheckpoint checkpoint = 0)
     {
-        m_outputs.append({ move(frame), status });
+        MutexLocker locker { m_mutex };
+        m_outputs.append({ move(frame), status, checkpoint });
     }
 
     void wake()
@@ -171,23 +170,181 @@ public:
             m_wake_handler();
     }
 
-    virtual void start() override { }
+    virtual void start() override { m_start_count++; }
+    virtual void suspend() override { m_suspend_count++; }
     virtual Media::VideoProducerOutput peek() override
     {
+        MutexLocker locker { m_mutex };
         if (m_outputs.is_empty())
             return { nullptr, Media::PipelineStatus::Pending };
         return m_outputs.first();
     }
-    virtual void consume() override { (void)m_outputs.take_first(); }
+    virtual void consume() override
+    {
+        MutexLocker locker { m_mutex };
+        (void)m_outputs.take_first();
+    }
     virtual void set_wake_handler(Media::PipelineWakeHandler handler) override { m_wake_handler = move(handler); }
-    virtual void seek(AK::Duration) override { m_seek_count++; }
+    virtual void seek(AK::Duration timestamp, Media::InvalidateHeldData = Media::InvalidateHeldData::No) override
+    {
+        m_seek_count++;
+        m_last_seek_timestamp = timestamp;
+    }
 
     size_t seek_count() const { return m_seek_count; }
+    Optional<AK::Duration> last_seek_timestamp() const { return m_last_seek_timestamp; }
+    size_t start_count() const { return m_start_count; }
+    size_t suspend_count() const { return m_suspend_count; }
 
 private:
     ScriptedVideoProducer() = default;
 
+    Mutex m_mutex;
     Vector<Media::VideoProducerOutput> m_outputs;
     size_t m_seek_count { 0 };
+    Optional<AK::Duration> m_last_seek_timestamp;
+    size_t m_start_count { 0 };
+    size_t m_suspend_count { 0 };
     Media::PipelineWakeHandler m_wake_handler;
+};
+
+static inline NonnullRefPtr<Media::IncrementallyPopulatedStream> load_test_file(StringView path)
+{
+    auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
+    return Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
+}
+
+static inline NonnullRefPtr<Media::Demuxer> create_demuxer(NonnullRefPtr<Media::IncrementallyPopulatedStream> const& stream)
+{
+    return MUST(Media::create_demuxer(stream));
+}
+
+template<typename Condition>
+static inline bool pump_until(Core::EventLoop& loop, Condition condition)
+{
+    auto deadline = MonotonicTime::now_coarse() + AK::Duration::from_seconds(10);
+    while (MonotonicTime::now_coarse() < deadline) {
+        if (condition())
+            return true;
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+    return false;
+}
+
+static constexpr AK::Duration SHORT_AUTO_SUSPEND_TIMEOUT = AK::Duration::from_milliseconds(50);
+
+static inline void sleep_past_the_idle_timeout()
+{
+    MUST(Core::System::sleep_ms(static_cast<u32>(SHORT_AUTO_SUSPEND_TIMEOUT.to_milliseconds() * 4)));
+}
+
+// A stalled test thread can leave the producer idle long enough to suspend before it is ever seen with data.
+static inline bool has_data_or_already_suspended(Media::PipelineStatus status)
+{
+    return status == Media::PipelineStatus::HaveData || status == Media::PipelineStatus::Suspended;
+}
+
+// A stalled test thread can leave the producer idle long enough to suspend again before it peeks, and a consumer that
+// sees a suspension must seek again. These resume from a seek as such a consumer would.
+// Returns the output that showed the data, since the producer can suspend again and drop it before another peek.
+// seek_count counts the seeks issued, the first included.
+template<typename Producer>
+static inline auto seek_to_resume_and_pump_until_woken_with_data(Core::EventLoop& loop, Producer& producer, AK::Duration timestamp, size_t& seek_count)
+{
+    Optional<decltype(producer.peek())> output_with_data;
+    bool woken = false;
+    producer.set_wake_handler([&] { woken = true; });
+    producer.seek(timestamp);
+    seek_count = 1;
+    pump_until(loop, [&] {
+        if (!woken)
+            return false;
+        woken = false;
+        auto output = producer.peek();
+        if (output.status == Media::PipelineStatus::Suspended) {
+            producer.seek(timestamp);
+            seek_count++;
+            return false;
+        }
+        if (output.status != Media::PipelineStatus::HaveData)
+            return false;
+        output_with_data = move(output);
+        return true;
+    });
+    producer.set_wake_handler(nullptr);
+    return output_with_data;
+}
+
+template<typename Producer>
+static inline auto seek_to_resume_and_pump_until_woken_with_data(Core::EventLoop& loop, Producer& producer, AK::Duration timestamp)
+{
+    size_t seek_count = 0;
+    return seek_to_resume_and_pump_until_woken_with_data(loop, producer, timestamp, seek_count);
+}
+
+struct ExpectedScenePeak {
+    i64 milliseconds;
+    Optional<double> luminance;
+};
+
+// The frames of these files were given scene peaks in decoding order, so a peak that does not follow its frame through
+// reordering lands on a frame expecting another.
+static constexpr Array<ExpectedScenePeak, 6> hevc_hdr10_plus_in_sei_scene_peaks { {
+    { 0, 100 },
+    { 33, 400 },
+    { 67, 500 },
+    { 100, 300 },
+    { 133, 600 },
+    { 167, 200 },
+} };
+// Each frame's RPU takes another path through the syntax: a polynomial mapping, floating point coefficients, a reused
+// mapping with compressed display management, nonlinear quantization, no display management at all, and MMR.
+static constexpr Array<ExpectedScenePeak, 6> hevc_dolby_vision_rpus_scene_peaks { {
+    { 0, 100.1 },
+    { 33, 300.33 },
+    { 67, 599.56 },
+    { 100, 500.44 },
+    { 133, {} },
+    { 167, 399.72 },
+} };
+
+// Each expected frame has to be checked exactly once, whatever order the frames come in.
+class ScenePeakChecker {
+public:
+    explicit ScenePeakChecker(Span<ExpectedScenePeak const> expected_scene_peaks)
+        : m_expected_scene_peaks(expected_scene_peaks)
+    {
+        m_checked.resize(expected_scene_peaks.size());
+    }
+
+    void check(AK::Duration timestamp, Optional<float> maximum_scene_luminance)
+    {
+        Optional<size_t> expected_index;
+        for (size_t index = 0; index < m_expected_scene_peaks.size(); index++) {
+            if (m_expected_scene_peaks[index].milliseconds == timestamp.to_milliseconds())
+                expected_index = index;
+        }
+        EXPECT(expected_index.has_value());
+        if (!expected_index.has_value())
+            return;
+        EXPECT(!m_checked[expected_index.value()]);
+        m_checked[expected_index.value()] = true;
+
+        auto const& expected = m_expected_scene_peaks[expected_index.value()];
+        EXPECT_EQ(maximum_scene_luminance.has_value(), expected.luminance.has_value());
+        if (!maximum_scene_luminance.has_value() || !expected.luminance.has_value())
+            return;
+        EXPECT(isfinite(maximum_scene_luminance.value()));
+        EXPECT_APPROXIMATE_WITH_ERROR(maximum_scene_luminance.value(), expected.luminance.value(), 0.5);
+    }
+
+    void expect_every_frame_checked() const
+    {
+        for (auto checked : m_checked)
+            EXPECT(checked);
+    }
+
+private:
+    Span<ExpectedScenePeak const> m_expected_scene_peaks;
+    Vector<bool> m_checked;
 };

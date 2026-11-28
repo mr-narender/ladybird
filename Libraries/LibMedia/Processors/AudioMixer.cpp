@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Checked.h>
 #include <LibCore/EventLoop.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioMixer.h>
@@ -179,7 +180,7 @@ AudioProducerOutput AudioMixer::peek()
     }
     if (!m_output_block.is_empty())
         status = PipelineStatus::HaveData;
-    return { m_output_block.is_empty() ? nullptr : &m_output_block, status };
+    return { m_output_block.is_empty() ? nullptr : &m_output_block, status, oldest_input_checkpoint_while_locked() };
 }
 
 void AudioMixer::consume()
@@ -191,10 +192,24 @@ void AudioMixer::consume()
 bool AudioMixer::any_input_is_suspended_while_locked()
 {
     for (auto& [input, input_data] : m_inputs) {
-        if (input->peek().status == PipelineStatus::Suspended)
+        auto output = input->peek();
+        // A mix stops at the first input with nothing to mix, so the status of every other input is taken here. An
+        // input whose block is still being mixed keeps the status it had when the block was taken.
+        if (input_data.current_block.is_empty())
+            input_data.last_status = output.status;
+        input_data.last_checkpoint = output.checkpoint;
+        if (output.status == PipelineStatus::Suspended)
             return true;
     }
     return false;
+}
+
+PipelineCheckpoint AudioMixer::oldest_input_checkpoint_while_locked() const
+{
+    Optional<PipelineCheckpoint> checkpoint;
+    for (auto const& [input, input_data] : m_inputs)
+        checkpoint = min(checkpoint.value_or(input_data.last_checkpoint), input_data.last_checkpoint);
+    return checkpoint.value_or(0);
 }
 
 void AudioMixer::drop_buffered_data_while_locked()
@@ -210,7 +225,14 @@ PipelineStatus AudioMixer::mix_into_output_block_while_locked()
     auto max_frame_count = AudioBlock::max_frame_count(channel_count);
 
     auto buffer_start_frame = m_next_frame_to_write;
-    auto frames_end_cap = buffer_start_frame + static_cast<i64>(max_frame_count);
+    Checked<i64> checked_frames_end_cap = buffer_start_frame;
+    checked_frames_end_cap += static_cast<i64>(max_frame_count);
+    // A seek to the end of representable time has no frames left to mix.
+    if (checked_frames_end_cap.has_overflow()) {
+        drop_buffered_data_while_locked();
+        return PipelineStatus::EndOfStream;
+    }
+    auto frames_end_cap = checked_frames_end_cap.value();
 
     auto combined_status_after_mix = PipelineStatus::EndOfStream;
     i64 latest_mixed_frame = frames_end_cap;
@@ -258,6 +280,7 @@ PipelineStatus AudioMixer::mix_into_output_block_while_locked()
             current_block.clear();
             auto output = input.peek();
             input_data.last_status = output.status;
+            input_data.last_checkpoint = output.checkpoint;
             if (output.status == PipelineStatus::Suspended) {
                 drop_buffered_data_while_locked();
                 return PipelineStatus::Suspended;

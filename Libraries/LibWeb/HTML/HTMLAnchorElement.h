@@ -42,12 +42,9 @@ public:
             && meets_focusable_area_rendering_requirements();
     }
 
-    virtual bool is_html_anchor_element() const override { return true; }
-
 private:
     HTMLAnchorElement(DOM::Document&, DOM::QualifiedName);
 
-    bool has_download_preference() const;
     virtual void visit_edges(Cell::Visitor&) override;
 
     // ^DOM::EventTarget
@@ -66,12 +63,5 @@ private:
 
     GC::Ptr<DOM::DOMTokenList> m_rel_list;
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLAnchorElement>() const { return is_html_anchor_element(); }
 
 }

@@ -21,7 +21,8 @@ private:                                                                        
         return take_lazy_load_resumption_steps_internal();                                               \
     }                                                                                                    \
                                                                                                          \
-    virtual bool is_lazy_loading() const override { return true; }
+    static_assert(IsOneOf<ElementClass, HTMLImageElement, HTMLIFrameElement>,                            \
+        "DOM::Node::is_lazy_loading() must answer true for every lazy-loading element class")
 
 enum class LazyLoading {
     Lazy,
@@ -32,14 +33,17 @@ template<typename T>
 class LazyLoadingElement {
 public:
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#lazy-loading-attributes
-    [[nodiscard]] LazyLoading lazy_loading_attribute() const
+    [[nodiscard]] static LazyLoading lazy_loading_state(Optional<Utf16String> const& value)
     {
-        auto& element = static_cast<T const&>(*this);
-
-        auto value = element.attribute(HTML::AttributeNames::loading);
         if (value.has_value() && value->equals_ignoring_ascii_case(u"lazy"sv))
             return LazyLoading::Lazy;
         return LazyLoading::Eager;
+    }
+
+    [[nodiscard]] LazyLoading lazy_loading_attribute() const
+    {
+        auto& element = static_cast<T const&>(*this);
+        return lazy_loading_state(element.attribute(HTML::AttributeNames::loading));
     }
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#will-lazy-load-element-steps
@@ -62,9 +66,9 @@ public:
 
     [[nodiscard]] bool has_lazy_load_resumption_steps() const { return !!m_lazy_load_resumption_steps; }
 
-    void set_lazy_load_resumption_steps(Function<void()> steps)
+    void set_lazy_load_resumption_steps(GC::Ref<GC::Function<void()>> steps)
     {
-        m_lazy_load_resumption_steps = GC::create_function(GC::Heap::the(), move(steps));
+        m_lazy_load_resumption_steps = steps;
     }
 
     void visit_lazy_loading_element(JS::Cell::Visitor& visitor)

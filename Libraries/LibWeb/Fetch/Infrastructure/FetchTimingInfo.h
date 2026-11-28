@@ -6,12 +6,13 @@
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/NonnullRefPtr.h>
-#include <AK/RefCounted.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <LibRequests/Forward.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Fetch/Engine/FetchTimingSeed.h>
 #include <LibWebCommon/Fetch/Infrastructure/ConnectionTimingInfo.h>
 #include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
 #include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
@@ -19,9 +20,14 @@
 namespace Web::Fetch::Infrastructure {
 
 // https://fetch.spec.whatwg.org/#fetch-timing-info
-class WEB_API FetchTimingInfo : public RefCounted<FetchTimingInfo> {
+class WEB_API FetchTimingInfo : public AtomicRefCounted<FetchTimingInfo> {
 public:
+    GC_HOLDS_NO_CELL_EDGES;
+
     [[nodiscard]] static NonnullRefPtr<FetchTimingInfo> create();
+    [[nodiscard]] static NonnullRefPtr<FetchTimingInfo> create(Engine::FetchTimingSeed const&);
+
+    [[nodiscard]] Engine::FetchTimingSeed seed() const;
 
     [[nodiscard]] HighResolutionTime::DOMHighResTimeStamp start_time() const { return m_start_time; }
     void set_start_time(HighResolutionTime::DOMHighResTimeStamp start_time) { m_start_time = start_time; }
@@ -60,6 +66,10 @@ public:
     [[nodiscard]] bool render_blocking() const { return m_render_blocking; }
     void set_render_blocking(bool render_blocking) { m_render_blocking = render_blocking; }
 
+    [[nodiscard]] Engine::FetchNetworkPhases final_network_phases(Requests::RequestTimingInfo const& final_timings, HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability) const;
+    // The final connection timing info and network start times, if the final connection timing info is not null.
+    [[nodiscard]] Optional<Engine::FetchNetworkPhases> network_phases() const;
+    void set_network_phases(Engine::FetchNetworkPhases);
     void update_final_timings(Requests::RequestTimingInfo const& final_timings, HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability);
 
 private:

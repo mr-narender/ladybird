@@ -9,9 +9,9 @@
 
 #include <AK/FixedArray.h>
 #include <AK/NonnullRefPtr.h>
-#include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 namespace Media::Matroska {
 
@@ -38,6 +38,7 @@ public:
     DecoderErrorOr<void> read_unknown_element();
 
     DecoderErrorOr<FixedArray<u8>> read_raw_octets(size_t num_octets);
+    DecoderErrorOr<void> read_and_discard_octets(size_t num_octets);
 
     size_t position() const;
 

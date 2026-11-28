@@ -7,6 +7,7 @@
 
 #include <LibGC/Heap.h>
 #include <LibWeb/Bindings/MouseEvent.h>
+#include <LibWeb/DOM/Node.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
@@ -18,6 +19,19 @@
 namespace Web::UIEvents {
 
 GC_DEFINE_ALLOCATOR(MouseEvent);
+
+// INTEROP: The legacy mouse endpoints use the current dispatch targets, reversing direction for exit events.
+GC::Ptr<DOM::Node> MouseEvent::from_element() const
+{
+    auto endpoint = type().is_one_of(EventNames::mouseout, EventNames::mouseleave) ? target() : related_target();
+    return as_if<DOM::Node>(endpoint.ptr());
+}
+
+GC::Ptr<DOM::Node> MouseEvent::to_element() const
+{
+    auto endpoint = type().is_one_of(EventNames::mouseout, EventNames::mouseleave) ? related_target() : target();
+    return as_if<DOM::Node>(endpoint.ptr());
+}
 
 MouseEvent::MouseEvent(FlyString const& event_name, MouseEventOptions const& options, double page_x, double page_y, double offset_x, double offset_y, HighResolutionTime::DOMHighResTimeStamp time_stamp)
     : UIEvent(event_name, time_stamp)
@@ -272,7 +286,6 @@ WebIDL::ExceptionOr<GC::Ref<MouseEvent>> MouseEvent::create_from_platform_event(
     event_options.button = mouse_button_to_button_code(static_cast<MouseButton>(button));
     event_options.buttons = buttons;
     auto event = MouseEvent::create(event_name, event_options, page.x().to_double(), page.y().to_double(), offset.x().to_double(), offset.y().to_double(), HighResolutionTime::current_high_resolution_time(relevant_global_object));
-    event->set_is_trusted(true);
     event->set_bubbles(true);
     event->set_cancelable(true);
     event->set_composed(true);
@@ -299,11 +312,19 @@ WebIDL::ExceptionOr<GC::Ref<MouseEvent>> MouseEvent::create_from_platform_event(
         event_options.movement_y = movement->y().to_double();
     }
     auto event = MouseEvent::create(event_name, event_options, page.x().to_double(), page.y().to_double(), offset.x().to_double(), offset.y().to_double(), HighResolutionTime::current_high_resolution_time(relevant_global_object));
-    event->set_is_trusted(true);
     event->set_bubbles(true);
     event->set_cancelable(true);
     event->set_composed(true);
     return event;
+}
+
+extern "C" {
+MouseEvent const* web_ui_events_mouse_event_from_event(DOM::Event const*);
+
+MouseEvent const* web_ui_events_mouse_event_from_event(DOM::Event const* event)
+{
+    return as_if<MouseEvent>(event);
+}
 }
 
 }

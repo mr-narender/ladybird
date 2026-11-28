@@ -5,7 +5,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <LibCore/Socket.h>
+#include <LibCore/SocketAddress.h>
 #include <LibCore/System.h>
 
 namespace Core {
@@ -106,6 +108,36 @@ ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>> Socket::resolve_host(ByteStri
         return Error::from_string_literal("Could not resolve to IPv4 or IPv6 address");
 
     return addresses;
+}
+
+// Connecting a datagram socket sends nothing, but has the system choose the local address it would send from.
+bool Socket::is_ipv6_globally_reachable()
+{
+    auto fd_or_error = create_fd(SocketDomain::Inet6, SocketType::Datagram);
+    if (fd_or_error.is_error())
+        return false;
+    auto fd = fd_or_error.release_value();
+    ScopeGuard close_fd = [fd] { (void)System::close(fd); };
+
+    // 2001:4860:4860::8888, a public DNS server.
+    static constexpr Array<u16, 8> probe_address { 0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888 };
+    auto destination = SocketAddress { IPv6Address { probe_address }, 443 }.to_sockaddr_in6();
+    if (System::connect(fd, bit_cast<struct sockaddr const*>(&destination), sizeof(destination)).is_error())
+        return false;
+
+    struct sockaddr_in6 local_socket_address {};
+    socklen_t local_socket_address_size = sizeof(local_socket_address);
+    if (System::getsockname(fd, bit_cast<struct sockaddr*>(&local_socket_address), &local_socket_address_size).is_error())
+        return false;
+    IPv6Address local_address { local_socket_address.sin6_addr.s6_addr };
+
+    // A link-local address (fe80::/10) reaches no further than the link, and a Teredo address (2001::/32) tunnels
+    // IPv6 over IPv4 too unreliably to prefer it.
+    if ((local_address[0] & 0xffc0) == 0xfe80)
+        return false;
+    if (local_address[0] == 0x2001 && local_address[1] == 0)
+        return false;
+    return true;
 }
 
 ErrorOr<void> Socket::connect_local(int fd, ByteString const& path)
@@ -375,52 +407,6 @@ ErrorOr<size_t> LocalSocket::send_message(ReadonlyBytes data, int flags, Vector<
     msg.msg_controllen = CMSG_LEN(fd_payload_size);
 
     return Core::System::sendmsg(m_helper.fd(), &msg, default_flags() | flags);
-}
-
-ErrorOr<Bytes> LocalSocket::receive_message(AK::Bytes buffer, int flags, Vector<int>& fds)
-{
-    struct iovec iov {
-        .iov_base = buffer.data(),
-        .iov_len = buffer.size(),
-    };
-
-    alignas(struct cmsghdr) char control_buf[CMSG_SPACE(sizeof(int) * MAX_TRANSFER_FDS)] {};
-
-    struct msghdr msg = {};
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control_buf;
-    msg.msg_controllen = sizeof(control_buf);
-
-    // NB: A descriptor that arrives here must not survive an exec() in this process, where it would reach a child
-    //     that was never meant to have it.
-    int receive_flags = default_flags() | flags;
-#ifdef MSG_CMSG_CLOEXEC
-    receive_flags |= MSG_CMSG_CLOEXEC;
-#endif
-    auto nread = TRY(Core::System::recvmsg(m_helper.fd(), &msg, receive_flags));
-    if (nread == 0) {
-        m_helper.did_reach_eof_on_read();
-        return buffer.trim(nread);
-    }
-
-    fds.clear();
-
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    while (cmsg != nullptr) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-            size_t num_fds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-            auto* fd_data = reinterpret_cast<int*>(CMSG_DATA(cmsg));
-            for (size_t i = 0; i < num_fds; ++i) {
-#ifndef MSG_CMSG_CLOEXEC
-                (void)Core::System::set_close_on_exec(fd_data[i], true);
-#endif
-                fds.append(fd_data[i]);
-            }
-        }
-        AK_IGNORE_DIAGNOSTIC("-Wsign-compare", cmsg = CMSG_NXTHDR(&msg, cmsg));
-    }
-    return buffer.trim(nread);
 }
 
 ErrorOr<pid_t> LocalSocket::peer_pid() const

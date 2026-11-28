@@ -11,8 +11,6 @@ const byteFormatter = getByteFormatter(unit => {
 const browsingDataSettings = document.querySelector("#browsing-data-settings");
 const browsingDataSettingsClose = document.querySelector("#browsing-data-settings-close");
 const browsingDataSettingsDialog = document.querySelector("#browsing-data-settings-dialog");
-const browsingDataSettingsMaxDiskCacheSize = document.querySelector("#browsing-data-settings-max-disk-cache-size");
-const browsingDataSettingsMaxDiskCacheUnit = document.querySelector("#browsing-data-settings-max-disk-cache-unit");
 const browsingDataTotalSize = document.querySelector("#browsing-data-total-size");
 
 const clearBrowsingDataCachedFiles = document.querySelector("#clear-browsing-data-cached-files");
@@ -26,18 +24,14 @@ const clearBrowsingDataTimeRange = document.querySelector("#clear-browsing-data-
 
 const globalPrivacyControlToggle = document.querySelector("#global-privacy-control-toggle");
 
-const MiB = 1024 * 1024;
-const GiB = MiB * 1024;
-
-let BROWSING_DATA = {};
+const passkeysDescription = document.querySelector("#passkeys-description");
+const passkeysList = document.querySelector("#passkeys-list");
+const passkeysShow = document.querySelector("#passkeys-show");
 
 function loadSettings(settings) {
-    BROWSING_DATA = settings.browsingData || {};
-
-    globalPrivacyControlToggle.checked = settings.globalPrivacyControl;
-
-    showBrowsingDataSettings();
-    estimateBrowsingDataSizes();
+    if (Object.hasOwn(settings, "globalPrivacyControl")) {
+        globalPrivacyControlToggle.checked = settings.globalPrivacyControl;
+    }
 }
 
 function updateBrowsingDataSizes(sizes) {
@@ -47,14 +41,6 @@ function updateBrowsingDataSizes(sizes) {
 
     clearBrowsingDataCachedFilesSize.innerText = ` (remove ${byteFormatter.formatBytes(sizes.cacheSizeSinceRequestedTime)})`;
     clearBrowsingDataSiteDataSize.innerText = ` (remove ${byteFormatter.formatBytes(sizes.siteDataSizeSinceRequestedTime)})`;
-}
-
-function formatDiskCacheSize(bytes) {
-    if (bytes >= GiB && bytes % GiB == 0) {
-        return { value: bytes / GiB, unit: "GiB" };
-    }
-
-    return { value: bytes / MiB, unit: "MiB" };
 }
 
 function computeTimeRange() {
@@ -83,40 +69,6 @@ function estimateBrowsingDataSizes() {
     });
 }
 
-function saveBrowsingDataSettings() {
-    browsingDataSettingsMaxDiskCacheSize.classList.remove("success");
-    browsingDataSettingsMaxDiskCacheSize.classList.remove("error");
-
-    if (
-        browsingDataSettingsMaxDiskCacheSize.value.length === 0 ||
-        !browsingDataSettingsMaxDiskCacheSize.checkValidity()
-    ) {
-        browsingDataSettingsMaxDiskCacheSize.classList.add("error");
-        return;
-    }
-
-    BROWSING_DATA.diskCache = {};
-    BROWSING_DATA.diskCache.maxSize =
-        browsingDataSettingsMaxDiskCacheUnit.value === "MiB"
-            ? browsingDataSettingsMaxDiskCacheSize.value * MiB
-            : browsingDataSettingsMaxDiskCacheSize.value * GiB;
-
-    ladybird.sendMessage("setBrowsingDataSettings", BROWSING_DATA);
-    browsingDataSettingsMaxDiskCacheSize.classList.add("success");
-
-    setTimeout(() => {
-        browsingDataSettingsMaxDiskCacheSize.classList.remove("success");
-    }, 1000);
-}
-
-function showBrowsingDataSettings() {
-    const maxDiskCacheSize = BROWSING_DATA.diskCache?.maxSize || 5 * GiB;
-
-    const { value, unit } = formatDiskCacheSize(maxDiskCacheSize);
-    browsingDataSettingsMaxDiskCacheSize.value = value;
-    browsingDataSettingsMaxDiskCacheUnit.value = unit;
-}
-
 registerDialogDeepLink({
     hash: "clearBrowsingData",
     tab: "privacy",
@@ -130,13 +82,6 @@ browsingDataSettings.addEventListener("click", () => {
 
 browsingDataSettingsClose.addEventListener("click", () => {
     browsingDataSettingsDialog.close();
-});
-
-browsingDataSettingsMaxDiskCacheSize.addEventListener("change", () => {
-    saveBrowsingDataSettings();
-});
-browsingDataSettingsMaxDiskCacheUnit.addEventListener("change", () => {
-    saveBrowsingDataSettings();
 });
 
 clearBrowsingDataTimeRange.addEventListener("change", () => {
@@ -170,9 +115,85 @@ clearBrowsingDataRemoveData.addEventListener("click", () => {
     browsingDataSettingsDialog.close();
 });
 
+// NB: The list is loaded only when the user asks for it, as the platform can ask the user before it gives the passkeys.
+passkeysShow.addEventListener("click", () => {
+    ladybird.sendMessage("loadPasskeys");
+});
+
+const dateFormatter = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+
+function updatePasskeys(data) {
+    passkeysList.replaceChildren();
+    if (!data.available) {
+        passkeysDescription.textContent = "Ladybird cannot keep passkeys on this device yet.";
+        passkeysShow.disabled = true;
+        return;
+    }
+    // NB: The control stays after a read that failed, so that the user can try again.
+    if (data.failed) {
+        const failure = document.createElement("p");
+        failure.className = "card-group description";
+        failure.textContent = "Ladybird could not read the passkeys on this device. Try again.";
+        passkeysList.appendChild(failure);
+        return;
+    }
+    passkeysShow.hidden = true;
+
+    if (data.passkeys.length === 0) {
+        const empty = document.createElement("p");
+        empty.className = "card-group description";
+        empty.textContent = "There are no passkeys in Ladybird.";
+        passkeysList.appendChild(empty);
+        return;
+    }
+
+    for (const passkey of data.passkeys) {
+        const row = document.createElement("div");
+        row.className = "card-group inline-container control-row";
+
+        const label = document.createElement("label");
+        label.textContent = passkey.site;
+        const account = document.createElement("p");
+        account.className = "description";
+        account.textContent = passkey.account || "No account name";
+        label.appendChild(account);
+
+        const dates = [];
+        if (Object.hasOwn(passkey, "created")) {
+            dates.push(`Created ${dateFormatter.format(new Date(passkey.created))}`);
+        }
+        if (Object.hasOwn(passkey, "lastUsed")) {
+            dates.push(`Last used ${dateFormatter.format(new Date(passkey.lastUsed))}`);
+        }
+        if (dates.length > 0) {
+            const usage = document.createElement("p");
+            usage.className = "description";
+            usage.textContent = dates.join(" · ");
+            label.appendChild(usage);
+        }
+
+        const remove = document.createElement("button");
+        remove.className = "secondary-button";
+        remove.textContent = "Remove";
+        const name = passkey.account ? `${passkey.account} on ${passkey.site}` : passkey.site;
+        remove.setAttribute("aria-label", `Remove the passkey for ${name}`);
+        remove.addEventListener("click", () => {
+            if (!window.confirm(`Remove the passkey for ${name}? You can then no longer sign in with it.`)) {
+                return;
+            }
+            ladybird.sendMessage("removePasskey", passkey.id);
+        });
+
+        row.append(label, remove);
+        passkeysList.appendChild(row);
+    }
+}
+
 globalPrivacyControlToggle.addEventListener("change", () => {
     ladybird.sendMessage("setGlobalPrivacyControl", globalPrivacyControlToggle.checked);
 });
+
+document.addEventListener("WebUILoaded", estimateBrowsingDataSizes);
 
 document.addEventListener("WebUIMessage", event => {
     if (event.detail.name === "loadSettings") {
@@ -181,5 +202,9 @@ document.addEventListener("WebUIMessage", event => {
         updateBrowsingDataSizes(event.detail.data);
     } else if (event.detail.name === "clearedBrowsingData") {
         estimateBrowsingDataSizes();
+    } else if (event.detail.name === "loadPasskeys") {
+        updatePasskeys(event.detail.data);
+    } else if (event.detail.name === "passkeyRemovalFailed") {
+        window.alert("Ladybird could not remove the passkey. It is still on this device.");
     }
 });

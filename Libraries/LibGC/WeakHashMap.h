@@ -18,8 +18,8 @@ namespace GC {
 // when their referent is collected; non-cell slots are stored directly.
 template<typename K, typename V>
 class WeakHashMap {
-    static constexpr bool key_is_cell = IsBaseOf<Cell, K>;
-    static constexpr bool value_is_cell = IsBaseOf<Cell, V>;
+    static constexpr bool key_is_cell = IsCellLike<K>;
+    static constexpr bool value_is_cell = IsCellLike<V>;
 
     using KeyStorage = Conditional<key_is_cell, Weak<K>, K>;
     using ValueStorage = Conditional<value_is_cell, Weak<V>, V>;
@@ -28,7 +28,7 @@ class WeakHashMap {
         static unsigned hash(KeyStorage const& value)
         {
             if constexpr (key_is_cell)
-                return Traits<K const*>::hash(value.ptr().ptr());
+                return weak_key_hash(value.ptr().ptr());
             else
                 return Traits<K>::hash(value);
         }
@@ -187,7 +187,7 @@ private:
     auto find_iterator(K const& key) const -> typename TableType::ConstIteratorType
     {
         if constexpr (key_is_cell) {
-            return m_table.find(Traits<K const*>::hash(&key), [&](auto& entry) {
+            return m_table.find(weak_key_hash(&key), [&](auto& entry) {
                 return entry.key.ptr().ptr() == &key;
             });
         } else {
@@ -198,7 +198,7 @@ private:
     auto find_iterator(K const& key) -> typename TableType::IteratorType
     {
         if constexpr (key_is_cell) {
-            return m_table.find(Traits<K const*>::hash(&key), [&](auto& entry) {
+            return m_table.find(weak_key_hash(&key), [&](auto& entry) {
                 return entry.key.ptr().ptr() == &key;
             });
         } else {

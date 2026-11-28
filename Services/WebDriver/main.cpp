@@ -9,16 +9,15 @@
 #include <AK/Random.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/Directory.h>
-#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
 #include <LibCore/TCPServer.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibMain/Main.h>
 #include <LibWebCommon/WebDriver/Capabilities.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebCommon/WebView/Utilities.h>
 #include <WebDriver/Client.h>
 #include <WebDriver/Session.h>
@@ -39,7 +38,7 @@ static ErrorOr<Core::Process> launch_process(StringView application, ReadonlySpa
     return result;
 }
 
-static Vector<ByteString> create_arguments(ByteString const& webdriver_endpoint, Optional<StringView> profile_name, Optional<StringView> profile_path, bool headless, bool expose_experimental_interfaces, bool expose_internals_object, bool force_cpu_painting, bool disable_sandbox, Optional<StringView> debug_process, Optional<StringView> default_time_zone, Optional<StringView> resource_substitution_map_path, Optional<StringView> site_isolation_mode)
+static Vector<ByteString> create_arguments(ByteString const& webdriver_endpoint, Optional<StringView> profile_name, Optional<StringView> profile_path, bool headless, bool expose_experimental_interfaces, bool expose_internals_object, bool force_cpu_painting, bool disable_sandbox, Optional<StringView> debug_process, Optional<StringView> default_time_zone, Optional<StringView> resource_substitution_map_path, Optional<ByteString> const& proxy_autoconfig_url)
 {
     Vector<ByteString> arguments;
 #if defined(AK_OS_MACOS)
@@ -83,11 +82,11 @@ static Vector<ByteString> create_arguments(ByteString const& webdriver_endpoint,
     if (resource_substitution_map_path.has_value())
         arguments.append(ByteString::formatted("--resource-map={}", resource_substitution_map_path.value()));
 
-    // FIXME: WebDriver does not yet handle the WebContent process switch brought by site isolation.
-    if (site_isolation_mode.has_value())
-        arguments.append(ByteString::formatted("--site-isolation={}", *site_isolation_mode));
-    else if (!Core::Environment::has("LADYBIRD_WEBDRIVER_ENABLE_SITE_ISOLATION"sv))
-        arguments.append("--site-isolation=disable"sv);
+    if (proxy_autoconfig_url.has_value())
+        arguments.append(ByteString::formatted("--proxy-autoconfig-url={}", *proxy_autoconfig_url));
+
+    if (auto* stats_log = Core::StatsLog::the())
+        arguments.append(ByteString::formatted("--stats-log-dir={}", stats_log->directory()));
 
     arguments.append("about:blank"sv);
     return arguments;
@@ -116,9 +115,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Optional<StringView> profile_path;
     Optional<StringView> profiles_directory;
     Optional<StringView> resource_substitution_map_path;
-    Optional<StringView> site_isolation_mode;
 
+    StringView stats_log_directory;
     Core::ArgsParser args_parser;
+    args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(listen_address, "IP address to listen on", "listen-address", 'l', "listen_address");
     args_parser.add_option(port, "Port to listen on", "port", 'p', "port");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
@@ -126,26 +126,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
     args_parser.add_option(force_cpu_painting, "Launch browser with GPU painting disabled", "force-cpu-painting");
     args_parser.add_option(disable_sandbox, "Launch browser with helper process sandboxing disabled", "disable-sandbox");
-    args_parser.add_option(debug_process, "Wait for a debugger to attach to the given process name (WebContent, RequestServer, etc.)", "debug-process", 0, "process-name");
+    args_parser.add_option(debug_process, "Wait for a debugger to attach to the given process name (ladybird-render, ladybird-net, etc.)", "debug-process", 0, "process-name");
     args_parser.add_option(headless, "Launch browser without a graphical interface", "headless");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
     args_parser.add_option(profile_name, "Select or create a named browser profile", "profile", 0, "name");
     args_parser.add_option(profile_path, "Use a self-contained browser profile at an absolute path", "profile-path", 0, "path");
     args_parser.add_option(profiles_directory, "Directory in which to create the browser profile", "profiles-directory", 0, "path");
     args_parser.add_option(resource_substitution_map_path, "Path to JSON file mapping URLs to local files", "resource-map", 0, "path");
-    args_parser.add_option(Core::ArgsParser::Option {
-        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
-        .help_string = "Launch browser with the given site isolation mode ('disable', 'top-level', or 'iframe')",
-        .long_name = "site-isolation",
-        .value_name = "mode",
-        .accept_value = [&](StringView value) {
-            if (!WebView::site_isolation_mode_from_string(value).has_value())
-                return false;
-            site_isolation_mode = value;
-            return true;
-        },
-    });
     args_parser.parse(arguments);
+
+    auto stats_log = TRY(Core::StatsLog::create(stats_log_directory, "ladybird-driver"sv));
 
     auto profile_selector_count = static_cast<unsigned>(profile_name.has_value())
         + static_cast<unsigned>(profile_path.has_value())
@@ -153,9 +143,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     if (profile_selector_count > 1)
         return Error::from_string_literal("--profile, --profile-path, and --profiles-directory are mutually exclusive");
 
+    // NB: A WebDriver client controls the browser with no authentication, so by default, as other browsers' drivers
+    //     do, only the local machine may connect.
     bool has_persistent_profile = profile_name.has_value() || profile_path.has_value();
     if (!listen_address.has_value())
-        listen_address = has_persistent_profile ? "127.0.0.1"sv : "0.0.0.0"sv;
+        listen_address = "127.0.0.1"sv;
 
     auto ipv4_address = IPv4Address::from_string(*listen_address);
     if (!ipv4_address.has_value()) {
@@ -191,6 +183,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     }
 
     auto& loop = Core::EventLoop::initialize_for_current_thread();
+    if (stats_log)
+        stats_log->start_sampling();
     Core::EventLoop::register_signal(SIGINT, handle_signal);
     Core::EventLoop::register_signal(SIGTERM, handle_signal);
     auto server = TRY(Core::TCPServer::try_create());
@@ -211,9 +205,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             return;
         }
 
-        auto launch_browser_callback = [&](ByteString const& webdriver_endpoint, bool headless) {
-            auto arguments = create_arguments(webdriver_endpoint, profile_name, profile_path, headless, expose_experimental_interfaces, expose_internals_object, force_cpu_painting, disable_sandbox, debug_process, default_time_zone, resource_substitution_map_path, site_isolation_mode);
-            return launch_process("Ladybird"sv, arguments.span());
+        auto launch_browser_callback = [&](ByteString const& webdriver_endpoint, bool headless, Optional<ByteString> const& proxy_autoconfig_url) {
+            auto arguments = create_arguments(webdriver_endpoint, profile_name, profile_path, headless, expose_experimental_interfaces, expose_internals_object, force_cpu_painting, disable_sandbox, debug_process, default_time_zone, resource_substitution_map_path, proxy_autoconfig_url);
+            return launch_process("ladybird"sv, arguments.span());
         };
 
         auto maybe_client = WebDriver::Client::try_create(maybe_buffered_socket.release_value(), move(launch_browser_callback));
@@ -232,7 +226,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     };
 
     TRY(server->listen(ipv4_address.value(), port, Core::TCPServer::AllowAddressReuse::Yes));
-    outln("Listening on {}:{}", ipv4_address.value(), port);
+
+    // Tests start WebDriver on port 0 and read the chosen port from this line.
+    outln("Listening on {}:{}", ipv4_address.value(), server->local_port().value());
+    (void)fflush(stdout);
 
     auto result = loop.exec();
     WebDriver::Session::close_all();

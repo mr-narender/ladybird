@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/Array.h>
 #include <AK/BitCast.h>
 #include <AK/HashFunctions.h>
@@ -24,69 +25,11 @@
 
 namespace Gfx {
 
-GlyphRun::GlyphRun(Vector<DrawGlyph>&& glyphs, NonnullRefPtr<Font const> font, TextType text_type, float width)
-    : m_glyphs(move(glyphs))
-    , m_font(move(font))
-    , m_text_type(text_type)
-    , m_width(width)
-{
-}
-
-GlyphRun::~GlyphRun() = default;
-
-NonnullRefPtr<GlyphRun> GlyphRun::slice(size_t start, size_t length) const
-{
-    Vector<DrawGlyph> sliced_glyphs;
-    sliced_glyphs.ensure_capacity(length);
-
-    float width = 0;
-    for (size_t i = start; i < start + length; ++i) {
-        sliced_glyphs.unchecked_append(m_glyphs[i]);
-        width += m_glyphs[i].glyph_width;
-    }
-
-    return adopt_ref(*new GlyphRun(move(sliced_glyphs), m_font, m_text_type, width));
-}
-
-FloatRect glyph_run_bounding_box(Font const& font, ReadonlySpan<DrawGlyph> glyphs, float scale)
+// Tight bounds of the ink of the painted glyphs, from their own extents, in device pixels relative to the run's baseline
+// origin (glyph positions scaled by `scale`, with the font ascent added to y). Empty if no painted glyph has ink.
+static FloatRect glyph_run_ink_bounding_box(Font const& font, ReadonlySpan<ShapedGlyph> glyphs, float scale)
 {
     auto font_ascent = font.pixel_metrics().ascent;
-
-    // NOTE: This is a plain min/max rather than FloatRect::unite(), because a run with a single glyph must still
-    //       produce a (zero-sized) origin box that gets expanded by the font bounds below.
-    bool has_painted_glyphs = false;
-    float min_x = NumericLimits<float>::max();
-    float min_y = NumericLimits<float>::max();
-    float max_x = NumericLimits<float>::lowest();
-    float max_y = NumericLimits<float>::lowest();
-    for (auto const& glyph : glyphs) {
-        if (!glyph.should_paint)
-            continue;
-        auto origin_x = glyph.position.x() * scale;
-        auto origin_y = (glyph.position.y() + font_ascent) * scale;
-        if (!__builtin_isfinite(origin_x) || !__builtin_isfinite(origin_y))
-            return {};
-        min_x = min(min_x, origin_x);
-        min_y = min(min_y, origin_y);
-        max_x = max(max_x, origin_x);
-        max_y = max(max_y, origin_y);
-        has_painted_glyphs = true;
-    }
-    if (!has_painted_glyphs)
-        return {};
-
-    auto font_bounding_box = font.typeface().bounding_box_in_font_units();
-    if (!font_bounding_box.is_empty()) {
-        auto font_units_to_pixels = font.pixel_size() * scale / font_bounding_box.units_per_em;
-        // Font units have y pointing up, device pixels have y pointing down.
-        auto left = min_x + font_bounding_box.x_min * font_units_to_pixels;
-        auto right = max_x + font_bounding_box.x_max * font_units_to_pixels;
-        auto top = min_y - font_bounding_box.y_max * font_units_to_pixels;
-        auto bottom = max_y - font_bounding_box.y_min * font_units_to_pixels;
-        return { left, top, right - left, bottom - top };
-    }
-
-    // The font doesn't record an overall bounding box (e.g. bitmap-only fonts), so unite the glyphs' own extents.
     auto* hb_font = font.harfbuzz_font();
     int x_scale = 0;
     int y_scale = 0;
@@ -345,7 +288,7 @@ hb_draw_funcs_t* ink_extent_draw_funcs()
 
 }
 
-Vector<float> glyph_run_glyph_intercepts(Font const& font, ReadonlySpan<DrawGlyph> glyphs, float scale, float y_top, float y_bottom)
+Vector<float> glyph_run_glyph_intercepts(Font const& font, ReadonlySpan<ShapedGlyph> glyphs, float scale, float origin_y, float y_top, float y_bottom)
 {
     if (!(scale > 0) || !__builtin_isfinite(scale))
         return {};
@@ -365,11 +308,14 @@ Vector<float> glyph_run_glyph_intercepts(Font const& font, ReadonlySpan<DrawGlyp
         if (!glyph.should_paint)
             continue;
         auto origin_x = static_cast<double>(glyph.position.x()) * scale;
-        auto origin_y = (static_cast<double>(glyph.position.y()) + font_ascent) * scale;
+        // The rasterizer draws each glyph of horizontal text from a baseline it puts on a whole device pixel, so the
+        // glyph's ink is where that baseline puts it. origin_y is where the run's origin falls in device pixels.
+        auto baseline_y = static_cast<double>(origin_y) + (static_cast<double>(glyph.position.y()) + font_ascent) * scale;
+        auto glyph_origin_y = AK::floor(baseline_y + 0.5) - origin_y;
 
         // Move the band into glyph-local coordinates, with the origin at the glyph's baseline origin.
-        auto band_top = y_top - origin_y;
-        auto band_bottom = y_bottom - origin_y;
+        auto band_top = y_top - glyph_origin_y;
+        auto band_bottom = y_bottom - glyph_origin_y;
 
         // Skip glyphs whose bounding box doesn't reach the band before decoding their outline.
         hb_glyph_extents_t extents;
@@ -397,48 +343,15 @@ Vector<float> glyph_run_glyph_intercepts(Font const& font, ReadonlySpan<DrawGlyp
     return intervals;
 }
 
-Vector<NonnullRefPtr<GlyphRun>> shape_text(FloatPoint baseline_start, Utf16View const& string, FontCascadeList const& font_cascade_list, float letter_spacing)
-{
-    if (string.is_empty())
-        return {};
-
-    Vector<NonnullRefPtr<GlyphRun>> runs;
-
-    auto it = string.begin();
-    auto substring_begin_offset = string.iterator_offset(it);
-    Font const* last_font = &font_cascade_list.font_for_code_point(*it);
-    FloatPoint last_position = baseline_start;
-
-    auto add_run = [&runs, &last_position, letter_spacing](Utf16View const& string, Font const& font) {
-        auto run = shape_text(last_position, letter_spacing, 0.f, string, font, GlyphRun::TextType::Common);
-        last_position.translate_by(run->width(), 0);
-        runs.append(*run);
-    };
-
-    while (it != string.end()) {
-        auto code_point = *it;
-        auto const* font = &font_cascade_list.font_for_code_point(code_point);
-        if (font != last_font) {
-            auto substring = string.substring_view(substring_begin_offset, string.iterator_offset(it) - substring_begin_offset);
-            add_run(substring, *last_font);
-            last_font = font;
-            substring_begin_offset = string.iterator_offset(it);
-        }
-        ++it;
-    }
-
-    auto end_offset = string.iterator_offset(it);
-    if (substring_begin_offset < end_offset) {
-        auto substring = string.substring_view(substring_begin_offset, end_offset - substring_begin_offset);
-        add_run(substring, *last_font);
-    }
-
-    return runs;
-}
-
-static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font, GlyphRun::TextType text_type)
+static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, FFI::JoiningContext joining_context = {}, bool vertical_forms = false)
 {
     hb_buffer_t* buffer = hb_buffer_create();
+
+    // A zero width joiner as context before or after the text gives the letters at its edges the forms that join them
+    // to letters outside it.
+    static constexpr hb_codepoint_t ZERO_WIDTH_JOINER = 0x200D;
+    if (joining_context.joins_before)
+        hb_buffer_add_codepoints(buffer, &ZERO_WIDTH_JOINER, 1, 1, 0);
 
     if (string.has_ascii_storage()) {
         hb_buffer_add_utf8(buffer, string.ascii_span().data(), string.length_in_code_units(), 0, -1);
@@ -446,12 +359,15 @@ static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font
         hb_buffer_set_script(buffer, HB_SCRIPT_LATIN);
         hb_buffer_set_direction(buffer, HB_DIRECTION_LTR);
     } else {
-        hb_buffer_add_utf16(buffer, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units(), 0, -1);
+        if (string.has_latin1_storage())
+            hb_buffer_add_latin1(buffer, string.latin1_span().data(), string.length_in_code_units(), 0, -1);
+        else
+            hb_buffer_add_utf16(buffer, reinterpret_cast<u16 const*>(string.utf16_span().data()), string.length_in_code_units(), 0, -1);
         // For non-ASCII, set direction from text_type if known, otherwise guess.
-        if (text_type == GlyphRun::TextType::Ltr) {
+        if (text_type == FFI::TextType::Ltr) {
             hb_buffer_set_direction(buffer, HB_DIRECTION_LTR);
             hb_buffer_guess_segment_properties(buffer);
-        } else if (text_type == GlyphRun::TextType::Rtl) {
+        } else if (text_type == FFI::TextType::Rtl) {
             hb_buffer_set_direction(buffer, HB_DIRECTION_RTL);
             hb_buffer_guess_segment_properties(buffer);
         } else {
@@ -459,23 +375,48 @@ static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font
         }
     }
 
+    if (joining_context.joins_after)
+        hb_buffer_add_codepoints(buffer, &ZERO_WIDTH_JOINER, 1, 0, 0);
+
     auto* hb_font = font.harfbuzz_font();
-    hb_feature_t const* hb_features_data = nullptr;
-    Vector<hb_feature_t, 4> hb_features;
-    if (!font.features().is_empty()) {
-        hb_features.ensure_capacity(font.features().size());
-        for (auto const& feature : font.features()) {
-            hb_features.unchecked_append({
-                .tag = HB_TAG(feature.tag[0], feature.tag[1], feature.tag[2], feature.tag[3]),
-                .value = feature.value,
-                .start = 0,
-                .end = HB_FEATURE_GLOBAL_END,
-            });
-        }
-        hb_features_data = hb_features.data();
+    Vector<hb_feature_t, 8> hb_features;
+    hb_features.ensure_capacity(font.features().size() + (vertical_forms ? 1 : 0));
+    // https://drafts.csswg.org/css-writing-modes-4/#typeset-upright
+    // "Additionally, font features (such as alternate glyphs and other transformation) intended for use in vertical
+    //  typesetting must be used. (E.g. the OpenType vert feature must be enabled.)"
+    // NB: That gives glyphs set upright the vertical forms the font has for them: the vertical long vowel mark,
+    //     brackets that open downwards, and punctuation that sits in the top-right corner of the em box.
+    // NB: It goes first, so that font-feature-settings can still turn it off.
+    if (vertical_forms)
+        hb_features.append({ .tag = HB_TAG('v', 'e', 'r', 't'), .value = 1, .start = 0, .end = HB_FEATURE_GLOBAL_END });
+
+    for (auto const& feature : font.features()) {
+        hb_features.unchecked_append({
+            .tag = HB_TAG(feature.tag[0], feature.tag[1], feature.tag[2], feature.tag[3]),
+            .value = feature.value,
+            .start = 0,
+            .end = HB_FEATURE_GLOBAL_END,
+        });
     }
 
-    hb_shape(hb_font, buffer, hb_features_data, font.features().size());
+    // https://drafts.csswg.org/css-fonts-4/#feature-variation-precedence
+    // 11. Feature settings determined by properties other than font-variant or font-feature-settings are applied. For
+    //     example, setting a non-default value for the letter-spacing property disables optional ligatures.
+    // NB: The optional ligatures are the ones CSS Text names: those not required for fundamentally correct glyph
+    //     shaping, which leaves rlig on. A feature that font-feature-settings set stays as it is, since step 13
+    //     applies font-feature-settings after this step. And HarfBuzz applies the last of the features with one tag,
+    //     so these go after the font's own.
+    if (letter_spacing != 0) {
+        for (auto tag : { HB_TAG('l', 'i', 'g', 'a'), HB_TAG('c', 'l', 'i', 'g'), HB_TAG('d', 'l', 'i', 'g'), HB_TAG('h', 'l', 'i', 'g') }) {
+            auto set_by_feature_settings = any_of(font.features(), [&](auto const& feature) {
+                return feature.set_by_feature_settings && HB_TAG(feature.tag[0], feature.tag[1], feature.tag[2], feature.tag[3]) == tag;
+            });
+            if (!set_by_feature_settings)
+                hb_features.append({ .tag = tag, .value = 0, .start = 0, .end = HB_FEATURE_GLOBAL_END });
+        }
+    }
+
+    hb_shape(hb_font, buffer, hb_features.data(), hb_features.size());
 
     return buffer;
 }
@@ -492,7 +433,68 @@ static bool is_word_separator(u32 code_point)
     return code_point == 0x0020 || code_point == 0x00A0 || code_point == 0x000A;
 }
 
-static size_t length_of_trailing_whitespace_run(Utf16View const& string)
+// https://drafts.csswg.org/css-text-3/#cursive-script
+static bool is_cursive_script(u32 code_point)
+{
+    switch (hb_unicode_script(hb_unicode_funcs_get_default(), code_point)) {
+    case HB_SCRIPT_ARABIC:
+    case HB_SCRIPT_HANIFI_ROHINGYA:
+    case HB_SCRIPT_MANDAIC:
+    case HB_SCRIPT_MONGOLIAN:
+    case HB_SCRIPT_NKO:
+    case HB_SCRIPT_PHAGS_PA:
+    case HB_SCRIPT_SYRIAC:
+        return true;
+    case HB_SCRIPT_COMMON:
+    case HB_SCRIPT_INHERITED: {
+        // https://drafts.csswg.org/css-text-3/#character-properties
+        // script property: Defined in Unicode Standard Annex #24 [UAX24] and given as the Script property in the
+        // Unicode Character Database [UAX44]. (UAs must include any ScriptExtensions.txt assignments in this mapping.)
+        // NB: So a character that serves several scripts, as the tatweel (U+0640) does, belongs to a cursive script
+        //     when one of its script extensions is one.
+        static auto const cursive_scripts = [] {
+            constexpr Array names { "Arab"sv, "Rohg"sv, "Mand"sv, "Mong"sv, "Nkoo"sv, "Phag"sv, "Syrc"sv };
+            Array<Unicode::Script, names.size()> scripts;
+            for (size_t i = 0; i < names.size(); ++i)
+                scripts[i] = Unicode::script_from_string(names[i]).release_value();
+            return scripts;
+        }();
+        return any_of(cursive_scripts, [&](auto script) { return Unicode::code_point_has_script_extension(code_point, script); });
+    }
+    default:
+        return false;
+    }
+}
+
+// Whether letter-spacing goes after the last glyph of the cluster starting at cluster_start: Every cluster takes it but
+// one that starts with a character of a cursive script.
+static bool cluster_takes_letter_spacing(Utf16View const& string, u32 cluster_start)
+{
+    // https://drafts.csswg.org/css-text-3/#cursive-tracking
+    // Otherwise, if the UA cannot expand text from a cursive script without breaking its cursive connections, it must
+    // not apply spacing between any pair of that script's typographic letter units at all (effectively treating each
+    // word as a single typographic letter unit for the purpose of letter-spacing).
+    // NB: Spaces still take it: Their script is Common, with no extensions.
+    return cluster_start >= string.length_in_code_units() || !is_cursive_script(string.code_point_at(cluster_start));
+}
+
+static bool is_hangul_filler(u32 code_point)
+{
+    return code_point == 0x115F || code_point == 0x1160 || code_point == 0x3164 || code_point == 0xFFA0;
+}
+
+// https://drafts.csswg.org/css-text-3/#white-space-phase-2
+// 4. If there remains any sequence of white space, other space separators, and/or preserved tabs at the end of a line
+//    (after bidi reordering [CSS-WRITING-MODES-4]):
+//    - If white-space is set to normal, nowrap, or pre-line, the UA must hang this sequence (unconditionally).
+// AD-HOC: Of the other space separators, only the ideographic space (U+3000) counts, so the rest (the em space, e.g.)
+//         stay on the line.
+static bool is_trailing_space(u16 code_unit)
+{
+    return is_ascii_space(code_unit) || code_unit == 0x3000;
+}
+
+static size_t length_of_trailing_ascii_whitespace_run(Utf16View const& string)
 {
     size_t length = 0;
     while (length < string.length_in_code_units() && is_ascii_space(string.code_unit_at(string.length_in_code_units() - length - 1)))
@@ -500,35 +502,52 @@ static size_t length_of_trailing_whitespace_run(Utf16View const& string)
     return length;
 }
 
-struct ShapedGlyphs {
-    Vector<DrawGlyph> glyphs;
-    float width { 0 };
-    TrailingWhitespace trailing_whitespace;
+static size_t length_of_trailing_whitespace_run(Utf16View const& string)
+{
+    size_t length = 0;
+    while (length < string.length_in_code_units() && is_trailing_space(string.code_unit_at(string.length_in_code_units() - length - 1)))
+        ++length;
+    return length;
+}
+
+struct TrailingWhitespace {
+    size_t length_in_code_units { 0 };
+    float advance { 0 };
+    // The advance of the ASCII white space at the very end alone, which intrinsic sizing takes off, since an
+    // ideographic space that hangs at the end of a line still counts toward its intrinsic sizes.
+    float ascii_advance { 0 };
 };
 
-static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font const& font, GlyphRun::TextType text_type, float letter_spacing, float word_spacing)
+struct ShapedGlyphs {
+    Vector<ShapedGlyph> glyphs;
+    float width { 0 };
+    TrailingWhitespace trailing_whitespace;
+    bool requires_context_for_breaks { false };
+};
+
+static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, float word_spacing, FFI::JoiningContext joining_context, bool vertical_forms)
 {
     auto const& metrics = font.pixel_metrics();
-    auto* buffer = setup_text_shaping(string, font, text_type);
+    auto* buffer = setup_text_shaping(string, font, text_type, letter_spacing, joining_context, vertical_forms);
 
     u32 glyph_count;
     auto const* glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
     auto const* positions = hb_buffer_get_glyph_positions(buffer, &glyph_count);
 
-    Vector<DrawGlyph> glyphs;
+    Vector<ShapedGlyph> glyphs;
     glyphs.ensure_capacity(glyph_count);
     FloatPoint point;
+    bool requires_context_for_breaks = false;
 
     // The trailing whitespace advance is recorded so that trimming it at line end can subtract exactly what shaping
     // added, spacing included.
     TrailingWhitespace trailing_whitespace { .length_in_code_units = length_of_trailing_whitespace_run(string), .advance = 0 };
     auto first_trailing_whitespace_offset = string.length_in_code_units() - trailing_whitespace.length_in_code_units;
+    auto first_trailing_ascii_whitespace_offset = string.length_in_code_units() - length_of_trailing_ascii_whitespace_run(string);
 
     auto is_right_to_left = hb_buffer_get_direction(buffer) == HB_DIRECTION_RTL;
-    auto glyph_length_in_code_units = [&](auto index) -> size_t {
+    auto cluster_length_in_code_units = [&](auto index) -> size_t {
         auto starting_offset = glyph_info[index].cluster;
-        if (index > 0 && glyph_info[index - 1].cluster == starting_offset)
-            return 0;
         if (is_right_to_left) {
             for (size_t i = index; i-- > 0;) {
                 if (auto offset = glyph_info[i].cluster; offset != starting_offset)
@@ -544,36 +563,77 @@ static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font co
         return string.length_in_code_units() - starting_offset;
     };
 
+    auto glyph_length_in_code_units = [&](auto index) -> size_t {
+        if (index > 0 && glyph_info[index - 1].cluster == glyph_info[index].cluster)
+            return 0;
+        return cluster_length_in_code_units(index);
+    };
+
+    // A glyph is left unpainted only when everything in its cluster is default-ignorable. A cluster that merely starts
+    // with one, such as a Hangul syllable whose initial is the choseong filler, still shows its other characters.
     auto should_paint_glyph = [&](auto index) {
         auto starting_offset = glyph_info[index].cluster;
         if (starting_offset >= string.length_in_code_units())
             return true;
-        return !Unicode::code_point_has_default_ignorable_code_point_property(string.code_point_at(starting_offset));
+        auto has_hangul_filler = false;
+        for (auto code_point : string.substring_view(starting_offset, cluster_length_in_code_units(index))) {
+            if (is_hangul_filler(code_point)) {
+                has_hangul_filler = true;
+                continue;
+            }
+            if (!Unicode::code_point_has_default_ignorable_code_point_property(code_point))
+                return true;
+        }
+        // AD-HOC: The Hangul fillers have the Default_Ignorable_Code_Point property, but fonts give them a spacing
+        //         glyph, and a filler that stands alone takes that glyph's advance. A filler no font has a glyph for
+        //         stays invisible, rather than showing the missing-glyph box.
+        return has_hangul_filler && glyph_info[index].codepoint != 0;
     };
 
+    // NB: HarfBuzz positions glyphs in font space, where y grows upward, so its y offsets and advances are negated
+    //     for our coordinates, where y grows downward.
+    bool should_paint = true;
     for (size_t i = 0; i < glyph_count; ++i) {
-        bool should_paint = should_paint_glyph(i);
+        // Every glyph of a cluster gets the same answer, so it's worked out once, at the cluster's first glyph.
+        if (i == 0 || glyph_info[i - 1].cluster != glyph_info[i].cluster)
+            should_paint = should_paint_glyph(i);
+        auto glyph_length = glyph_length_in_code_units(i);
+        requires_context_for_breaks |= glyph_length > 1
+            || (hb_glyph_info_get_glyph_flags(&glyph_info[i]) & HB_GLYPH_FLAG_UNSAFE_TO_BREAK);
         auto position = point
             - FloatPoint { 0, metrics.ascent }
-            + FloatPoint { positions[i].x_offset, positions[i].y_offset } / text_shaping_resolution;
+            + FloatPoint { positions[i].x_offset, -positions[i].y_offset } / text_shaping_resolution;
 
-        auto extra_advance = letter_spacing;
-        if (auto starting_offset = glyph_info[i].cluster; starting_offset < string.length_in_code_units()
-            && is_word_separator(string.code_point_at(starting_offset)))
-            extra_advance += word_spacing;
+        // https://drafts.csswg.org/css-text-3/#letter-spacing-property
+        // This property specifies additional spacing (commonly called tracking) between adjacent typographic character
+        // units.
+        // NB: A cluster's glyphs (a base and its marks, or a conjunct's parts) are one typographic character unit, so
+        //     the spacing goes after the cluster's last glyph only. Spacing after any other glyph of the cluster would
+        //     push the glyphs after it away from the ones they attach to.
+        auto is_last_glyph_of_cluster = i + 1 == glyph_count || glyph_info[i + 1].cluster != glyph_info[i].cluster;
+        float extra_advance = 0;
+        if (is_last_glyph_of_cluster) {
+            if (letter_spacing != 0 && cluster_takes_letter_spacing(string, glyph_info[i].cluster))
+                extra_advance = letter_spacing;
+            if (auto starting_offset = glyph_info[i].cluster; starting_offset < string.length_in_code_units()
+                && is_word_separator(string.code_point_at(starting_offset)))
+                extra_advance += word_spacing;
+        }
 
         glyphs.unchecked_append({
             .position = position,
-            .length_in_code_units = glyph_length_in_code_units(i),
+            .length_in_code_units = glyph_length,
             .glyph_width = should_paint ? positions[i].x_advance / text_shaping_resolution + extra_advance : 0,
             .glyph_id = glyph_info[i].codepoint,
+            .cluster_start = glyph_info[i].cluster,
             .should_paint = should_paint,
+            .is_rtl = is_right_to_left,
         });
 
         if (!should_paint)
             continue;
 
-        point += FloatPoint { positions[i].x_advance, positions[i].y_advance } / text_shaping_resolution;
+        point += FloatPoint { positions[i].x_advance, -positions[i].y_advance } / text_shaping_resolution;
 
         // NOTE: The spec says that we "really should not" apply letter-spacing to the trailing edge of a line but
         //       other browsers do so we will as well. https://drafts.csswg.org/css-text/#example-7880704e
@@ -581,76 +641,55 @@ static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font co
 
         if (glyph_info[i].cluster >= first_trailing_whitespace_offset)
             trailing_whitespace.advance += glyphs.last().glyph_width;
+        if (glyph_info[i].cluster >= first_trailing_ascii_whitespace_offset)
+            trailing_whitespace.ascii_advance += glyphs.last().glyph_width;
     }
 
     hb_buffer_destroy(buffer);
 
-    return ShapedGlyphs { move(glyphs), point.x(), trailing_whitespace };
-}
-
-NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, float word_spacing, Utf16View const& string, Font const& font, GlyphRun::TextType text_type, TrailingWhitespace* out_trailing_whitespace)
-{
-    Vector<u16, 64> code_units;
-    code_units.ensure_capacity(string.length_in_code_units());
-    for (size_t i = 0; i < string.length_in_code_units(); ++i)
-        code_units.unchecked_append(string.code_unit_at(i));
-
-    ShapedGlyphs shape;
-    FFI::ladybird_gfx_shape_text_cached(&font, code_units.data(), code_units.size(), static_cast<FFI::TextType>(text_type), letter_spacing, word_spacing, &shape,
-        [](void* sink, FFI::DrawGlyph const* glyphs, size_t count, float width, size_t trailing_length, float trailing_advance) {
-            auto& shape = *static_cast<ShapedGlyphs*>(sink);
-            shape.glyphs.append(reinterpret_cast<DrawGlyph const*>(glyphs), count);
-            shape.width = width;
-            shape.trailing_whitespace = { trailing_length, trailing_advance };
-        });
-    if (out_trailing_whitespace)
-        *out_trailing_whitespace = shape.trailing_whitespace;
-    if (!baseline_start.is_zero()) {
-        for (auto& glyph : shape.glyphs)
-            glyph.position.translate_by(baseline_start);
-    }
-    return adopt_ref(*new GlyphRun(move(shape.glyphs), font, text_type, shape.width));
+    return ShapedGlyphs { move(glyphs), point.x(), trailing_whitespace, requires_context_for_breaks };
 }
 
 float measure_text_width(Utf16View const& string, Font const& font, float letter_spacing)
 {
-    auto* buffer = setup_text_shaping(string, font, GlyphRun::TextType::Common);
+    auto* buffer = setup_text_shaping(string, font, FFI::TextType::Common, letter_spacing);
 
     u32 glyph_count;
+    auto const* glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
     auto const* positions = hb_buffer_get_glyph_positions(buffer, &glyph_count);
 
     double point_x = 0;
-    for (size_t i = 0; i < glyph_count; ++i)
+    size_t cluster_count = 0;
+    for (size_t i = 0; i < glyph_count; ++i) {
         point_x += positions[i].x_advance;
+        if (letter_spacing != 0 && (i + 1 == glyph_count || glyph_info[i + 1].cluster != glyph_info[i].cluster)
+            && cluster_takes_letter_spacing(string, glyph_info[i].cluster))
+            ++cluster_count;
+    }
 
     hb_buffer_destroy(buffer);
-    return static_cast<float>(point_x / text_shaping_resolution + glyph_count * letter_spacing);
+    return static_cast<float>(point_x / text_shaping_resolution + cluster_count * letter_spacing);
 }
 
 }
 
-static_assert(to_underlying(Gfx::FFI::TextType::Common) == to_underlying(Gfx::GlyphRun::TextType::Common));
-static_assert(to_underlying(Gfx::FFI::TextType::ContextDependent) == to_underlying(Gfx::GlyphRun::TextType::ContextDependent));
-static_assert(to_underlying(Gfx::FFI::TextType::EndPadding) == to_underlying(Gfx::GlyphRun::TextType::EndPadding));
-static_assert(to_underlying(Gfx::FFI::TextType::Ltr) == to_underlying(Gfx::GlyphRun::TextType::Ltr));
-static_assert(to_underlying(Gfx::FFI::TextType::Rtl) == to_underlying(Gfx::GlyphRun::TextType::Rtl));
-static_assert(sizeof(Gfx::FFI::DrawGlyph) == sizeof(Gfx::DrawGlyph));
-static_assert(alignof(Gfx::FFI::DrawGlyph) == alignof(Gfx::DrawGlyph));
-static_assert(IsTriviallyCopyable<Gfx::FFI::DrawGlyph>);
-static_assert(IsTriviallyCopyable<Gfx::DrawGlyph>);
+static_assert(sizeof(Gfx::FFI::ShapedGlyph) == sizeof(Gfx::ShapedGlyph));
+static_assert(alignof(Gfx::FFI::ShapedGlyph) == alignof(Gfx::ShapedGlyph));
+static_assert(IsTriviallyCopyable<Gfx::FFI::ShapedGlyph>);
+static_assert(IsTriviallyCopyable<Gfx::ShapedGlyph>);
 static_assert(sizeof(Gfx::FloatPoint) == 2 * sizeof(float));
-static_assert(offsetof(Gfx::FFI::DrawGlyph, x) == offsetof(Gfx::DrawGlyph, position));
-static_assert(offsetof(Gfx::FFI::DrawGlyph, y) == offsetof(Gfx::DrawGlyph, position) + sizeof(float));
-static_assert(offsetof(Gfx::FFI::DrawGlyph, length_in_code_units) == offsetof(Gfx::DrawGlyph, length_in_code_units));
-static_assert(offsetof(Gfx::FFI::DrawGlyph, glyph_width) == offsetof(Gfx::DrawGlyph, glyph_width));
-static_assert(offsetof(Gfx::FFI::DrawGlyph, glyph_id) == offsetof(Gfx::DrawGlyph, glyph_id));
-static_assert(offsetof(Gfx::FFI::DrawGlyph, should_paint) == offsetof(Gfx::DrawGlyph, should_paint));
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, x) == offsetof(Gfx::ShapedGlyph, position));
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, y) == offsetof(Gfx::ShapedGlyph, position) + sizeof(float));
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, length_in_code_units) == offsetof(Gfx::ShapedGlyph, length_in_code_units));
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, glyph_width) == offsetof(Gfx::ShapedGlyph, glyph_width));
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, glyph_id) == offsetof(Gfx::ShapedGlyph, glyph_id));
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, should_paint) == offsetof(Gfx::ShapedGlyph, should_paint));
 
 extern "C" {
-void ladybird_gfx_shape_text_uncached(void const*, u16 const*, size_t, Gfx::FFI::TextType, float, float, void*, void (*)(void*, Gfx::FFI::DrawGlyph const*, size_t, float, size_t, float));
+void ladybird_gfx_shape_text_uncached(void const*, u16 const*, size_t, Gfx::FFI::TextType, float, float, Gfx::FFI::JoiningContext, bool, void*, void (*)(void*, Gfx::FFI::ShapedGlyph const*, size_t, float, size_t, float, float, bool));
 float ladybird_gfx_font_measure_text_width(void const*, u16 const*, size_t);
-void ladybird_gfx_glyph_run_bounding_box(void const*, Gfx::FFI::DrawGlyph const*, size_t, float, float*);
-void ladybird_gfx_glyph_run_glyph_intercepts(void const*, Gfx::FFI::DrawGlyph const*, size_t, float, float, float, void*, void (*)(void*, float));
+void ladybird_gfx_glyph_run_ink_bounding_box(void const*, Gfx::FFI::ShapedGlyph const*, size_t, float, float*);
+void ladybird_gfx_glyph_run_glyph_intercepts(void const*, Gfx::FFI::ShapedGlyph const*, size_t, float, float, float, float, void*, void (*)(void*, float));
 }
 
 extern "C" void ladybird_gfx_shape_text_uncached(
@@ -660,8 +699,10 @@ extern "C" void ladybird_gfx_shape_text_uncached(
     Gfx::FFI::TextType text_type,
     float letter_spacing,
     float word_spacing,
+    Gfx::FFI::JoiningContext joining_context,
+    bool vertical_forms,
     void* sink,
-    void (*emit)(void*, Gfx::FFI::DrawGlyph const*, size_t, float, size_t, float))
+    void (*emit)(void*, Gfx::FFI::ShapedGlyph const*, size_t, float, size_t, float, float, bool))
 {
     VERIFY(font);
     VERIFY(text_utf16 || length_in_code_units == 0);
@@ -672,16 +713,20 @@ extern "C" void ladybird_gfx_shape_text_uncached(
     auto shape = Gfx::build_origin_relative_shape(
         text,
         *static_cast<Gfx::Font const*>(font),
-        static_cast<Gfx::GlyphRun::TextType>(text_type),
+        text_type,
         letter_spacing,
-        word_spacing);
+        word_spacing,
+        joining_context,
+        vertical_forms);
     emit(
         sink,
-        reinterpret_cast<Gfx::FFI::DrawGlyph const*>(shape.glyphs.data()),
+        reinterpret_cast<Gfx::FFI::ShapedGlyph const*>(shape.glyphs.data()),
         shape.glyphs.size(),
         shape.width,
         shape.trailing_whitespace.length_in_code_units,
-        shape.trailing_whitespace.advance);
+        shape.trailing_whitespace.advance,
+        shape.trailing_whitespace.ascii_advance,
+        shape.requires_context_for_breaks);
 }
 
 extern "C" float ladybird_gfx_font_measure_text_width(
@@ -697,9 +742,9 @@ extern "C" float ladybird_gfx_font_measure_text_width(
     return Gfx::measure_text_width(text, *static_cast<Gfx::Font const*>(font));
 }
 
-extern "C" void ladybird_gfx_glyph_run_bounding_box(
+extern "C" void ladybird_gfx_glyph_run_ink_bounding_box(
     void const* font,
-    Gfx::FFI::DrawGlyph const* glyphs,
+    Gfx::FFI::ShapedGlyph const* glyphs,
     size_t glyph_count,
     float scale,
     float* out_rect)
@@ -707,9 +752,9 @@ extern "C" void ladybird_gfx_glyph_run_bounding_box(
     VERIFY(font);
     VERIFY(glyphs || glyph_count == 0);
     VERIFY(out_rect);
-    auto bounds = Gfx::glyph_run_bounding_box(
+    auto bounds = Gfx::glyph_run_ink_bounding_box(
         *static_cast<Gfx::Font const*>(font),
-        { reinterpret_cast<Gfx::DrawGlyph const*>(glyphs), glyph_count },
+        { reinterpret_cast<Gfx::ShapedGlyph const*>(glyphs), glyph_count },
         scale);
     out_rect[0] = bounds.x();
     out_rect[1] = bounds.y();
@@ -719,9 +764,10 @@ extern "C" void ladybird_gfx_glyph_run_bounding_box(
 
 extern "C" void ladybird_gfx_glyph_run_glyph_intercepts(
     void const* font,
-    Gfx::FFI::DrawGlyph const* glyphs,
+    Gfx::FFI::ShapedGlyph const* glyphs,
     size_t glyph_count,
     float scale,
+    float origin_y,
     float y_top,
     float y_bottom,
     void* sink,
@@ -732,10 +778,13 @@ extern "C" void ladybird_gfx_glyph_run_glyph_intercepts(
     VERIFY(push);
     auto intercepts = Gfx::glyph_run_glyph_intercepts(
         *static_cast<Gfx::Font const*>(font),
-        { reinterpret_cast<Gfx::DrawGlyph const*>(glyphs), glyph_count },
+        { reinterpret_cast<Gfx::ShapedGlyph const*>(glyphs), glyph_count },
         scale,
+        origin_y,
         y_top,
         y_bottom);
     for (auto value : intercepts)
         push(sink, value);
 }
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, cluster_start) == offsetof(Gfx::ShapedGlyph, cluster_start));
+static_assert(offsetof(Gfx::FFI::ShapedGlyph, is_rtl) == offsetof(Gfx::ShapedGlyph, is_rtl));

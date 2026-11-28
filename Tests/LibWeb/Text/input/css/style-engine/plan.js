@@ -1,28 +1,21 @@
 // Shared harness for the StyleEngine mutation-surface tests.
 //
 // Every way the engine's inputs can move should be provable twice over: that the mutation reaches
-// the engine at all, and that its reaction batch is no wider than it has to be. The plan names
-// exactly the elements whose semantic output changed before any consumer materializes the result.
+// the engine at all, and that the elements it changes are exactly the ones whose style it moves.
+// The plan names the elements whose records the style passes after the mutation changed. Tests load
+// work-test.js before this file.
 
-// Settle everything before the mutation under test, so the batch describes that mutation and no
-// other. Forcing layout is not enough: layout that is already clean does not flush style, and
-// whether it happens to be clean depends on what else the page has been doing. Asking for the
-// reactions afterwards takes the transaction the settle left behind, so the next one starts empty.
-function planSetup() {
-    internals.updateStyle();
-    internals.styleEngineTransactionReactions();
-}
-
-// Run `mutate`, then report the elements whose semantic output changed.
+// Run `mutate`, then report the elements whose records the style passes after it changed, the elements they restyled
+// without changing them, and whether one of the passes restyled every element. Everything before the mutation is
+// settled first, so the passes describe that mutation and no other.
 function plan(name, mutate) {
-    planSetup();
-    mutate();
-    const result = internals.styleEngineTransactionReactions();
-    if (result.wholeDocument) {
-        println(`${name}: WHOLE DOCUMENT`);
-        return;
-    }
-    println(`${name}: [${result.elements.join(", ")}]`);
+    const work = styleWork(mutate);
+    const changed = work.changed();
+    const unchanged = work.restyled().filter(element => !changed.includes(element));
+    let line = `${name}: [${changed.map(shortStyleName).join(", ")}]`;
+    if (unchanged.length) line += ` + unchanged [${unchanged.map(shortStyleName).join(", ")}]`;
+    if (work.passes().includes("FULL")) line += " (full pass)";
+    println(line);
 }
 
 function make(tagName, id, options = {}) {

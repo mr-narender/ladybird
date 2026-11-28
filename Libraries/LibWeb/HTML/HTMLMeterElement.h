@@ -20,8 +20,6 @@ class HTMLMeterElement final : public HTMLElement {
 public:
     virtual ~HTMLMeterElement() override;
 
-    virtual bool is_html_meter_element() const final { return true; }
-
     double value() const;
     void set_value(double);
     double min() const;
@@ -41,6 +39,10 @@ public:
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
 
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-meter-element-2
+    // The meter element is a devolvable widget.
+    virtual bool is_devolvable_widget() const override { return true; }
+
     // https://www.w3.org/TR/html-aria/#el-meter
     virtual Optional<ARIA::Role> default_role() const override { return ARIA::Role::meter; }
 
@@ -55,19 +57,15 @@ private:
     HTMLMeterElement(DOM::Document&, DOM::QualifiedName);
     virtual void visit_edges(Cell::Visitor&) override;
 
+    virtual void computed_properties_changed() override;
+
     void create_shadow_tree_if_needed();
 
     void update_meter_value_element();
 
+    GC::Ptr<DOM::Element> m_meter_bar_element;
     GC::Ptr<DOM::Element> m_meter_value_element;
     ValueState m_cached_value_state { ValueState::Optimal };
 };
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLMeterElement>() const { return is_html_meter_element(); }
 
 }

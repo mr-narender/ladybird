@@ -28,18 +28,18 @@ bool code_point_has_punctuation_general_category(u32 code_point);
 bool code_point_has_separator_general_category(u32 code_point);
 bool code_point_has_space_separator_general_category(u32 code_point);
 bool code_point_has_symbol_general_category(u32 code_point);
+bool code_point_extends_grapheme_cluster(u32 code_point);
 
 Optional<Property> property_from_string(StringView);
 bool code_point_has_property(u32 code_point, Property property, CaseSensitivity case_sensitivity = CaseSensitivity::CaseSensitive);
 
 bool code_point_has_emoji_property(u32 code_point);
-bool code_point_has_emoji_modifier_base_property(u32 code_point);
 bool code_point_has_emoji_presentation_property(u32 code_point);
+bool code_point_has_emoji_modifier_base_property(u32 code_point);
+bool code_point_has_extended_pictographic_property(u32 code_point);
 bool code_point_has_default_ignorable_code_point_property(u32 code_point);
 bool code_point_has_identifier_start_property(u32 code_point);
 bool code_point_has_identifier_continue_property(u32 code_point);
-bool code_point_has_regional_indicator_property(u32 code_point);
-bool code_point_has_variation_selector_property(u32 code_point);
 bool code_point_has_white_space_property(u32 code_point);
 
 bool is_ecma262_property(Property);
@@ -49,6 +49,9 @@ Vector<String> get_property_strings(Property);
 Optional<Script> script_from_string(StringView);
 bool code_point_has_script(u32 code_point, Script script);
 bool code_point_has_script_extension(u32 code_point, Script script);
+// The language most likely written in the script of a code point, such as "th" for Thai. There's none for a script that
+// many languages share (Latin, Han), or for a code point that has no script of its own.
+Optional<String> likely_language_for_script_of(u32 code_point);
 
 enum class BidiClass {
     ArabicNumber,             // AN
@@ -79,16 +82,61 @@ enum class BidiClass {
 BidiClass bidirectional_class(u32 code_point);
 
 enum class LineBreakClass {
-    Alphabetic,     // AL
-    Numeric,        // NU
-    Ideographic,    // ID
-    Ambiguous,      // AI
-    ComplexContext, // SA
-    CombiningMark,  // CM
+    Alphabetic,                 // AL
+    Numeric,                    // NU
+    Ideographic,                // ID
+    Ambiguous,                  // AI
+    ComplexContext,             // SA
+    CombiningMark,              // CM
+    ConditionalJapaneseStarter, // CJ
+    HangulJamo,                 // JL, JV, JT
+    OpenPunctuation,            // OP
+    ClosePunctuation,           // CL, CP
+    BreakSymbols,               // SY
+    InfixNumericSeparator,      // IS
+    PrefixNumeric,              // PR
+    PostfixNumeric,             // PO
+    Hyphen,                     // HY
+    Glue,                       // GL
+    WordJoiner,                 // WJ
+    ZeroWidthJoiner,            // ZWJ
     Other,
 };
 
 LineBreakClass line_break_class(u32 code_point);
+
+enum class JoiningType {
+    NonJoining,   // U
+    Transparent,  // T
+    DualJoining,  // D
+    JoinCausing,  // C
+    LeftJoining,  // L
+    RightJoining, // R
+};
+
+JoiningType joining_type(u32 code_point);
+
+// https://www.unicode.org/reports/tr50/#vo
+enum class VerticalOrientation : u8 {
+    Rotated,
+    TransformedRotated,
+    TransformedUpright,
+    Upright,
+};
+VerticalOrientation vertical_orientation(u32 code_point);
+
+// Whether a code point is in one of the CJK scripts (Han, Hiragana, Katakana, Bopomofo, or Hangul), or is a character of
+// the Common or Inherited script that takes its script from the text around it.
+enum class CJKScriptClass : u8 {
+    Other,
+    CJK,
+    Neutral,
+};
+CJKScriptClass cjk_script_class(u32 code_point);
+
+// The opening bracket that a bracket pairs with, as the Bidi_Paired_Bracket property gives it: the code point itself for
+// an opening bracket, its negation for the opening bracket of a closing one, and 0 for any other code point.
+i32 paired_bracket_key(u32 code_point);
 
 struct CodePointRange {
     u32 from { 0 };

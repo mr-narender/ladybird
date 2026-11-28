@@ -7,48 +7,63 @@
 #pragma once
 
 #include <AK/Forward.h>
-#include <LibGC/Ptr.h>
-#include <LibJS/Forward.h>
-#include <LibJS/Heap/Cell.h>
+#include <AK/RefCounted.h>
+#include <AK/WeakPtr.h>
+#include <AK/Weakable.h>
+#include <LibGC/HoldsNoCellEdges.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
-#include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
+#include <LibWeb/Fetch/Engine/Ids.h>
+#include <LibWeb/Fetch/Infrastructure/FetchControlBlock.h>
+#include <LibWeb/Fetch/Infrastructure/FetchControllerToken.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Fetch/Infrastructure/Task.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
+#include <LibWebCommon/Loader/LoaderConfigSnapshot.h>
+#include <LibWebCommon/Page/PageId.h>
+
+namespace Web::Fetch::Engine {
+
+class EngineEventSink;
+class FetchEngineRecord;
+struct StartFetchInput;
+
+}
 
 namespace Web::Fetch::Infrastructure {
 
+class FetchControllerRegistry;
+
 // https://fetch.spec.whatwg.org/#fetch-params
-class WEB_API FetchParams : public JS::Cell {
-    GC_CELL(FetchParams, JS::Cell);
-    GC_DECLARE_ALLOCATOR(FetchParams);
-
+class WEB_API FetchParams
+    : public RefCounted<FetchParams>
+    , public Weakable<FetchParams> {
 public:
+    GC_HOLDS_NO_CELL_EDGES;
+
     struct PreloadedResponseCandidatePendingTag { };
-    using PreloadedResponseCandidate = Variant<Empty, PreloadedResponseCandidatePendingTag, GC::Ref<Response>>;
+    using PreloadedResponseCandidate = Variant<Empty, PreloadedResponseCandidatePendingTag, NonnullRefPtr<Response>>;
 
-    [[nodiscard]] static GC::Ref<FetchParams> create(GC::Ref<Request>, NonnullRefPtr<FetchTimingInfo>);
-    [[nodiscard]] static GC::Ref<FetchParams> copy(FetchParams const&);
+    [[nodiscard]] static NonnullRefPtr<FetchParams> create(FetchControllerToken, WeakPtr<FetchControllerRegistry>, NonnullRefPtr<FetchControlBlock>, NonnullRefPtr<Request>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+    [[nodiscard]] static NonnullRefPtr<FetchParams> copy(FetchParams const&);
+    ~FetchParams();
 
-    [[nodiscard]] GC::Ref<Request> request() const { return m_request; }
-    void set_request(GC::Ref<Request> request) { m_request = request; }
-    [[nodiscard]] GC::Ref<FetchController> controller() const { return m_controller; }
+    [[nodiscard]] NonnullRefPtr<Request> request() const { return m_request; }
+    void set_request(NonnullRefPtr<Request> request) { m_request = move(request); }
+    [[nodiscard]] FetchControllerToken controller_token() const { return m_controller_token; }
+    [[nodiscard]] WeakPtr<FetchControllerRegistry> const& controller_registry() const { return m_controller_registry; }
+    [[nodiscard]] FetchControlBlock& control_block() const { return *m_control_block; }
     [[nodiscard]] NonnullRefPtr<FetchTimingInfo> timing_info() const { return m_timing_info; }
-
-    [[nodiscard]] GC::Ref<FetchAlgorithms const> algorithms() const { return m_algorithms; }
-    void set_algorithms(GC::Ref<FetchAlgorithms const> algorithms) { m_algorithms = algorithms; }
-
-    [[nodiscard]] TaskDestination& task_destination() { return m_task_destination; }
-    [[nodiscard]] TaskDestination const& task_destination() const { return m_task_destination; }
-    void set_task_destination(TaskDestination task_destination) { m_task_destination = move(task_destination); }
+    [[nodiscard]] LoaderConfig const& loader_config() const { return m_loader_config->config; }
+    [[nodiscard]] NonnullRefPtr<LoaderConfigSnapshot const> const& loader_config_snapshot() const { return m_loader_config; }
 
     [[nodiscard]] HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability() const { return m_cross_origin_isolated_capability; }
     void set_cross_origin_isolated_capability(HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability) { m_cross_origin_isolated_capability = cross_origin_isolated_capability; }
 
     [[nodiscard]] PreloadedResponseCandidate& preloaded_response_candidate() { return m_preloaded_response_candidate; }
     [[nodiscard]] PreloadedResponseCandidate const& preloaded_response_candidate() const { return m_preloaded_response_candidate; }
-    void set_preloaded_response_candidate(PreloadedResponseCandidate preloaded_response_candidate) { m_preloaded_response_candidate = move(preloaded_response_candidate); }
+    void set_preloaded_response_candidate(PreloadedResponseCandidate preloaded_response_candidate) const { m_preloaded_response_candidate = move(preloaded_response_candidate); }
 
     [[nodiscard]] bool is_aborted() const;
     [[nodiscard]] bool is_canceled() const;
@@ -56,36 +71,42 @@ public:
     [[nodiscard]] bool has_response_body_transfer_lease() const { return m_has_response_body_transfer_lease; }
     void set_has_response_body_transfer_lease(bool value) { m_has_response_body_transfer_lease = value; }
 
-private:
-    FetchParams(GC::Ref<Request>, GC::Ref<FetchAlgorithms>, GC::Ref<FetchController>, NonnullRefPtr<FetchTimingInfo>);
-    FetchParams(FetchParams const&);
+    [[nodiscard]] Optional<FileAPI::SerializedBlobURLEntry> const& blob_url_entry() const { return m_blob_url_entry; }
+    void set_blob_url_entry(Optional<FileAPI::SerializedBlobURLEntry> blob_url_entry) { m_blob_url_entry = move(blob_url_entry); }
 
-    virtual void visit_edges(JS::Cell::Visitor&) override;
+    [[nodiscard]] Engine::StartFetchInput start_fetch_input(Engine::FetchId, RefPtr<Response>, NonnullOwnPtr<Engine::EngineEventSink>) const;
+
+    // Set by the fetch engine when it runs main fetch's in-parallel steps, and shared with copies made after that. A
+    // CORS preflight's fetch params share the record of the fetch the preflight is for.
+    [[nodiscard]] Engine::FetchEngineRecord* engine_record() const { return m_engine_record; }
+    void set_engine_record(NonnullRefPtr<Engine::FetchEngineRecord>) const;
+
+    // The CORS preflight these fetch params are for, which runs under the controller of the fetch it is for.
+    [[nodiscard]] bool is_cors_preflight() const { return m_cors_preflight_id.has_value(); }
+    [[nodiscard]] Optional<Engine::CorsPreflightId> cors_preflight_id() const { return m_cors_preflight_id; }
+    void set_cors_preflight_id(Engine::CorsPreflightId cors_preflight_id) { m_cors_preflight_id = cors_preflight_id; }
+
+    // The page of the realm that started the fetch, which its network requests are made for, if it has a top-level
+    // traversable.
+    [[nodiscard]] Optional<PageId> originating_page_id() const { return m_originating_page_id; }
+    void set_originating_page_id(Optional<PageId> page_id) { m_originating_page_id = page_id; }
+
+    // The transport of the response body these fetch params receive, which the fetch's engine record keeps.
+    void set_body_transport(Engine::FetchBodyDeliveryGate::Transport&) const;
+    // Stops that transport, if there is one, without ending the fetch.
+    void stop_body_transport() const;
+
+    // Ends the delivery of a response's body that the fetch will not read.
+    void discard_response_body(Response const&) const;
+
+private:
+    FetchParams(FetchControllerToken, WeakPtr<FetchControllerRegistry>, NonnullRefPtr<FetchControlBlock>, NonnullRefPtr<Request>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+    FetchParams(FetchParams const&);
 
     // https://fetch.spec.whatwg.org/#fetch-params-request
     // request
     //     A request.
-    GC::Ref<Request> m_request;
-
-    // https://fetch.spec.whatwg.org/#fetch-params-process-request-body
-    // process request body chunk length (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-request-end-of-body
-    // process request end-of-body (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-early-hints-response
-    // process early hints response (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-response
-    // process response (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-response-end-of-body
-    // process response end-of-body (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-response-consume-body
-    // process response consume body (default null)
-    //     Null or an algorithm.
-    GC::Ref<FetchAlgorithms const> m_algorithms;
-
-    // https://fetch.spec.whatwg.org/#fetch-params-task-destination
-    // task destination (default null)
-    //     Null, a global object, or a parallel queue.
-    TaskDestination m_task_destination;
+    NonnullRefPtr<Request> m_request;
 
     // https://fetch.spec.whatwg.org/#fetch-params-cross-origin-isolated-capability
     // cross-origin isolated capability (default false)
@@ -95,7 +116,9 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-params-controller
     // controller (default a new fetch controller)
     //     A fetch controller.
-    GC::Ref<FetchController> m_controller;
+    FetchControllerToken m_controller_token;
+    WeakPtr<FetchControllerRegistry> m_controller_registry;
+    NonnullRefPtr<FetchControlBlock> m_control_block;
 
     // https://fetch.spec.whatwg.org/#fetch-params-timing-info
     // timing info
@@ -105,10 +128,22 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-params-preloaded-response-candidate
     // preloaded response candidate (default null)
     //     Null, "pending", or a response.
-    PreloadedResponseCandidate m_preloaded_response_candidate;
+    mutable PreloadedResponseCandidate m_preloaded_response_candidate;
 
     // Non-spec process integration: a navigation response is retained while the UI process selects its document host.
     bool m_has_response_body_transfer_lease { false };
+
+    // The blob URL entry of the request's URL, when that is a blob: URL, as it was when the fetch started.
+    Optional<FileAPI::SerializedBlobURLEntry> m_blob_url_entry;
+
+    // The loader configuration as it was when the fetch started.
+    NonnullRefPtr<LoaderConfigSnapshot const> m_loader_config;
+
+    mutable RefPtr<Engine::FetchEngineRecord> m_engine_record;
+
+    Optional<Engine::CorsPreflightId> m_cors_preflight_id;
+
+    Optional<PageId> m_originating_page_id;
 };
 
 }

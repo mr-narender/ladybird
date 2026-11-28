@@ -8,7 +8,7 @@
 
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
-#include <LibURL/URL.h>
+#include <LibWeb/Forward.h>
 
 namespace Web::HTML {
 
@@ -47,12 +47,17 @@ public:
     // https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-vendorsub
     Utf16FlyString vendor_sub() const { return ""_utf16_fly_string; }
 
-    // FIXME: If the navigator compatibility mode is Gecko, then the user agent must also support the following partial interface:
-    //       bool taint_enabled()
-    //       ByteString oscpu()
+    // If the navigator compatibility mode is Gecko, then the user agent must also support the following partial
+    // interface:
+    // https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-tainted
+    // "The taintEnabled() method must return false."
+    bool taint_enabled() const { return false; }
+    Utf16String oscpu() const;
+    // The build date every Gecko release reports since its build identifier was frozen.
+    Utf16FlyString build_id() const { return "20181001000000"_utf16_fly_string; }
 
 protected:
-    virtual URL::URL navigator_id_url() const = 0;
+    virtual EnvironmentSettingsObject const& navigator_id_settings_object() const = 0;
 };
 
 }

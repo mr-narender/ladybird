@@ -6,9 +6,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/NeverDestroyed.h>
 #include <AK/Utf16StringBuilder.h>
-#include <LibGC/ConservativeHashMap.h>
+#include <LibGC/RootHashMap.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
@@ -18,18 +17,34 @@
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Infra/SerializedURL.h>
+#include <LibWeb/MediaSourceExtensions/MediaSource.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/StorageAPI/StorageKey.h>
 
 namespace Web::FileAPI {
 
-// https://w3c.github.io/FileAPI/#BlobURLStore
-// NB: Only the entries this process created. The browser process keeps every process's entries, and is asked for
-//     them by blob_url_entry_in_the_user_agent_store().
-static GC::ConservativeHashMap<Utf16String, BlobURLEntry>& blob_url_store()
+void BlobURLEntry::visit_edges(GC::Cell::Visitor& visitor) const
 {
-    static NeverDestroyed<GC::ConservativeHashMap<Utf16String, BlobURLEntry>> store;
-    return *store;
+    visitor.visit(object);
+    visitor.visit(environment);
+}
+
+// https://w3c.github.io/FileAPI/#BlobURLStore
+// NB: Only the entries this agent created, in its own heap. The browser process keeps every agent's entries, and is
+//     asked for them by blob_url_entry_in_the_user_agent_store().
+static thread_local GC::RootHashMap<Utf16String, BlobURLEntry>* s_blob_url_store;
+
+static GC::RootHashMap<Utf16String, BlobURLEntry>& blob_url_store()
+{
+    if (!s_blob_url_store)
+        s_blob_url_store = new GC::RootHashMap<Utf16String, BlobURLEntry>;
+    return *s_blob_url_store;
+}
+
+void forget_blob_url_store_of_this_agent()
+{
+    delete s_blob_url_store;
+    s_blob_url_store = nullptr;
 }
 
 // The entry as the user agent's blob URL store has it: a Blob's bytes in shared memory, and the environment's origin.
@@ -43,7 +58,7 @@ static ErrorOr<SerializedBlobURLEntry> serialize_blob_url_entry(BlobURLEntry con
             return SerializedBlobURLEntry::MediaSource {};
         }));
 
-    return SerializedBlobURLEntry { .object = move(object), .origin = entry.environment->origin() };
+    return SerializedBlobURLEntry { .object = move(object), .origin = entry.environment->origin(), .environment_policy_container = entry.environment->policy_container()->serialize() };
 }
 
 // https://w3c.github.io/FileAPI/#unicodeBlobURL
@@ -113,14 +128,16 @@ bool check_for_same_partition_blob_url_usage(URL::Origin const& blob_url_entry_o
 }
 
 // https://www.w3.org/TR/FileAPI/#blob-url-obtain-object
-Optional<SerializedBlobURLEntry::Object> obtain_a_blob_object(SerializedBlobURLEntry const& blob_url_entry, Variant<GC::Ref<HTML::Environment>, TopLevelNavigation, TopLevelSelfFetch> environment)
+Optional<SerializedBlobURLEntry::Object> obtain_a_blob_object(SerializedBlobURLEntry const& blob_url_entry, Variant<StorageAPI::StorageKey, TopLevelNavigation, TopLevelSelfFetch> environment)
 {
     // 1. Let isAuthorized be true.
     bool is_authorized = true;
 
-    // 2. If environment is an environment settings object, then set isAuthorized to the result of checking for same-partition blob URL usage with blobUrlEntry and environment.
-    if (environment.has<GC::Ref<HTML::Environment>>())
-        is_authorized = check_for_same_partition_blob_url_usage(blob_url_entry.origin, environment.get<GC::Ref<HTML::Environment>>());
+    // 2. If environment is an environment, then set isAuthorized to the result of checking for same-partition blob URL usage with blobUrlEntry and environment.
+    // AD-HOC: An environment is given as its storage key for non-storage purposes, the only part of it that checking for
+    //         same-partition blob URL usage reads.
+    if (auto const* environment_storage_key = environment.get_pointer<StorageAPI::StorageKey>())
+        is_authorized = check_for_same_partition_blob_url_usage(blob_url_entry.origin, environment_storage_key->origin);
 
     // 3. If isAuthorized is false, then return failure.
     if (!is_authorized)
@@ -147,8 +164,11 @@ void remove_entry_from_blob_url_store(URL::URL const& url)
 void run_unloading_cleanup_steps(GC::Ref<DOM::Document> document)
 {
     // 1.  Let environment be the Document's relevant settings object.
-    auto& environment = document->relevant_settings_object();
+    remove_entries_of_environment(document->relevant_settings_object(), document->page());
+}
 
+void remove_entries_of_environment(HTML::EnvironmentSettingsObject& environment, Page& page)
+{
     // 2.  Let store be the user agent’s blob URL store;
     auto& store = FileAPI::blob_url_store();
 
@@ -162,7 +182,7 @@ void run_unloading_cleanup_steps(GC::Ref<DOM::Document> document)
     });
     // NB: Remove them from the browser process's store too, as revokeObjectURL would.
     if (!urls.is_empty())
-        document->page().client().page_did_remove_blob_url_entries(environment, urls);
+        page.client().page_did_remove_blob_url_entries(environment, urls);
 }
 
 // https://w3c.github.io/FileAPI/#blob-url-resolve
@@ -216,8 +236,13 @@ Optional<SerializedBlobURLEntry> blob_url_entry_in_the_user_agent_store(Page& pa
             [](URL::BlobURLEntry::MediaSource const&) -> Optional<SerializedBlobURLEntry::Object> {
                 return SerializedBlobURLEntry::MediaSource {};
             });
-        if (object.has_value())
-            return SerializedBlobURLEntry { .object = object.release_value(), .origin = entry->environment.origin };
+        if (object.has_value()) {
+            // NB: The URL record does not hold the environment's policy container, which this process's store has
+            //     while the entry is in it.
+            auto local_entry = local_blob_url_entry(url);
+            auto environment_policy_container = local_entry.has_value() ? local_entry->environment->policy_container()->serialize() : HTML::SerializedPolicyContainer {};
+            return SerializedBlobURLEntry { .object = object.release_value(), .origin = entry->environment.origin, .environment_policy_container = move(environment_policy_container) };
+        }
     }
 
     // https://w3c.github.io/FileAPI/#blob-url-resolve

@@ -9,9 +9,11 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/EditingHostManager.h>
 #include <LibWeb/DOM/Range.h>
+#include <LibWeb/DOM/StaticRange.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/ClipboardSanitizer.h>
 #include <LibWeb/Editing/CommandNames.h>
+#include <LibWeb/Editing/VisiblePosition.h>
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/Selection/SelectionModifier.h>
@@ -38,6 +40,18 @@ void EditingHostManager::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_active_contenteditable_element);
 }
 
+Array<u64, 2> EditingHostManager::content_versions(Document const& document)
+{
+    return { document.dom_tree_version(), document.character_data_version() };
+}
+
+// NB: A command can succeed without changing anything, such as a deletion at the start of the editing host.
+void EditingHostManager::did_run_user_edit(Document& document, WebIDL::ExceptionOr<bool>& editing_result, Array<u64, 2> content_versions_before)
+{
+    if (!editing_result.is_exception() && editing_result.value() && content_versions(document) != content_versions_before)
+        document.did_make_user_edit();
+}
+
 void EditingHostManager::handle_insert(Utf16FlyString const& input_type, Utf16View value)
 {
     // https://w3c.github.io/editing/docs/execCommand/#additional-requirements
@@ -49,9 +63,11 @@ void EditingHostManager::handle_insert(Utf16FlyString const& input_type, Utf16Vi
     //
     // NB: The user's input type is passed along so pastes fire an input event with inputType "insertFromPaste" and
     //     form their own undo unit, even though they run the insertText command.
+    auto content_versions_before = content_versions(*m_document);
     auto editing_result = m_document->exec_command_internal(Editing::CommandNames::insertText, false, value, Document::DispatchInputEvent::Yes, input_type);
     if (editing_result.is_exception())
         dbgln("handle_insert(): editing resulted in exception: {}", editing_result.exception());
+    did_run_user_edit(*m_document, editing_result, content_versions_before);
 }
 
 void EditingHostManager::handle_insert_from_clipboard(Utf16FlyString const& input_type, Utf16View plain_text, Optional<Utf16View> html)
@@ -66,17 +82,21 @@ void EditingHostManager::handle_insert_from_clipboard(Utf16FlyString const& inpu
         return;
     }
 
-    auto sanitized_html = Editing::sanitize_clipboard_html(*range, *html);
-    if (sanitized_html.is_exception() || sanitized_html.value().is_empty()) {
+    auto fragment = Editing::sanitize_clipboard_html(*range, *html);
+    if (fragment.is_exception() || !fragment.value()->has_children()) {
         handle_insert(input_type, plain_text);
         return;
     }
 
     // INTEROP: Rich editing hosts prefer text/html over text/plain when both clipboard representations are present.
     //          Run insertHTML as one user edit so its DOM mutations and final selection form one undo unit.
-    auto editing_result = m_document->exec_command_internal(Editing::CommandNames::insertHTML, false, sanitized_html.value(), Document::DispatchInputEvent::Yes, input_type);
+    // NB: insertHTML inserts the sanitized fragment itself. Serializing and reparsing it could produce a different
+    //     tree from the one the sanitizer inspected.
+    auto content_versions_before = content_versions(*m_document);
+    auto editing_result = m_document->exec_command_internal(Editing::CommandNames::insertHTML, false, {}, Document::DispatchInputEvent::Yes, input_type, nullptr, fragment.value());
     if (editing_result.is_exception())
         dbgln("handle_insert_from_clipboard(): editing resulted in exception: {}", editing_result.exception());
+    did_run_user_edit(*m_document, editing_result, content_versions_before);
 }
 
 void EditingHostManager::select_all()
@@ -140,6 +160,24 @@ void EditingHostManager::move_cursor_to_end(CollapseSelection collapse)
     if (!selection)
         return;
     Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Forward, Selection::SelectionGranularity::LineBoundary);
+}
+
+void EditingHostManager::move_cursor_to_start_of_paragraph(CollapseSelection collapse)
+{
+    if (auto selection = get_selection_for_navigation(collapse))
+        Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Backward, Selection::SelectionGranularity::ParagraphBoundary);
+}
+
+void EditingHostManager::move_cursor_to_end_of_paragraph(CollapseSelection collapse)
+{
+    if (auto selection = get_selection_for_navigation(collapse))
+        Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Forward, Selection::SelectionGranularity::ParagraphBoundary);
+}
+
+void EditingHostManager::move_cursor_to_physical_line_boundary(bool left, CollapseSelection collapse)
+{
+    if (auto selection = get_selection_for_navigation(collapse))
+        Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, left ? Selection::SelectionDirection::Backward : Selection::SelectionDirection::Forward, Selection::SelectionGranularity::PhysicalLineBoundary);
 }
 
 void EditingHostManager::move_cursor_to_start_of_document(CollapseSelection collapse)
@@ -218,6 +256,43 @@ void EditingHostManager::decrement_cursor_position_to_previous_line(CollapseSele
         selection->move_offset_to_previous_line(collapse == CollapseSelection::Yes);
 }
 
+GC::Ptr<StaticRange> EditingHostManager::deletion_target_range(Utf16FlyString const& input_type)
+{
+    auto selection = m_document->get_selection();
+    auto range = selection ? selection->range() : nullptr;
+    auto host = m_active_contenteditable_element;
+    if (!host || !host->is_connected() || !range
+        || range->start_container()->editing_host() != host
+        || range->end_container()->editing_host() != host)
+        return nullptr;
+    if (!range->collapsed())
+        return host->heap().allocate<StaticRange>(range->start_container(), range->start_offset(), range->end_container(), range->end_offset());
+
+    using namespace Web::Selection;
+    auto backward = first_is_one_of(input_type, UIEvents::InputTypes::deleteContentBackward, UIEvents::InputTypes::deleteWordBackward);
+    auto direction = backward ? SelectionDirection::Backward : SelectionDirection::Forward;
+    auto granularity = SelectionGranularity::Character;
+    if (first_is_one_of(input_type, UIEvents::InputTypes::deleteWordBackward, UIEvents::InputTypes::deleteWordForward))
+        granularity = SelectionGranularity::Word;
+    else if (input_type == UIEvents::InputTypes::deleteHardLineForward)
+        granularity = SelectionGranularity::ParagraphBoundary;
+    auto origin = Editing::VisiblePosition::create(*m_document, range->start());
+    auto destination = origin.move(SelectionAlteration::Extend, direction, granularity);
+    if (input_type == UIEvents::InputTypes::deleteHardLineForward
+        && (!destination.has_value() || position_of_boundary_point_relative_to_other_boundary_point(destination->deep_equivalent(), origin.deep_equivalent()) == RelativeBoundaryPointPosition::Equal))
+        destination = origin.move(SelectionAlteration::Extend, direction, SelectionGranularity::Character);
+    if (!destination.has_value() || position_of_boundary_point_relative_to_other_boundary_point(destination->deep_equivalent(), origin.deep_equivalent()) == RelativeBoundaryPointPosition::Equal)
+        return nullptr;
+    auto boundary = destination->boundary();
+    if (boundary.node->editing_host() != host)
+        return nullptr;
+    auto start = backward ? boundary : range->start();
+    auto end = backward ? range->start() : boundary;
+    if (position_of_boundary_point_relative_to_other_boundary_point(start, end) != RelativeBoundaryPointPosition::Before)
+        return nullptr;
+    return host->heap().allocate<StaticRange>(start.node, start.offset, end.node, end.offset);
+}
+
 void EditingHostManager::handle_delete(Utf16FlyString const& input_type, [[maybe_unused]] DispatchInputEvent dispatch_input_event)
 {
     // https://w3c.github.io/editing/docs/execCommand/#additional-requirements
@@ -230,10 +305,20 @@ void EditingHostManager::handle_delete(Utf16FlyString const& input_type, [[maybe
     //
     // NB: A cut deletes the selection like Backspace does, and passes its input type along so the input event fires
     //     with inputType "deleteByCut" and the cut forms its own undo unit.
-    auto command = input_type == UIEvents::InputTypes::deleteContentForward ? Editing::CommandNames::forwardDelete : Editing::CommandNames::delete_;
-    auto editing_result = m_document->exec_command_internal(command, false, {}, Document::DispatchInputEvent::Yes, input_type);
+    auto granular = first_is_one_of(input_type, UIEvents::InputTypes::deleteWordBackward, UIEvents::InputTypes::deleteWordForward, UIEvents::InputTypes::deleteHardLineForward);
+    GC::Root<StaticRange> range;
+    if (granular) {
+        range = deletion_target_range(input_type);
+        if (!range)
+            return;
+    }
+    auto forward = first_is_one_of(input_type, UIEvents::InputTypes::deleteContentForward, UIEvents::InputTypes::deleteWordForward, UIEvents::InputTypes::deleteHardLineForward);
+    auto command = forward ? Editing::CommandNames::forwardDelete : Editing::CommandNames::delete_;
+    auto content_versions_before = content_versions(*m_document);
+    auto editing_result = m_document->exec_command_internal(command, false, {}, Document::DispatchInputEvent::Yes, input_type, range.ptr());
     if (editing_result.is_exception())
         dbgln("handle_delete(): editing resulted in exception: {}", editing_result.exception());
+    did_run_user_edit(*m_document, editing_result, content_versions_before);
 }
 
 EventResult EditingHostManager::handle_return_key(Utf16FlyString const& ui_input_type)
@@ -250,11 +335,15 @@ EventResult EditingHostManager::handle_return_key(Utf16FlyString const& ui_input
     auto command = ui_input_type == UIEvents::InputTypes::insertParagraph
         ? Editing::CommandNames::insertParagraph
         : Editing::CommandNames::insertLineBreak;
-    auto editing_result = m_document->exec_command(command, false, {});
+    // NB: Use the internal entry point like the other user edits, so that a script that focuses a text control
+    //     during the key press does not redirect this edit to that text control.
+    auto content_versions_before = content_versions(*m_document);
+    auto editing_result = m_document->exec_command_internal(command, false, {}, Document::DispatchInputEvent::Yes);
     if (editing_result.is_exception()) {
         dbgln("handle_return_key(): editing resulted in exception: {}", editing_result.exception());
         return EventResult::Dropped;
     }
+    did_run_user_edit(*m_document, editing_result, content_versions_before);
     return editing_result.value() ? EventResult::Handled : EventResult::Dropped;
 }
 

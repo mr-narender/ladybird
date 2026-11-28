@@ -6,27 +6,20 @@
 
 #pragma once
 
-#include <AK/HashMap.h>
-#include <AK/Utf16String.h>
-#include <AK/Vector.h>
-#include <LibJS/Forward.h>
+#include <AK/Types.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/EventLoop/Task.h>
 
 namespace Web::WebLocks {
 
-// https://w3c.github.io/web-locks/#lock-request-queue
-using LockRequestQueue = Vector<GC::Ref<LockRequest>>;
+// The id under which the lock managers of this process know the agent of the current thread.
+WEB_API u64 lock_agent_id();
 
-// https://w3c.github.io/web-locks/#lock-manager-lock-request-queue-map
-using LockRequestQueueMap = HashMap<Utf16String, LockRequestQueue>;
+// https://w3c.github.io/web-locks/#termination-of-locks
+// Any thread can do this for an agent, so that an agent that is stuck in script still lets go of its locks.
+WEB_API void terminate_remaining_locks_and_requests(u64 lock_agent_id);
 
-HTML::ParallelQueue& lock_task_queue();
-void queue_web_locks_task(JS::Realm&, GC::Ref<GC::Function<void()>> steps);
-void queue_web_locks_task_on_relevant_event_loop(GC::Ref<WebIDL::CallbackType> callback, GC::Ref<GC::Function<void()>> steps);
-
-LockManager& obtain_lock_manager(HTML::EnvironmentSettingsObject&);
-
-LockRequestQueue& get_lock_request_queue(LockRequestQueueMap&, Utf16String const& name);
+// https://w3c.github.io/web-locks/#termination-of-locks
+void run_unloading_cleanup_steps(DOM::Document&);
 
 }

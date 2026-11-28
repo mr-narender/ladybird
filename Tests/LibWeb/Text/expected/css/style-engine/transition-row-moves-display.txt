@@ -1,0 +1,2 @@
+hidden: display block, transitions display,opacity
+shown: display block, transitions 

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html class="reftest-wait">
+<style>
+    body { margin: 0; background: #808080; }
+    svg { position: absolute; top: 0; }
+</style>
+<svg style="left: 0" width="60" height="60"><rect width="60" height="60" fill="#f6d2dd"/><rect x="15" y="15" width="30" height="30" fill="#202020"/></svg>
+<svg style="left: 60px" width="60" height="60"><rect width="60" height="60" fill="#f6d2dd"/><rect x="15" y="15" width="30" height="30" fill="#202020"/></svg>
+<script>
+    if (window.internals)
+        internals.setForceDarkEnabled(true);
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            document.documentElement.classList.remove("reftest-wait");
+        });
+    });
+</script>
+</html>

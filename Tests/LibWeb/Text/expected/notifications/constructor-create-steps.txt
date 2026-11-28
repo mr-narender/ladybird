@@ -1,0 +1,10 @@
+maxActions: 2
+silent with vibrate: TypeError
+silent alone: created, actions frozen: true
+vibrate alone: created, actions frozen: true
+renotify without tag: TypeError
+one action: TypeError
+renotify without tag, uncloneable data: TypeError
+silent with vibrate, uncloneable data: TypeError
+one action, uncloneable data: TypeError
+uncloneable data: DataCloneError

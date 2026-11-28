@@ -14,12 +14,14 @@
 #include <AK/Time.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
-#include <LibCompositing/DisplayList/DisplayListResourceIds.h>
+#include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibCore/Forward.h>
+#include <LibGC/Function.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
 #include <LibMedia/Forward.h>
+#include <LibMedia/SeekMode.h>
 #include <LibMedia/VideoSinkHandle.h>
 #include <LibMediaClient/Forward.h>
 #include <LibWeb/DOM/Document.h>
@@ -61,6 +63,10 @@ class HTMLMediaElement : public HTMLElement {
     WEB_WRAPPABLE(HTMLMediaElement, HTMLElement);
 
 public:
+    // NB: A move runs no children changed steps, so the move algorithm reports these instead.
+    void child_moved_out(DOM::Node const& child, GC::Ptr<DOM::Node> old_previous_sibling);
+    void child_moved_in();
+
     static constexpr size_t audio_tracks_offset() { return offsetof(HTMLMediaElement, m_audio_tracks); }
     static constexpr size_t video_tracks_offset() { return offsetof(HTMLMediaElement, m_video_tracks); }
     static constexpr size_t text_tracks_offset() { return offsetof(HTMLMediaElement, m_text_tracks); }
@@ -72,8 +78,8 @@ public:
         return meets_focusable_area_rendering_requirements();
     }
 
-    // NOTE: The function is wrapped in a GC::HeapFunction immediately.
-    void queue_a_media_element_task(Function<void(HTMLMediaElement&)>);
+    void queue_a_media_element_task(GC::Ref<GC::Function<void(HTMLMediaElement&)>>);
+    Task::Source media_element_event_task_source() const { return m_media_element_event_task_source.source; }
 
     void cancel_the_fetching_process();
     bool is_fetching() const;
@@ -121,9 +127,11 @@ public:
     double current_time() const;
     void set_current_time(double);
     void fast_seek(double);
+    void seek_from_media_controls(double);
 
     double current_playback_position() const;
     void set_official_playback_position(double);
+    double earliest_possible_position() const;
 
     double duration() const;
     JS::Object* get_start_date(JS::Object& relevant_global_object) const;
@@ -149,28 +157,43 @@ public:
 
     void toggle_fullscreen();
 
-    void page_mute_state_changed(Badge<Page>);
-
     double effective_media_volume() const;
     bool is_playing_audio() const { return m_is_playing_audio; }
 
     GC::Ref<AudioTrackList> audio_tracks() const { return *m_audio_tracks; }
     GC::Ref<VideoTrackList> video_tracks() const { return *m_video_tracks; }
+
+    GC::Ptr<MediaSourceExtensions::MediaSource> attached_media_source() const { return m_attached_media_source; }
     GC::Ref<TextTrackList> text_tracks() const { return *m_text_tracks; }
+    enum class TimeMarchesOnReason : u8 {
+        NormalPlayback,
+        Other,
+    };
+    void time_marches_on(TimeMarchesOnReason = TimeMarchesOnReason::NormalPlayback);
+
+    void add_newly_introduced_cues(ReadonlySpan<GC::Ref<TextTrackCue>>);
+    void text_track_cue_or_text_track_removed();
+    void text_track_mode_changed();
 
     void set_audio_track_enabled(Badge<AudioTrack>, GC::Ptr<HTML::AudioTrack> audio_track, bool);
 
     void set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML::VideoTrack> video_track);
 
     void add_current_video_sink();
-    void sync_video_sink_ticking() const;
+    enum class DocumentWasLaidOut {
+        No,
+        Yes,
+    };
+    void sync_video_sink_ticking(DocumentWasLaidOut = DocumentWasLaidOut::Yes) const;
+    void video_sink_ticking_inputs_changed();
     void detach_video_sink_edge();
 
     GC::Ref<TextTrack> add_text_track(Bindings::TextTrackKind kind, Utf16View label, Utf16View language);
 
     void update_ready_state();
 
-    void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration) { set_duration(duration); }
+    void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration, double playback_position_before_the_change) { set_duration(duration, playback_position_before_the_change); }
+    void media_source_metadata_available(Badge<MediaSourceExtensions::SourceBuffer>) { on_metadata_parsed(SourceType::Local); }
 
     MediaClient::RemotePlaybackManager& playback_manager()
     {
@@ -178,17 +201,40 @@ public:
         return *m_playback_manager;
     }
 
-    void create_controls();
-    void destroy_controls();
+    bool should_expose_user_interface() const;
+    void update_controls();
+    void media_element_for_controls_changed();
+    void set_picture_in_picture_window_controls_in_use(bool);
 
     CORSSettingAttribute crossorigin() const { return m_crossorigin; }
 
     Optional<Media::VideoSinkHandle> video_sink_handle() const;
-    RefPtr<Media::VideoFrame> current_presented_frame() const;
+    Optional<Compositing::CapturedVideoFrame> capture_current_video_frame() const;
+    bool media_data_is_cors_cross_origin() const;
 
-    Optional<Compositing::VideoSinkResourceId> video_sink_resource_id() const;
+    struct VideoFrameCounts {
+        u64 presented { 0 };
+        u64 dropped { 0 };
 
-    virtual void update_natural_dimensions() { }
+        VideoFrameCounts operator+(VideoFrameCounts const& other) const { return { presented + other.presented, dropped + other.dropped }; }
+        VideoFrameCounts operator-(VideoFrameCounts const& other) const { return { presented - other.presented, dropped - other.dropped }; }
+        VideoFrameCounts& operator+=(VideoFrameCounts const& other) { return *this = *this + other; }
+    };
+    VideoFrameCounts video_frame_counts() const;
+    VideoFrameCounts video_frame_counts_since_last_load() const { return video_frame_counts() - m_video_frame_counts_at_last_load; }
+
+    struct PresentedVideoFrame {
+        u64 presented_frames { 0 };
+        AK::Duration media_time;
+        MonotonicTime presentation_time;
+        u32 width { 0 };
+        u32 height { 0 };
+    };
+    Optional<PresentedVideoFrame> hold_presented_video_frame_for_callbacks();
+    void release_presented_video_frame_held_for_callbacks();
+    virtual void request_rendering_update_for_video_frame_callbacks() { }
+
+    virtual void update_representation() { }
 
 protected:
     HTMLMediaElement(DOM::Document&, DOM::QualifiedName);
@@ -197,6 +243,7 @@ protected:
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
+    virtual WebIDL::ExceptionOr<void> cloned(DOM::Node&, bool) const override;
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
     virtual void removed_from(IsSubtreeRoot, DOM::Node* old_ancestor, DOM::Node& old_root) override;
     virtual void adopted_from(DOM::Document&) override;
@@ -208,7 +255,6 @@ private:
 
     class ActiveVideoSink;
     struct RemoteFetchData;
-    virtual bool is_html_media_element() const final { return true; }
 
     struct EntireResource { };
     struct UntilEnd {
@@ -216,16 +262,19 @@ private:
     };
     using ByteRange = Variant<EntireResource, UntilEnd>;
 
-    Task::Source media_element_event_task_source() const { return m_media_element_event_task_source.source; }
-
     WebIDL::ExceptionOr<void> load_element();
     void select_resource_for_current_load();
     void promote_current_resource_selection_to_explicit();
 
-    void load_url_resource(URL::URL const&, ESCAPING Function<void(Utf16String)> failure_callback);
+    void load_url_resource(URL::URL const&, GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
     void load_remote_resource(ByteRange const&);
-    void load_local_resource(MediaProvider const&, ESCAPING Function<void(Utf16String)> failure_callback);
+    void load_local_resource(MediaProvider const&, GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
     bool preload_attribute_is_in_none_state() const;
+    bool preload_attribute_is_in_automatic_state() const;
+    bool should_suspend_the_download() const;
+    void update_download_suspension();
+    void stop_suspending_the_download_after_first_frame();
+    void stop_suspending_the_download_after_a_track_change();
     bool should_wait_for_an_implementation_defined_event_before_fetching_the_resource() const;
     void wait_for_an_implementation_defined_event_before_fetching_the_resource(u32 fetch_generation);
     void continue_fetching_the_resource_after_an_implementation_defined_event();
@@ -234,21 +283,24 @@ private:
     void add_current_video_sink(Media::VideoSinkHandle);
     void release_active_video_sink();
 
-    Optional<Utf16String> verify_response_or_get_failure_reason(GC::Ref<Fetch::Infrastructure::Response>, ByteRange const&);
+    Optional<Utf16String> verify_response_or_get_failure_reason(GC::Ref<Fetch::Infrastructure::ResponseView>, ByteRange const&);
     bool should_hold_screen_wake_lock() const;
     void update_screen_wake_lock();
 
     void handle_data_request(Optional<u64> offset);
 
     void set_up_playback_manager_for_remote();
-    void set_up_playback_manager_for_local(Function<void(Utf16String)> failure_callback);
-    void set_up_playback_manager_error_handler(Function<void(Utf16String)> failure_callback);
+    void set_up_playback_manager_for_local(GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
+    void listen_for_playback_manager_errors();
+    void handle_playback_manager_error(Media::DecoderError&&);
     enum class FetchingStatus : u8 {
         Ongoing,
         Complete,
         Interrupted,
     };
     void process_media_data(FetchingStatus);
+    void maybe_complete_remote_fetch();
+    void queue_interrupted_fetch_steps();
 
     enum class SourceType : u8 {
         Remote,
@@ -264,6 +316,7 @@ private:
     void on_video_track_added(Media::Track const&);
     void on_metadata_parsed(SourceType);
     void on_playback_manager_state_change();
+    void on_playback_manager_seek_decided(Media::SeekDecision);
     void upon_current_playback_position_possibly_changed();
     void start_or_stop_playback_position_update_timer();
     void play_element();
@@ -274,21 +327,31 @@ private:
     void update_audio_play_state();
     void set_show_poster(bool);
     void set_paused(bool);
-    void set_duration(double);
+    void set_duration(double, Optional<double> playback_position_before_the_change = {});
     void set_ended(bool);
+    void update_ended_attribute();
 
     void volume_or_muted_attribute_changed();
     void update_volume();
     void attach_selected_video_track_sink(Media::Track const&);
 
-    bool video_sink_should_tick() const;
+    bool video_sink_should_tick(DocumentWasLaidOut) const;
+    virtual bool is_shown_elsewhere() const { return false; }
+    virtual HTMLMediaElement& media_element_for_controls() { return *this; }
 
-    // Mirrors what PlaybackManager and the compositor were last told; a freshly reserved sink is assumed to tick.
-    mutable bool m_video_sink_is_ticking { true };
+    // Mirrors what PlaybackManager was last told. A freshly reserved sink is undecided, and leaves its input unstarted
+    // until the first decision.
+    mutable Optional<bool> m_video_sink_is_ticking;
     void note_frame_captured() const;
 
     bool is_eligible_for_autoplay() const;
     bool is_allowed_to_play() const;
+
+    void set_network_state(NetworkState);
+    void set_can_autoplay(bool);
+    void set_delaying_the_load_event(bool);
+    bool should_be_kept_alive() const;
+    void update_pending_activity();
 
     enum class PlaybackDirection : u8 {
         Forwards,
@@ -296,17 +359,15 @@ private:
     };
     PlaybackDirection direction_of_playback() const;
 
-    bool has_ended_playback() const;
+    enum class IgnoreLoopAttribute : u8 {
+        No,
+        Yes,
+    };
+    bool has_ended_playback(IgnoreLoopAttribute) const;
     void upon_has_ended_playback_possibly_changed();
     void reached_end_of_media_playback();
 
     void dispatch_time_update_event();
-
-    enum class TimeMarchesOnReason : u8 {
-        NormalPlayback,
-        Other,
-    };
-    void time_marches_on(TimeMarchesOnReason = TimeMarchesOnReason::NormalPlayback);
 
     GC::RootVector<GC::Ref<WebIDL::Promise>> take_pending_play_promises();
     void resolve_pending_play_promises(ReadonlySpan<GC::Ref<WebIDL::Promise>> promises);
@@ -324,6 +385,18 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#media-element-event-task-source
     UniqueTaskSource m_media_element_event_task_source;
+
+    // NB: The media element tasks that haven't run yet, in the order they were queued, so that they can follow the
+    //     element when it's adopted into another document.
+    struct PendingMediaElementTask {
+        u64 key { 0 };
+        TaskID task_id;
+        GC::Ref<GC::Function<void(HTMLMediaElement&)>> steps;
+    };
+    void queue_pending_media_element_task(PendingMediaElementTask&);
+    void requeue_pending_media_element_tasks();
+    Vector<PendingMediaElementTask> m_pending_media_element_tasks;
+    u64 m_next_media_element_task_key { 0 };
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-error
     GC::Ptr<MediaError> m_error;
@@ -347,10 +420,12 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-readystate
     ReadyState m_ready_state { ReadyState::HaveNothing };
-    bool m_first_data_load_event_since_load_start { false };
+    bool m_has_fired_loadeddata { false };
+    bool m_media_data_is_cors_cross_origin { false };
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-seeking
     bool m_seeking { false };
+    bool m_prevent_next_loop_while_paused { false };
 
     // The current playback position as of the last possible-change check; empty until the first check
     // for each media resource.
@@ -405,6 +480,14 @@ private:
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-texttracks
     GC::Ptr<TextTrackList> m_text_tracks;
 
+    // https://html.spec.whatwg.org/multipage/media.html#list-of-newly-introduced-cues
+    Vector<GC::Ref<TextTrackCue>> m_list_of_newly_introduced_cues;
+
+    Optional<double> m_time_marches_on_last_time;
+
+    // https://html.spec.whatwg.org/multipage/media.html#pending-text-track-change-notification-flag
+    bool m_pending_text_track_change_notification_flag { false };
+
     // https://html.spec.whatwg.org/multipage/media.html#can-autoplay-flag
     bool m_can_autoplay { true };
 
@@ -426,15 +509,17 @@ private:
     bool m_current_resource_selection_is_explicit { false };
 
     OwnPtr<MediaClient::RemotePlaybackManager> m_playback_manager;
+    OwnPtr<MediaStreamPlayback> m_media_stream_playback;
+    GC::Ptr<GC::Function<void(Utf16String)>> m_playback_manager_failure_callback;
 
     RefPtr<Core::Timer> m_playback_position_update_timer;
     GC::Ptr<VideoTrack> m_selected_video_track;
     OwnPtr<ActiveVideoSink> m_active_video_sink;
+    VideoFrameCounts m_frame_counts_of_released_video_sinks;
+    VideoFrameCounts m_video_frame_counts_at_last_load;
     mutable bool m_video_frame_was_recently_captured { false };
     mutable RefPtr<Core::Timer> m_video_frame_capture_keepalive_timer;
     Optional<ScreenWakeLockHandle> m_screen_wake_lock;
-
-    bool m_loop_was_specified_when_reaching_end_of_media_resource { false };
 
     Optional<MediaControls> m_controls;
 
@@ -444,9 +529,6 @@ private:
 
 }
 
-namespace Web::DOM {
+GC_UNTRACED_CAPTURE(Web::HTML::HTMLMediaElement::EntireResource);
 
-template<>
-inline bool Node::fast_is<HTML::HTMLMediaElement>() const { return is_html_media_element(); }
-
-}
+GC_UNTRACED_CAPTURE(Web::HTML::HTMLMediaElement::UntilEnd);

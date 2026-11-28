@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Base64.h>
+#include <AK/Checked.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/PaintingSurface.h>
+#include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -26,7 +28,7 @@ void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_cont
 {
     HTML::TemporaryExecutionContext execution_context { element.document().relevant_settings_object() };
 
-    // 1. If either the initial viewport's width or height is 0 CSS pixels, return error with error code unable to capture screen.
+    // 1. If either the visual viewport's width or height is 0 CSS pixels, return error with error code unable to capture screen.
     // NB: Another process hosts the top-level traversable when the browsing context is in an isolated frame.
     auto viewport_rect = browsing_context.active_document()->navigable()->local_root()->viewport_rect();
     if (viewport_rect.is_empty()) {
@@ -35,20 +37,36 @@ void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_cont
     }
 
     auto viewport_device_rect = browsing_context.page().enclosing_device_rect(viewport_rect).to_type<int>();
+    auto rectangle = rect.to_type<i64>();
 
-    // 2. Let paint width be the initial viewport's width – min(rectangle x coordinate, rectangle x coordinate + rectangle width dimension).
-    auto paint_width = viewport_device_rect.width() - min(rect.x(), rect.x() + rect.width());
+    // 2. Let paint width be the visual viewport's width – min(rectangle x coordinate, rectangle x coordinate + rectangle width dimension).
+    auto paint_width = viewport_device_rect.width() - min(rectangle.x(), rectangle.x() + rectangle.width());
 
-    // 3. Let paint height be the initial viewport's height – min(rectangle y coordinate, rectangle y coordinate + rectangle height dimension).
-    auto paint_height = viewport_device_rect.height() - min(rect.y(), rect.y() + rect.height());
+    // 3. Let paint height be the visual viewport's height – min(rectangle y coordinate, rectangle y coordinate + rectangle height dimension).
+    auto paint_height = viewport_device_rect.height() - min(rectangle.y(), rectangle.y() + rectangle.height());
+
+    if (paint_width <= 0 || paint_height <= 0 || !AK::is_within_range<int>(paint_width) || !AK::is_within_range<int>(paint_height)) {
+        callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Invalid screenshot dimensions"sv));
+        return;
+    }
+
+    // NB: Validate the bitmap size before requesting canvas backing from the compositor. The framebuffer is captured
+    //     whole, so that step 6 can draw its region at the rectangle's coordinates.
+    Gfx::IntSize paint_size { static_cast<int>(paint_width), static_cast<int>(paint_height) };
+    auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, viewport_device_rect.size());
+    if (bitmap_or_error.is_error()) {
+        callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Unable to allocate the screenshot"sv));
+        return;
+    }
+    auto bitmap = bitmap_or_error.release_value();
 
     // 4. Let canvas be a new canvas element, and set its width and height to paint width and paint height, respectively.
     auto canvas_element = DOM::create_element(element.document(), HTML::TagNames::canvas, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     auto& canvas = as<HTML::HTMLCanvasElement>(*canvas_element);
 
     // FIXME: Handle DevicePixelRatio in HiDPI mode.
-    MUST(canvas.set_width(paint_width));
-    MUST(canvas.set_height(paint_height));
+    MUST(canvas.set_width(paint_size.width()));
+    MUST(canvas.set_height(paint_size.height()));
 
     // FIXME: 5. Let context, a canvas context mode, be the result of invoking the 2D context creation algorithm given canvas as the target.
     canvas.create_2d_context({});
@@ -63,17 +81,25 @@ void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_cont
     //    - Y coordinate: rectangle y coordinate
     //    - Width: paint width
     //    - Height: paint height
-    Gfx::IntRect paint_rect { rect.x(), rect.y(), paint_width, paint_height };
+    Gfx::IntRect paint_rect { rect.location(), paint_size };
 
-    auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, Gfx::IntSize { paint_width, paint_height }));
-    auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(bitmap);
-    HTML::PaintConfig paint_config { .canvas_fill_rect = paint_rect };
-    browsing_context.active_document()->navigable()->render_screenshot(painting_surface, paint_config, [bitmap, element = GC::make_root(element), canvas = GC::make_root(canvas), callback = move(callback)] mutable {
+    HTML::PaintConfig paint_config { .canvas_fill_rect = Gfx::IntRect { {}, viewport_device_rect.size() } };
+    browsing_context.active_document()->navigable()->render_screenshot(bitmap, paint_config, [bitmap, paint_rect, element = GC::make_root(element), canvas = GC::make_root(canvas), callback = move(callback)](auto result) mutable {
+        if (result == Compositor::ScreenshotResult::Failed) {
+            callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "The compositor did not take the screenshot"sv));
+            return;
+        }
+
         HTML::TemporaryExecutionContext execution_context { element->document().relevant_settings_object() };
 
-        auto image_bitmap = HTML::ImageBitmap::create();
-        image_bitmap->set_bitmap(bitmap);
-        if (canvas->canvas_rendering_context_2d()->draw_image(image_bitmap, 0, 0).is_exception()) {
+        // A rectangle can start outside the framebuffer, where nothing is drawn.
+        auto region = bitmap->cropped(paint_rect, Gfx::Color::Transparent);
+        if (region.is_error()) {
+            callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Unable to allocate the screenshot"sv));
+            return;
+        }
+        auto image_bitmap = HTML::ImageBitmap::create(region.release_value());
+        if (!canvas->canvas_rendering_context_2d()->draw_image(*image_bitmap, 0, 0)) {
             callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to draw the screenshot to the canvas"sv));
             return;
         }
@@ -95,18 +121,20 @@ Response encode_canvas_element(HTML::HTMLCanvasElement& canvas)
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Captured screenshot is empty"sv);
 
     // 3. Let file be a serialization of the canvas element’s bitmap as a file, using "image/png" as an argument.
-    // 4. Let data url be a data: URL representing file. [RFC2397]
-    auto data_url_result = canvas.to_data_url("image/png"sv, {});
-    if (data_url_result.is_exception())
+    auto frame = canvas.get_srgb_frame_from_surface();
+    if (!frame.has_value())
+        return Error::from_code(ErrorCode::UnableToCaptureScreen, "Captured screenshot is empty"sv);
+    Gfx::PNGWriterOptions png_options;
+    png_options.compression = Gfx::PNGCompression::Fast;
+    auto file = Gfx::PNGWriter::encode(*frame->bitmap_sharing_pixels(), png_options);
+    if (file.is_error())
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to serialize canvas"sv);
-    auto data_url = data_url_result.release_value();
 
+    // 4. Let data url be a data: URL representing file. [RFC2397]
     // 5. Let index be the index of "," in data url.
-    auto index = data_url.utf16_view().find_code_unit_offset(',');
-    VERIFY(index.has_value());
-
     // 6. Let encoded string be a substring of data url using (index + 1) as the start argument.
-    auto encoded_string = MUST(data_url.utf16_view().substring_view(*index + 1).to_utf8());
+    // NB: That substring is file's base64 encoding.
+    auto encoded_string = MUST(encode_base64(file.value()));
 
     // 7. Return success with data encoded string.
     return JsonValue { move(encoded_string) };

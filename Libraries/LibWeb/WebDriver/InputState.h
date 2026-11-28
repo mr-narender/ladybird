@@ -7,6 +7,8 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/JsonObject.h>
+#include <AK/RefCounted.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <LibWeb/Export.h>
@@ -16,7 +18,7 @@
 namespace Web::WebDriver {
 
 // https://w3c.github.io/webdriver/#dfn-input-state
-struct InputState {
+struct InputState : public RefCounted<InputState> {
     InputState();
     ~InputState();
 
@@ -32,5 +34,9 @@ struct InputState {
 
 WEB_API InputState& get_input_state(HTML::Navigable& top_level_traversable);
 WEB_API void reset_input_state(HTML::Navigable& top_level_traversable);
+
+// Private command-boundary snapshots contain sources and cancellation records, never live action queue tokens.
+WEB_API JsonObject serialize_input_state(InputState const&);
+WEB_API ErrorOr<void, Error> restore_input_state(HTML::Navigable& top_level_traversable, JsonValue const&);
 
 }

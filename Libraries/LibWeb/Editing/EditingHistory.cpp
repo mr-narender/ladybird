@@ -238,7 +238,6 @@ static void dispatch_history_input_event(DOM::Document& document, GC::Ref<DOM::N
     event_init.input_type = input_type;
 
     auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init);
-    event->set_is_trusted(true);
     editing_host->dispatch_event(event);
 }
 
@@ -432,6 +431,15 @@ void EditingHistory::notify_state_if_changed(DOM::Document& document)
     document.page().client().page_did_update_editing_history_state(new_can_undo, new_can_redo);
 }
 
+void EditingHistory::forget_steps_for(DOM::Node& editing_host)
+{
+    if (m_open_step && m_open_step->editing_host().ptr() == &editing_host)
+        m_open_step = nullptr;
+    m_undo_stack.remove_all_matching([&](GC::Ref<UndoStep> const& step) { return step->editing_host().ptr() == &editing_host; });
+    m_redo_stack.remove_all_matching([&](GC::Ref<UndoStep> const& step) { return step->editing_host().ptr() == &editing_host; });
+    notify_state_if_changed(editing_host.document());
+}
+
 void EditingHistory::prune_steps_for_disconnected_hosts()
 {
     // INTEROP: Blink erases the undo steps owned by a root editable element when it is removed
@@ -497,7 +505,6 @@ EventResult perform_history_action(DOM::Document& document, HistoryAction action
     event_init.cancelable = true;
     event_init.input_type = input_type;
     auto event = UIEvents::InputEvent::create_from_platform_event(UIEvents::EventNames::beforeinput, event_init);
-    event->set_is_trusted(true);
     if (!step->editing_host()->dispatch_event(event))
         return EventResult::Handled;
 

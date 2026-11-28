@@ -17,10 +17,10 @@
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/ValueInlines.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
+#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/Buffers.h>
 #include <LibWeb/WebIDL/CallbackType.h>
@@ -163,8 +163,26 @@ inline JS::Completion clean_up_on_return(HTML::EnvironmentSettingsObject& stored
     return JS::Value { rejected_promise->promise() };
 }
 
+// AD-HOC: None of invoking a callback function, constructing one, or calling a user object's operation checks that the
+//         callback's realm can still run script, so a callback from a page that's been navigated away from (or an
+//         iframe that's been removed) would keep running wherever a live object holds it — a timer on the new page's
+//         Window, e.g., which lets the old page's code re-arm itself there and keep the whole old page alive. So refuse
+//         to call into a realm whose global object is a Window whose associated Document isn't fully active.
+//         See https://github.com/whatwg/webidl/issues/993.
+static bool is_settings_object_of_inactive_window(HTML::EnvironmentSettingsObject& relevant_settings)
+{
+    // Only a Window's settings object has a responsible document: the Window's associated Document.
+    auto document = relevant_settings.responsible_document();
+    return document && !document->is_fully_active();
+}
+
+static JS::Completion refuse_callback_from_inactive_window(JS::Realm& realm)
+{
+    return throw_completion(realm, NotSupportedError::create(realm, "Cannot run a callback from a window whose document is not fully active"_utf16));
+}
+
 // https://webidl.spec.whatwg.org/#call-a-user-objects-operation
-JS::Completion call_user_object_operation(CallbackType& callback, Utf16FlyString const& operation_name, Optional<JS::Value> this_argument, ReadonlySpan<JS::Value> args)
+JS::Completion call_user_object_operation(CallbackType& callback, Utf16FlyString const& operation_name, Optional<JS::Value> this_argument, ReadonlySpan<JS::Value> args, RefuseCallbackFromInactiveWindow refuse_from_inactive_window)
 {
     // 1. Let completion be an uninitialized variable.
     JS::Completion completion;
@@ -174,23 +192,20 @@ JS::Completion call_user_object_operation(CallbackType& callback, Utf16FlyString
         this_argument = JS::js_undefined();
 
     // 3. Let O be the ECMAScript object corresponding to value.
-    auto& object = callback.callback;
+    GC::Ref<JS::Object> object = callback.callback;
 
     // 4. Let realm be O’s associated realm.
-    auto& realm = object->shape().realm();
+    auto& realm = callback.associated_realm();
 
     // 5. Let relevant settings be realm’s settings object.
     auto& relevant_settings = HTML::principal_realm_settings_object(realm);
 
     // 6. Let stored settings be value’s callback context.
-    auto& stored_settings = callback.callback_context;
+    GC::Ref<HTML::EnvironmentSettingsObject> stored_settings = callback.callback_context;
 
-    // AD-HOC: Reject a cross-origin callback object before entering its realm; otherwise the operation lookup below
-    //         throws in that protected realm, exposing it to the caller. See https://github.com/whatwg/webidl/issues/1640.
-    if (HTML::is_cross_origin_platform_object(object)) {
-        auto& caller_realm = *object->vm().current_realm();
-        return throw_completion(caller_realm, WebIDL::SecurityError::create(caller_realm, "Cannot invoke a callback on a cross-origin object"_utf16));
-    }
+    // AD-HOC: See is_settings_object_of_inactive_window().
+    if (refuse_from_inactive_window == RefuseCallbackFromInactiveWindow::Yes && is_settings_object_of_inactive_window(relevant_settings))
+        return refuse_callback_from_inactive_window(realm);
 
     // 7. Prepare to run script with relevant settings.
     HTML::prepare_to_run_script(relevant_settings);
@@ -209,13 +224,13 @@ JS::Completion call_user_object_operation(CallbackType& callback, Utf16FlyString
         // 2. If getResult is an abrupt completion, set completion to getResult and jump to the step labeled return.
         if (get_result.is_throw_completion()) {
             completion = get_result.throw_completion();
-            return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise);
+            return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise());
         }
 
         // 4. If ! IsCallable(X) is false, then set completion to a new Completion{[[Type]]: throw, [[Value]]: a newly created TypeError object, [[Target]]: empty}, and jump to the step labeled return.
         if (!get_result.value().is_function()) {
             completion = realm.vm().template throw_completion<JS::TypeError>(JS::ErrorType::NotAFunction, get_result.value());
-            return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise);
+            return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise());
         }
 
         // 3. Set X to getResult.[[Value]].
@@ -235,14 +250,14 @@ JS::Completion call_user_object_operation(CallbackType& callback, Utf16FlyString
     // 13. If callResult is an abrupt completion, set completion to callResult and jump to the step labeled return.
     if (call_result.is_throw_completion()) {
         completion = call_result.throw_completion();
-        return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise);
+        return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise());
     }
 
     // 14. Set completion to the result of converting callResult.[[Value]] to an IDL value of the same type as the operation’s return type.
     // FIXME: This does no conversion.
     completion = call_result.value();
 
-    return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise);
+    return clean_up_on_return(stored_settings, relevant_settings, completion, callback.operation_returns_promise());
 }
 
 // https://webidl.spec.whatwg.org/#ref-for-idl-ByteString%E2%91%A7
@@ -273,6 +288,16 @@ JS::ThrowCompletionOr<Utf16String> to_utf16_usv_string(JS::VM& vm, JS::Value val
     return TRY(value.to_utf16_string(vm)).to_well_formed();
 }
 
+JS::ThrowCompletionOr<StringArgument> to_usv_string_argument(JS::VM& vm, JS::Value value)
+{
+    if (value.is_string()) {
+        auto const& string = value.as_string().utf16_string();
+        if (string.utf16_view().validate())
+            return StringArgument::borrowed(string);
+    }
+    return StringArgument::owned(TRY(to_utf16_usv_string(vm, value)));
+}
+
 // https://webidl.spec.whatwg.org/#invoke-a-callback-function
 // https://whatpr.org/webidl/1437.html#invoke-a-callback-function
 template<typename ReturnSteps>
@@ -285,7 +310,7 @@ static auto invoke_callback_impl(CallbackType& callback, Optional<JS::Value> thi
         this_argument = JS::js_undefined();
 
     // 3. Let F be the ECMAScript object corresponding to callable.
-    auto& function_object = callback.callback;
+    GC::Ref<JS::Object> function_object = callback.callback;
 
     // 5. Let realm be F’s associated realm.
     auto& realm = function_object->shape().realm();
@@ -302,7 +327,11 @@ static auto invoke_callback_impl(CallbackType& callback, Optional<JS::Value> thi
     }
 
     // 7. Let stored settings be callable’s callback context.
-    auto& stored_settings = callback.callback_context;
+    GC::Ref<HTML::EnvironmentSettingsObject> stored_settings = callback.callback_context;
+
+    // AD-HOC: See is_settings_object_of_inactive_window().
+    if (is_settings_object_of_inactive_window(relevant_settings))
+        return return_steps(realm, refuse_callback_from_inactive_window(realm));
 
     // 8. Prepare to run script with relevant realm.
     HTML::prepare_to_run_script(relevant_settings);
@@ -337,10 +366,10 @@ JS::Completion invoke_callback(CallbackType& callback, Optional<JS::Value> this_
     // https://webidl.spec.whatwg.org/#js-invoking-callback-functions
     // The exceptionBehavior argument must be supplied if, and only if, callable’s return type is not a promise type. If callable’s return type is neither undefined nor any, it must be "rethrow".
     // NOTE: Until call sites are updated to respect this, specifications which fail to provide a value here when it would be mandatory should be understood as supplying "rethrow".
-    if (exception_behavior == ExceptionBehavior::NotSpecified && callback.operation_returns_promise == OperationReturnsPromise::No)
+    if (exception_behavior == ExceptionBehavior::NotSpecified && callback.operation_returns_promise() == OperationReturnsPromise::No)
         exception_behavior = ExceptionBehavior::Rethrow;
 
-    VERIFY(exception_behavior == ExceptionBehavior::NotSpecified || callback.operation_returns_promise == OperationReturnsPromise::No);
+    VERIFY(exception_behavior == ExceptionBehavior::NotSpecified || callback.operation_returns_promise() == OperationReturnsPromise::No);
 
     return invoke_callback_impl(callback, move(this_argument), args, [&](JS::Realm& relevant_realm, JS::Completion completion) -> JS::Completion {
         // 3. If completion is an IDL value, return completion.
@@ -360,16 +389,14 @@ JS::Completion invoke_callback(CallbackType& callback, Optional<JS::Value> this_
             // FIXME: 1. Assert: callable’s return type is undefined or any.
 
             // 2. Report an exception completion.[[Value]] for relevant realm’s global object.
-            auto* window_or_worker = HTML::window_or_worker_global_scope_from_global_object(relevant_realm.global_object());
-            VERIFY(window_or_worker);
-            window_or_worker->report_an_exception(completion.release_value());
+            HTML::report_an_exception(relevant_realm.global_object(), completion.release_value());
 
             // 3. Return the unique undefined IDL value.
             return JS::js_undefined();
         }
 
         // 7. Assert: callable’s return type is a promise type.
-        VERIFY(callback.operation_returns_promise == OperationReturnsPromise::Yes);
+        VERIFY(callback.operation_returns_promise() == OperationReturnsPromise::Yes);
 
         // 8. Let rejectedPromise be ! Call(%Promise.reject%, %Promise%, «completion.[[Value]]»).
         auto rejected_promise = create_rejected_promise(relevant_realm, completion.release_value());
@@ -388,7 +415,7 @@ JS::Completion invoke_callback(CallbackType& callback, Optional<JS::Value> this_
 //         and the caller needs a WebIDL::Promise rather than a JS::Promise.
 GC::Ref<Promise> invoke_promise_callback(CallbackType& callback, Optional<JS::Value> this_argument, ReadonlySpan<JS::Value> args)
 {
-    VERIFY(callback.operation_returns_promise == OperationReturnsPromise::Yes);
+    VERIFY(callback.operation_returns_promise() == OperationReturnsPromise::Yes);
 
     return invoke_callback_impl(callback, move(this_argument), args, [&](JS::Realm& relevant_realm, JS::Completion completion) {
         // 3. If completion is an IDL value, return completion.
@@ -414,7 +441,7 @@ JS::Completion construct(CallbackType& callable, ReadonlySpan<JS::Value> args)
     JS::Completion completion;
 
     // 2. Let F be the JavaScript object corresponding to callable.
-    auto& function_object = callable.callback;
+    GC::Ref<JS::Object> function_object = callable.callback;
 
     // 3. If IsConstructor(F) is false, throw a TypeError exception.
     // 4. Let realm be F’s associated realm.
@@ -426,7 +453,11 @@ JS::Completion construct(CallbackType& callable, ReadonlySpan<JS::Value> args)
     auto& relevant_settings = HTML::principal_realm_settings_object(realm);
 
     // 6. Let stored settings be callable’s callback context.
-    auto& stored_settings = callable.callback_context;
+    GC::Ref<HTML::EnvironmentSettingsObject> stored_settings = callable.callback_context;
+
+    // AD-HOC: See is_settings_object_of_inactive_window().
+    if (is_settings_object_of_inactive_window(relevant_settings))
+        return refuse_callback_from_inactive_window(realm);
 
     // 7. Prepare to run script with relevant settings.
     HTML::prepare_to_run_script(relevant_settings);
@@ -559,6 +590,18 @@ JS::ThrowCompletionOr<T> convert_to_int(JS::VM& vm, JS::Value value, EnforceRang
 
     // 10. Set x to x modulo 2^bitLength.
     auto constexpr two_pow_bitlength = NumericLimits<MakeUnsigned<T>>::max() + 1.0;
+    if constexpr (sizeof(T) == 8) {
+        // NB: fmod() is exact, and leaves an integer of the sign of x whose magnitude is below 2^64, which a u64 holds.
+        //     But a double holds few integers near 2^64, so adding 2^64 to a negative remainder in one would round
+        //     (and -1 would become 2^64). So the wrap around to a non-negative x is done in a u64 instead.
+        auto remainder = fmod(x, two_pow_bitlength);
+        auto modulo = remainder < 0 ? 0 - static_cast<u64>(-remainder) : static_cast<u64>(remainder);
+
+        // 11. If signedness is "signed" and x ≥ 2^(bitLength − 1), then return x − 2^(bitLength).
+        // 12. Otherwise, return x.
+        // NB: Reinterpreting the bits of x as a signed 64-bit integer does just that.
+        return static_cast<T>(modulo);
+    }
     x = JS::modulo(x, two_pow_bitlength);
 
     // 11. If signedness is "signed" and x ≥ 2^(bitLength − 1), then return x − 2^(bitLength).

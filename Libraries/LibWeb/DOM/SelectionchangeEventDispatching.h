@@ -31,7 +31,7 @@ template<SelectionChangeTarget T>
 void schedule_a_selectionchange_event(T& target, Document& document)
 {
     // NB: Style must observe every range change, even when the event is already queued.
-    document.set_needs_selection_style_update();
+    document.set_needs_highlight_style_update(CSS::PseudoElement::Selection);
 
     // 1. If target's has scheduled selectionchange event is true, abort these steps.
     if (target.has_scheduled_selectionchange_event())
@@ -43,7 +43,7 @@ void schedule_a_selectionchange_event(T& target, Document& document)
 
     // 2. Queue a task on the user interaction task source to fire a selectionchange event on
     //    target.
-    queue_global_task(HTML::Task::Source::UserInteraction, relevant_global_object(document), GC::create_function(GC::Heap::the(), [&] {
+    queue_global_task(HTML::Task::Source::UserInteraction, relevant_global_object(document), GC::create_function(GC::Heap::the(), GC::captures(target, document), [](auto& target, auto& document) {
         fire_a_selectionchange_event(target, document);
     }));
 }
