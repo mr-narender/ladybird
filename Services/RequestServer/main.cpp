@@ -15,7 +15,9 @@
 #include <LibCore/Platform/TaskRole.h>
 #include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
@@ -51,9 +53,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     StringView cache_path;
     bool wait_for_debugger = false;
     bool disable_sandbox = false;
+    bool enable_test_mode = false;
 
     int crash_report_fd = -1;
+    StringView stats_log_directory;
     Core::ArgsParser args_parser;
+    args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
@@ -62,7 +67,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
+    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.parse(arguments);
+
+    auto stats_log = TRY(Core::StatsLog::create(stats_log_directory, "ladybird-net"sv));
 
     if (crash_report_fd >= 0) {
         if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
@@ -76,6 +84,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         warnln("Could not adopt the foreground application task role: {}", result.error());
     if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInitiated); result.is_error())
         warnln("Could not set main thread QoS: {}", result.error());
+
+    if (enable_test_mode)
+        RequestServer::DNSInfo::the().loopback_domains.append("test"sv);
 
     // FIXME: Update RequestServer to support multiple custom root certificates.
     if (!certificates.is_empty())
@@ -117,10 +128,18 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             disk_cache = cache.release_value();
     }
 
+    // Alternative services are no longer persisted, so this only holds history.
+    if (!cache_path.is_empty())
+        (void)FileSystem::remove(LexicalPath::join(cache_path, "alt-svc-cache.txt"sv).string(), FileSystem::RecursionMode::Disallowed);
+
     TRY(RequestServer::initialize_libcurl());
 
-    if (!disable_sandbox)
-        TRY(RequestServer::apply_sandbox(mach_server_name, certificates, cache_path));
+    if (!disable_sandbox) {
+        Optional<StringView> disk_cache_directory;
+        if (disk_cache.has_value())
+            disk_cache_directory = disk_cache->cache_directory().string();
+        TRY(RequestServer::apply_sandbox(mach_server_name, certificates, disk_cache_directory));
+    }
 
     // Connections are stored on the stack to ensure they are destroyed before static destruction begins. This prevents
     // crashes from notifiers trying to unregister from already-destroyed thread data during process exit.
@@ -131,8 +150,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         mach_server_name,
         connections,
         request_transfer_leases,
-        disk_cache,
-        LexicalPath::join(cache_path, "alt-svc-cache.txt"sv).string()));
+        disk_cache));
+
+    if (stats_log)
+        stats_log->start_sampling([&](JsonObject& values) {
+            values.set("requests.clients"sv, connections.size());
+            values.set("requests.transfer_leases"sv, request_transfer_leases.size());
+        });
 
     return event_loop.exec();
 }

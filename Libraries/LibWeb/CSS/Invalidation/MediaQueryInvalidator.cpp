@@ -4,13 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/Invalidation/MediaQueryInvalidator.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleScope.h>
+#include <LibWeb/CSS/StyleSheetInvalidation.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 
 namespace Web::CSS::Invalidation {
 
@@ -22,10 +25,15 @@ namespace Web::CSS::Invalidation {
 // conditions, and drop the scope's cached rule set.
 void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
 {
-    ++document.style_invalidation_counters().media_rule_evaluations;
+    HTML::note_rendering_trace_event("media rules evaluated"sv);
 
     HashTable<StyleScope*> scopes_with_changed_layer_order;
+    // OPTIMIZATION: A sheet that many shadow roots adopt is evaluated once, not once per root. Its evaluation is the
+    //               same for every scope that owns it, and the changes it finds go to all of them below.
+    HashTable<StyleSheetState*> evaluated_author_sheets;
     Function<void(StyleSheetState&)> evaluate_author_sheet = [&](StyleSheetState& style_sheet) {
+        if (evaluated_author_sheets.set(&style_sheet) != HashSetResult::InsertedNewEntry)
+            return;
         Parser::ValueParserFFI::NativeStyleSheetMediaEvaluation result {};
         if (!style_sheet.evaluate_media_queries(document, result))
             return;
@@ -35,7 +43,7 @@ void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
         style_sheet.record_conditions_for_owners();
         style_sheet.for_each_owning_style_scope([&](StyleScope& style_scope) {
             if (result.style_cache_inputs_changed)
-                style_scope.invalidate_style_cache();
+                invalidate_rule_cache_after_style_sheet_change(style_scope, style_sheet);
             if (result.layer_order_inputs_changed)
                 scopes_with_changed_layer_order.set(&style_scope);
         });
@@ -49,7 +57,7 @@ void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
 
             for (auto const& entry : document.style_computer().non_author_style_sheets()) {
                 if (entry.sheet.ptr() == &style_sheet) {
-                    document.style_computer().style_engine().set_sheet_conditions_hold(
+                    StyleEngineFFI::style_engine_set_sheet_conditions_hold(document.style_computer().style_engine().host(),
                         entry.sheet_id, !style_sheet.disabled() && style_sheet.native_media_list().matches());
                     break;
                 }
@@ -58,6 +66,7 @@ void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
             if (!changed)
                 return;
             document.style_scope().invalidate_style_cache();
+            document.style_scope().invalidate_counter_style_cache();
             style_sheet.reload_fonts_after_media_query_change();
         });
     }
@@ -73,6 +82,8 @@ void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
 
     for (auto* style_scope : scopes_with_changed_layer_order)
         style_scope->publish_cascade_layer_order();
+    if (scopes_with_changed_layer_order.contains(&document.style_scope()))
+        document.fonts()->synchronize_css_connected_font_order();
 }
 
 }

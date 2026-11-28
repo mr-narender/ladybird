@@ -33,6 +33,19 @@ math[display="inline" i] {
   math-style: compact;
 }
 
+/* AD-HOC: Color links as links, but do not underline them, matching other engines.
+ *         See https://github.com/w3c/mathml-core/issues/128 */
+a:link {
+  color: LinkText;
+}
+a:visited {
+  color: VisitedText;
+}
+a:any-link {
+  cursor: pointer;
+  text-decoration: none;
+}
+
 /* <mrow>-like elements */
 semantics > :not(:first-child) {
   display: none;

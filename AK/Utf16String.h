@@ -43,11 +43,7 @@ public:
     {
     }
 
-    ALWAYS_INLINE static Utf16String from_utf8(StringView utf8_string)
-    {
-        VERIFY(Utf8View { utf8_string }.validate());
-        return from_utf8_without_validation(utf8_string);
-    }
+    static Utf16String from_utf8(StringView);
 
     ALWAYS_INLINE static Utf16String from_utf8(String const& utf8_string)
     {
@@ -64,13 +60,13 @@ public:
         Yes,
     };
     static Utf16String from_utf8_with_replacement_character(StringView, WithBOMHandling = WithBOMHandling::Yes);
+    static Utf16String from_wtf8_with_replacement_character(StringView);
 
-    ALWAYS_INLINE static ErrorOr<Utf16String> try_from_utf8(StringView utf8_string)
-    {
-        if (!Utf8View { utf8_string }.validate())
-            return Error::from_string_literal("Input was not valid UTF-8");
-        return from_utf8_without_validation(utf8_string);
-    }
+    static ErrorOr<Utf16String> try_from_utf8(StringView);
+
+    // Returns an empty Optional if the input is not well-formed UTF-8. Unlike try_from_utf8(), this also rejects WTF-8
+    // input that encodes lone surrogates.
+    static Optional<Utf16String> from_well_formed_utf8(StringView);
 
     static Utf16String from_utf8_without_validation(StringView);
     static Utf16String from_ascii_without_validation(ReadonlyBytes);
@@ -209,8 +205,8 @@ public:
     {
         auto view = utf16_view();
 
-        if (view.has_ascii_storage()) {
-            if (!any_of(view.ascii_span(), is_ascii_upper_alpha))
+        if (view.has_latin1_storage()) {
+            if (!any_of(view.latin1_span(), is_ascii_upper_alpha))
                 return *this;
         } else {
             if (!any_of(view.utf16_span(), is_ascii_upper_alpha))
@@ -224,8 +220,8 @@ public:
     {
         auto view = utf16_view();
 
-        if (view.has_ascii_storage()) {
-            if (!any_of(view.ascii_span(), is_ascii_lower_alpha))
+        if (view.has_latin1_storage()) {
+            if (!any_of(view.latin1_span(), is_ascii_lower_alpha))
                 return *this;
         } else {
             if (!any_of(view.utf16_span(), is_ascii_lower_alpha))
@@ -284,7 +280,7 @@ public:
     ALWAYS_INLINE Utf16String escape_html_entities() const { return utf16_view().escape_html_entities(); }
 
     static Utf16String from_string_builder(Badge<Utf16StringBuilder>, Utf16StringBuilder& builder);
-    static ErrorOr<Utf16String> from_ipc_stream(Stream&, size_t length_in_code_units, bool is_ascii);
+    static ErrorOr<Utf16String> from_ipc_stream(Stream&, size_t length_in_code_units, bool has_latin1_storage);
 
     template<typename Callback>
     static Utf16String create_uninitialized_ascii(size_t length_in_code_units, Callback callback)

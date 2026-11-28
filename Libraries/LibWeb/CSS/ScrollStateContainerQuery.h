@@ -9,6 +9,7 @@
 #include <AK/HashMap.h>
 #include <LibGC/Cell.h>
 #include <LibGC/Ptr.h>
+#include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/Forward.h>
 #include <LibWebCommon/PixelUnits.h>
 
@@ -48,13 +49,19 @@ public:
     // https://github.com/whatwg/html/pull/11613
     // Snapshots the scroll state of the containers, invalidating the styles that queried a state that changed. Returns
     // whether any did.
-    bool snapshot_post_layout_state(DOM::Document&, Snapshot);
+    bool snapshot_post_layout_state(Layout::BegunRead const& read, DOM::Document&, Snapshot);
+
+    // Whether a scroll-state() query asked about any container.
+    bool has_containers() const { return !m_containers.is_empty(); }
 
     void visit_edges(GC::Cell::Visitor&);
 
 private:
     struct Container {
         ScrollStateSnapshot snapshot;
+        // The identity the snapshot was published under: a moved element has a new one, which
+        // holds no state until it is published again.
+        StyleNodeID published_style_node_id;
         bool has_been_snapshotted { false };
     };
 

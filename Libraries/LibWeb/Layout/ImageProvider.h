@@ -11,6 +11,7 @@
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Size.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWebCommon/PixelUnits.h>
 
 namespace Web::Layout {
@@ -39,13 +40,13 @@ public:
     Optional<CSSPixelSize> intrinsic_size() const;
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const;
 
+    // How the image is fitted into the rectangle it's drawn in, which only an SVG image element lets authors change.
+    virtual SVG::PreserveAspectRatio preserve_aspect_ratio() const { return {}; }
+
     Optional<Gfx::DecodedImageFrame> current_image_frame(Optional<Gfx::IntSize> size = {}) const;
     Optional<Gfx::DecodedImageFrame> default_image_frame(Optional<Gfx::IntSize> size = {}) const;
 
     virtual void layout_node_was_detached() const { }
-
-    virtual Layout::Node const* image_provider_layout_node() const = 0;
-    void image_provider_contents_changed() const;
 };
 
 }

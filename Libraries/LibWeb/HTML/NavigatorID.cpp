@@ -6,8 +6,11 @@
  */
 
 #include <AK/ByteString.h>
+#include <AK/StringBuilder.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP.h>
 #include <LibWeb/HTML/NavigatorID.h>
+#include <LibWeb/Loader/LoaderConfig.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWebCommon/Loader/UserAgent.h>
 
@@ -17,8 +20,7 @@ namespace Web::HTML {
 Utf16String NavigatorIDMixin::app_version() const
 {
     // 1. Let userAgent be this's relevant settings object's environment default `User-Agent` value.
-    // FIXME: Store that on the settings object?
-    auto user_agent = ResourceLoader::the().user_agent_for_url(navigator_id_url());
+    auto user_agent = Fetch::Infrastructure::environment_default_user_agent_value(current_loader_config()->config, navigator_id_settings_object());
 
     // 2. If userAgent does not start with `Mozilla/5.0 (`, then return the empty string.
     if (!user_agent.starts_with_bytes("Mozilla/5.0 ("sv))
@@ -28,7 +30,7 @@ Utf16String NavigatorIDMixin::app_version() const
     auto trail = MUST(user_agent.substring_from_byte_offset("Mozilla/"sv.length()));
 
     // 4. -> If the navigator compatibility mode is Chrome or WebKit
-    auto navigator_compatibility_mode = ResourceLoader::the().navigator_compatibility_mode();
+    auto navigator_compatibility_mode = ResourceLoader::navigator_compatibility_mode();
     if (navigator_compatibility_mode == NavigatorCompatibilityMode::Chrome || navigator_compatibility_mode == NavigatorCompatibilityMode::WebKit) {
         // Return trail.
         return Utf16String::from_ascii_without_validation(trail.bytes());
@@ -61,13 +63,39 @@ Utf16String NavigatorIDMixin::platform() const
     // platform.
 
     // FIXME: Use some portion of the user agent string to make spoofing work 100%
-    return Utf16String::from_ascii_without_validation(ResourceLoader::the().platform().bytes());
+    return Utf16String::from_ascii_without_validation(default_platform.bytes());
+}
+
+// https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-oscpu
+Utf16String NavigatorIDMixin::oscpu() const
+{
+    // The oscpu attribute's getter must return either the empty string or a string representing the platform on which
+    // the browser is executing, e.g. "Windows NT 10.0; Win64; x64", "Linux x86_64".
+    // The platform tokens of the User-Agent string say what it claims to run on: the parenthesized list without the
+    // "Macintosh" and "X11" markers and without the "rv:" version, so "Intel Mac OS X 10.15" or "Linux x86_64".
+    auto user_agent = Fetch::Infrastructure::environment_default_user_agent_value(current_loader_config()->config, navigator_id_settings_object());
+    auto open = user_agent.find_byte_offset('(');
+    auto close = user_agent.find_byte_offset(')');
+    if (!open.has_value() || !close.has_value() || *close <= *open)
+        return {};
+
+    auto tokens = user_agent.bytes_as_string_view().substring_view(*open + 1, *close - *open - 1).split_view(';');
+    StringBuilder builder;
+    for (auto token : tokens) {
+        token = token.trim_whitespace();
+        if (token.is_empty() || token.is_one_of("Macintosh"sv, "X11"sv) || token.starts_with("rv:"sv))
+            continue;
+        if (!builder.is_empty())
+            builder.append("; "sv);
+        builder.append(token);
+    }
+    return Utf16String::from_utf8(builder.string_view());
 }
 
 // https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-productsub
 Utf16FlyString NavigatorIDMixin::product_sub() const
 {
-    auto navigator_compatibility_mode = ResourceLoader::the().navigator_compatibility_mode();
+    auto navigator_compatibility_mode = ResourceLoader::navigator_compatibility_mode();
 
     // Must return the appropriate string from the following list:
 
@@ -90,14 +118,14 @@ Utf16FlyString NavigatorIDMixin::product_sub() const
 Utf16String NavigatorIDMixin::user_agent() const
 {
     // Must return the default `User-Agent` value.
-    auto user_agent = ResourceLoader::the().user_agent_for_url(navigator_id_url());
+    auto user_agent = Fetch::Infrastructure::environment_default_user_agent_value(current_loader_config()->config, navigator_id_settings_object());
     return Utf16String::from_ascii_without_validation(user_agent.bytes());
 }
 
 // https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-vendor
 Utf16FlyString NavigatorIDMixin::vendor() const
 {
-    auto navigator_compatibility_mode = ResourceLoader::the().navigator_compatibility_mode();
+    auto navigator_compatibility_mode = ResourceLoader::navigator_compatibility_mode();
 
     // Must return the appropriate string from the following list:
 

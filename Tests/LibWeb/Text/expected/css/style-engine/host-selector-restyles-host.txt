@@ -1,0 +1,3 @@
+passes: PARTIAL
+changed: [host, style, child]
+restyled but unchanged: []

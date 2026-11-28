@@ -112,3 +112,65 @@ test("await binding names in static blocks without a function boundary", () => {
     expect(`class A { static { await => 0; } }`).not.toEval();
     expect(`class A { static { async function await() {} } }`).not.toEval();
 });
+
+describe("static blocks inside a destructuring declaration", () => {
+    test("destructuring declaration with another name", () => {
+        function f() {
+            const [
+                a = class {
+                    static {
+                        let [b] = [];
+                    }
+                },
+            ] = [];
+            return typeof a;
+        }
+        expect(f()).toBe("function");
+    });
+
+    test("destructuring declaration with the same name", () => {
+        expect("const [a = class { static { let [a] = []; } }] = [];").toEval();
+    });
+
+    test("destructured catch parameter", () => {
+        function f() {
+            const {
+                a,
+                b = class {
+                    static {
+                        try {
+                        } catch ({ message }) {}
+                    }
+                },
+            } = { a: 1 };
+            return a;
+        }
+        expect(f()).toBe(1);
+    });
+});
+
+test("a direct eval in a static block sees the block's own arguments object", () => {
+    class A {
+        static {
+            this.result = eval("typeof arguments + ',' + arguments.length");
+        }
+    }
+    expect(A.result).toBe("object,0");
+
+    class B {
+        static {
+            this.result = (() => eval("arguments.length"))();
+        }
+    }
+    expect(B.result).toBe(0);
+
+    function outer() {
+        class C {
+            static {
+                this.result = eval("arguments.length");
+            }
+        }
+        return [C.result, arguments.length];
+    }
+    expect(outer(1, 2, 3)).toEqual([0, 3]);
+});

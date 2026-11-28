@@ -4,21 +4,23 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWebView/Profile.h>
+#include <AK/ByteString.h>
+#include <AK/StringView.h>
+#include <UI/Qt/BrandColors.h>
 
 #import <Cocoa/Cocoa.h>
 #import <UI/Qt/ApplicationIcon.h>
 
 namespace Ladybird {
 
-void set_profile_application_icon(WebView::Profile const& profile)
+void set_profile_application_icon(StringView identifier, ByteString const& identity, bool is_temporary)
 {
-    if (profile.identifier() == "default"sv)
+    if (identifier == "default"sv)
         return;
 
-    auto label = profile.is_temporary()
+    auto label = is_temporary
         ? "tmp"sv
-        : profile.identifier().substring_view(0, min(profile.identifier().length(), 3uz));
+        : identifier.substring_view(0, min(identifier.length(), 3uz));
     auto* profile_label = [[[NSString alloc] initWithBytes:label.characters_without_null_termination()
                                                     length:label.length()
                                                   encoding:NSUTF8StringEncoding]
@@ -27,33 +29,21 @@ void set_profile_application_icon(WebView::Profile const& profile)
     if (!application_icon)
         return;
 
+    auto ns_color = [](QRgb color) {
+        return [NSColor colorWithSRGBRed:qRed(color) / 255.0
+                                   green:qGreen(color) / 255.0
+                                    blue:qBlue(color) / 255.0
+                                   alpha:1];
+    };
     NSArray<NSColor*>* badge_colors = @[
-        [NSColor colorWithSRGBRed:0.38
-                            green:0.52
-                             blue:0.96
-                            alpha:1],
-        [NSColor colorWithSRGBRed:0.49
-                            green:0.43
-                             blue:0.91
-                            alpha:1],
-        [NSColor colorWithSRGBRed:0.63
-                            green:0.39
-                             blue:0.88
-                            alpha:1],
-        [NSColor colorWithSRGBRed:0.82
-                            green:0.36
-                             blue:0.65
-                            alpha:1],
-        [NSColor colorWithSRGBRed:0.16
-                            green:0.57
-                             blue:0.65
-                            alpha:1],
-        [NSColor colorWithSRGBRed:0.30
-                            green:0.36
-                             blue:0.72
-                            alpha:1],
+        ns_color(BrandColors::SlateBlue500),
+        ns_color(BrandColors::Indigo30),
+        ns_color(BrandColors::Violet100),
+        ns_color(BrandColors::Violet900),
+        ns_color(BrandColors::SlateBlue900),
+        ns_color(BrandColors::Indigo60),
     ];
-    auto* badge_color = badge_colors[profile.paths().identity.hash() % [badge_colors count]];
+    auto* badge_color = badge_colors[identity.hash() % [badge_colors count]];
 
     auto icon_size = [application_icon size];
     auto* profile_icon = [NSImage imageWithSize:icon_size

@@ -7,9 +7,9 @@
 
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Object.h>
-#include <LibMedia/CodecParameters.h>
 #include <LibMedia/MediaSupport.h>
 #include <LibMediaClient/Client.h>
+#include <LibMediaCodecs/CodecParameters.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
@@ -19,14 +19,16 @@
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
 
+GC_UNTRACED_CAPTURE(Media::DecoderCapabilities);
+
 namespace Web::MediaCapabilitiesAPI {
 
 // https://w3c.github.io/media-capabilities/#queue-a-media-capabilities-task
-static void queue_a_media_capabilities_task(JS::Object& global_object, Function<void()> steps)
+static void queue_a_media_capabilities_task(JS::Object& global_object, GC::Ref<GC::Function<void()>> steps)
 {
     // When an algorithm queues a Media Capabilities task T, the user agent MUST queue a global task T on the
     // media capabilities task source using the global object of the the current realm record.
-    HTML::queue_global_task(HTML::Task::Source::MediaCapabilities, global_object, GC::create_function(GC::Heap::the(), move(steps)));
+    HTML::queue_global_task(HTML::Task::Source::MediaCapabilities, global_object, steps);
 }
 
 // https://w3c.github.io/media-capabilities/#valid-mediaconfiguration
@@ -96,16 +98,14 @@ static bool check_mime_type_validity(MimeSniff::MimeType const& mime_type, Media
 
         //     2. If the value of mimeType.parameters["codecs"] does not describe a single media codec, return
         //        false.
-        auto codec_strings = codecs->value.bytes_as_string_view().split_view(',', SplitBehavior::KeepEmpty);
-        if (codec_strings.size() != 1)
+        auto codec_string = codecs->value.bytes_as_string_view().trim_whitespace();
+        if (codec_string.is_empty())
             return false;
-        auto codec = Media::parse_codec_parameters_string(codec_strings[0].trim_whitespace());
-        if (!codec.has_value())
+        auto codec_string_separators = codec_string.count(',');
+        if (codec_string_separators > 0)
             return false;
-
-        // AD-HOC: The algorithm takes media but consults it only in step 1, so nothing rejects a codec of the
-        //         wrong kind. See https://github.com/w3c/media-capabilities/issues/261.
-        if (Media::track_type_from_codec_id(codec->codec_id()) != media)
+        auto codec = Media::parse_codec_parameters_string(codec_string);
+        if (codec.has_value() && Media::track_type_from_codec_id(codec->codec_id()) != media)
             return false;
     }
 
@@ -188,6 +188,12 @@ MediaCapabilities::MediaCapabilities()
 {
 }
 
+void MediaCapabilities::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_pending_decoding_info_promises);
+}
+
 // https://w3c.github.io/media-capabilities/#dom-mediacapabilities-decodinginfo
 void MediaCapabilities::decoding_info(MediaDecodingConfiguration const& configuration, GC::Ref<WebIDL::Promise> promise)
 {
@@ -204,15 +210,22 @@ void MediaCapabilities::decoding_info(MediaDecodingConfiguration const& configur
     // FIXME: Implement this.
 
     // 4. Run the following steps in parallel:
-    auto resolve_with_capabilities = [promise = GC::Root(promise), configuration](Optional<Media::DecoderCapabilities> const& capabilities) {
+    m_pending_decoding_info_promises.append(promise);
+    auto resolve_with_capabilities = [weak_this = GC::Weak { *this }, weak_promise = GC::Weak { *promise }, configuration](Optional<Media::DecoderCapabilities> const& capabilities) {
+        auto self = weak_this.ptr();
+        auto pending_promise = weak_promise.ptr();
+        if (!self || !pending_promise)
+            return;
+        self->m_pending_decoding_info_promises.remove_first_matching([&](auto const& promise) { return promise.ptr() == pending_promise.ptr(); });
+
         // 1. Run the Create a MediaCapabilitiesDecodingInfo algorithm with configuration.
         // 2. Queue a Media Capabilities task to resolve p with its result.
-        queue_a_media_capabilities_task(WebIDL::promise_realm(*promise).global_object(), [promise, configuration, capabilities] {
+        queue_a_media_capabilities_task(WebIDL::promise_realm(*pending_promise).global_object(), GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *pending_promise }, configuration, capabilities), [](auto& promise, auto& configuration, auto& capabilities) {
             auto& realm = WebIDL::promise_realm(*promise);
             HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
             auto result = Bindings::media_capabilities_decoding_info_to_value(realm, create_a_media_capabilities_decoding_info(configuration, capabilities));
             WebIDL::resolve_promise(*promise, result);
-        });
+        }));
     };
     request_media_decoding_capabilities(configuration)
         ->when_resolved([resolve_with_capabilities](Optional<Media::DecoderCapabilities>& capabilities) {
@@ -291,7 +304,7 @@ static NonnullRefPtr<DecoderCapabilitiesPromise> request_media_source_decoding_c
 // AD-HOC: The spec answers only supported or unsupported, leaving steps 6 and 7 of "Create a
 //         MediaCapabilitiesDecodingInfo" to determine smoothness and power efficiency by unspecified means.
 //         LibMedia answers all three from one query, so the capabilities are returned here instead.
-static NonnullRefPtr<DecoderCapabilitiesPromise> check_mime_type_support(Utf16View content_type, MediaDecodingType decoding_type)
+static NonnullRefPtr<DecoderCapabilitiesPromise> check_mime_type_support(Utf16View content_type, Media::TrackType media, MediaDecodingType decoding_type)
 {
     // 1. If encodingOrDecodingType is webrtc and mimeType is not one that is used with RTP [...], return
     //    unsupported.
@@ -309,6 +322,17 @@ static NonnullRefPtr<DecoderCapabilitiesPromise> check_mime_type_support(Utf16Vi
     auto mime_type = MimeSniff::MimeType::parse(content_type);
     if (!mime_type.has_value())
         return unsupported();
+
+    // AD-HOC: The algorithm takes media but consults it only in step 1, so nothing rejects a codec of the
+    //         wrong kind. See https://github.com/w3c/media-capabilities/issues/261.
+    if (auto codecs = mime_type->parameters().get("codecs"sv); codecs.has_value()) {
+        auto codec = Media::parse_codec_parameters_string(codecs->bytes_as_string_view().trim_whitespace());
+        if (!codec.has_value())
+            return unsupported();
+        if (Media::track_type_from_codec_id(codec->codec_id()) != media)
+            return unsupported();
+    }
+
     if (decoding_type == MediaDecodingType::MediaSource)
         return request_media_source_decoding_capabilities(*mime_type);
     return request_file_decoding_capabilities(*mime_type);
@@ -380,7 +404,7 @@ NonnullRefPtr<DecoderCapabilitiesPromise> request_media_decoding_capabilities(Me
         // 3. If video is present in configuration, [...] set videoSupported to the result of running check MIME
         //   type support with videoMimeType, configuration's type, colorGamut, and transferFunction.
         if (configuration.video.has_value())
-            video_capabilities = check_mime_type_support(configuration.video->content_type, configuration.type);
+            video_capabilities = check_mime_type_support(configuration.video->content_type, Media::TrackType::Video, configuration.type);
 
         // 4. Let audioSupported be unknown.
         auto audio_capabilities = unconstrained();
@@ -388,7 +412,7 @@ NonnullRefPtr<DecoderCapabilitiesPromise> request_media_decoding_capabilities(Me
         // 5. If audio is present in configuration, [...] set audioSupported to the result of running check MIME type
         //    support with audioMimeType and configuration's type.
         if (configuration.audio.has_value())
-            audio_capabilities = check_mime_type_support(configuration.audio->content_type, configuration.type);
+            audio_capabilities = check_mime_type_support(configuration.audio->content_type, Media::TrackType::Audio, configuration.type);
 
         // 6. If videoSupported or audioSupported is unsupported, set supported to false, smooth to false,
         //    powerEfficient to false, and return info.

@@ -6,16 +6,20 @@
 
 #pragma once
 
+#include <AK/StdLibExtras.h>
 #include <AK/Types.h>
 #include <LibGC/Export.h>
+#include <LibGC/HoldsNoCellEdges.h>
 
 namespace GC {
 
+struct CAPI;
 class Cell;
 class CellAllocator;
 struct CellTypeInfo;
 struct CellTypeThunks;
 class DeferGC;
+class ForeignCell;
 class RootImpl;
 class Heap;
 class HeapGroup;
@@ -41,14 +45,11 @@ class Ref;
 template<class T>
 class Ptr;
 
-template<class T, size_t inline_capacity = 0>
-class ConservativeVector;
+template<class T>
+class Member;
 
-template<typename K, typename V, typename KeyTraits, typename ValueTraits, bool IsOrdered>
-class ConservativeHashMap;
-
-template<typename T, typename TraitsForT, bool IsOrdered>
-class ConservativeHashTable;
+template<class T>
+class NonnullMember;
 
 template<class T>
 class HeapVector;

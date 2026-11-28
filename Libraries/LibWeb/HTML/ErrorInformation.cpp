@@ -5,8 +5,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibJS/Runtime/Error.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/HTML/ErrorInformation.h>
+#include <LibWeb/WebIDL/DOMException.h>
 
 namespace Web::HTML {
 
@@ -21,11 +23,31 @@ ErrorInformation extract_error_information(JS::VM& vm, JS::Value exception)
 
     // 3. Set attributes[message], attributes[filename], attributes[lineno], and attributes[colno] to
     //    implementation-defined values derived from exception.
+    // NB: An Error's or a DOMException's message is prefixed with its name, as Error.prototype.toString() does.
+    auto prefix_with_name = [](Utf16String name, Utf16String message) {
+        if (message.is_empty())
+            return name;
+        if (name.is_empty())
+            return message;
+        return Utf16String::formatted("{}: {}", name, message);
+    };
+
     attributes.message = [&] {
         if (auto object = exception.as_if<JS::Object>()) {
-            if (MUST(object->has_own_property(vm.names.message))) {
-                auto message = object->get_without_side_effects(vm.names.message);
-                return message.to_utf16_string_without_side_effects();
+            // NB: A DOMException's name and message are accessors on its prototype.
+            if (auto const* dom_exception = Bindings::dom_exception_from_object(*object))
+                return prefix_with_name(dom_exception->name().to_utf16_string(), dom_exception->message().to_utf16_string());
+
+            // NB: Whatever script threw must not get to run here, so stay away from the traps of a proxy. What is left is
+            //     a module namespace object whose binding of that name is not initialized yet.
+            if (auto has_message = object->is_proxy() ? false : object->has_own_property(vm.names.message); !has_message.is_error() && has_message.value()) {
+                auto message = object->get_without_side_effects(vm.names.message).to_utf16_string_without_side_effects();
+                if (is<JS::Error>(*object)) {
+                    auto name = object->get_without_side_effects(vm.names.name);
+                    if (name.is_string())
+                        return prefix_with_name(name.to_utf16_string_without_side_effects(), move(message));
+                }
+                return message;
             }
         }
 
@@ -35,29 +57,39 @@ ErrorInformation extract_error_information(JS::VM& vm, JS::Value exception)
     // FIXME: This offset is relative to the javascript source. Other browsers appear to do it relative
     //        to the entire source document! Calculate that somehow.
 
-    // NB: If we got an Error object, then try and extract the information from the location the object was made.
+    // NB: Take the throw site even when an Error's traceback gives the location, so the VM stops keeping it alive.
+    auto throw_site = vm.take_throw_site_of(exception);
+
+    // NB: If we got an Error object, then try and extract the information from the location the object was made. Only
+    //     the script-visible frames count, so the location does not change while a debugger is attached.
+    bool has_location = false;
     if (auto object = exception.as_if<JS::Object>(); object && object->error_data()) {
-        for (auto const& frame : object->error_data()->traceback()) {
+        for (auto const& frame : object->error_data()->script_visible_traceback()) {
             auto source_range = frame.source_range();
             if (source_range.start.line != 0 || source_range.start.column != 0) {
                 attributes.filename = source_range.filename();
                 attributes.lineno = source_range.start.line;
                 attributes.colno = source_range.start.column;
+                has_location = true;
                 break;
             }
         }
     }
+    if (has_location)
+        return attributes;
+
+    // NB: Otherwise, if a throw statement threw it, take the location from there. That includes an Error whose stack
+    //     has no frames, as with Error.stackTraceLimit set to 0.
+    if (throw_site.has_value()) {
+        attributes.filename = throw_site->filename();
+        attributes.lineno = throw_site->start.line;
+        attributes.colno = throw_site->start.column;
+    }
     // NB: Otherwise, we fall back to try and find the location of the invocation of the function itself.
-    else {
-        for (auto const& frame : vm.stack_trace()) {
-            if (frame.source_range.has_value()) {
-                auto const& source_range = *frame.source_range;
-                attributes.filename = source_range.filename();
-                attributes.lineno = source_range.start.line;
-                attributes.colno = source_range.start.column;
-                break;
-            }
-        }
+    else if (auto source_range = vm.innermost_source_range(); source_range.has_value()) {
+        attributes.filename = source_range->filename();
+        attributes.lineno = source_range->start.line;
+        attributes.colno = source_range->start.column;
     }
 
     // 4. Return attributes.

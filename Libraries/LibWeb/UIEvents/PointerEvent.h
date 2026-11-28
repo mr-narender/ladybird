@@ -28,8 +28,12 @@ namespace Web::UIEvents {
 
 class PointerEvent;
 
+// https://w3c.github.io/pointerevents/#dom-pointerevent-pointerid
+// The mouse is the one pointer there is, and this is its id in every pointer event of it.
+constexpr WebIDL::Long mouse_pointer_id = 0;
+
 struct PointerEventOptions : public MouseEventOptions {
-    WebIDL::Long pointer_id { 0 };
+    WebIDL::Long pointer_id { mouse_pointer_id };
     double width { 1 };
     double height { 1 };
     float pressure { 0 };
@@ -42,8 +46,8 @@ struct PointerEventOptions : public MouseEventOptions {
     Utf16FlyString pointer_type {};
     bool is_primary { false };
     WebIDL::Long persistent_device_id { 0 };
-    Vector<GC::Ref<PointerEvent>> coalesced_events;
-    Vector<GC::Ref<PointerEvent>> predicted_events;
+    GC::RootVector<GC::Ref<PointerEvent>> coalesced_events;
+    GC::RootVector<GC::Ref<PointerEvent>> predicted_events;
 };
 
 // https://w3c.github.io/pointerevents/#pointerevent-interface
@@ -60,10 +64,14 @@ public:
         Utf16FlyString const& type, PointerEventOptions&&,
         double page_x, double page_y, double offset_x, double offset_y,
         HighResolutionTime::DOMHighResTimeStamp);
+    [[nodiscard]] static GC::Ref<PointerEvent> create_with_coalesced_events(
+        Utf16FlyString const& type, PointerEventOptions&&,
+        double page_x, double page_y, double offset_x, double offset_y,
+        HighResolutionTime::DOMHighResTimeStamp);
     [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<PointerEvent>> create_for_constructor(FlyString const&, Bindings::PointerEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
     [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<PointerEvent>> create_for_constructor(Utf16String const&, Bindings::PointerEventInit const&, HighResolutionTime::DOMHighResTimeStamp);
-    [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<PointerEvent>> create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy>, FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers);
-    [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<PointerEvent>> create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy>, Utf16FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers);
+    [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<PointerEvent>> create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy>, FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers, int detail = 0);
+    [[nodiscard]] static WebIDL::ExceptionOr<GC::Ref<PointerEvent>> create_from_platform_event(JS::Object const& relevant_global_object, GC::Ptr<HTML::WindowProxy>, Utf16FlyString const& event_name, CSSPixelPoint screen, CSSPixelPoint page, CSSPixelPoint client, CSSPixelPoint offset, Optional<CSSPixelPoint> movement, unsigned button, unsigned buttons, unsigned modifiers, int detail = 0);
 
     virtual ~PointerEvent() override;
 
@@ -77,6 +85,13 @@ public:
     double client_y() const override;
     double offset_x() const override;
     double offset_y() const override;
+
+    // https://w3c.github.io/pointerevents/#attributes-and-default-actions
+    // Many user agents expose non-standard attributes fromElement and toElement in MouseEvents to support legacy content.
+    // We encourage those user agents to set the values of those (inherited) attributes in PointerEvents to null to
+    // transition authors to the use of standardized alternates (target and relatedTarget).
+    virtual GC::Ptr<DOM::Node> from_element() const override { return nullptr; }
+    virtual GC::Ptr<DOM::Node> to_element() const override { return nullptr; }
 
     WebIDL::Long pointer_id() const { return m_pointer_id; }
     double width() const { return m_width; }
@@ -92,6 +107,7 @@ public:
     bool is_primary() const { return m_is_primary; }
     WebIDL::Long persistent_device_id() const { return m_persistent_device_id; }
     AK::ReadonlySpan<GC::Ref<PointerEvent>> get_coalesced_events() const { return m_coalesced_events; }
+    void set_target_of_coalesced_events(GC::Ptr<DOM::EventTarget>);
     AK::ReadonlySpan<GC::Ref<PointerEvent>> get_predicted_events() const { return m_predicted_events; }
 
     // https://w3c.github.io/pointerevents/#dom-pointerevent-pressure

@@ -33,16 +33,6 @@ ErrorOr<void> Thread::set_priority(int priority)
     return {};
 }
 
-ErrorOr<int> Thread::get_priority() const
-{
-    sched_param scheduling_parameters {};
-    int policy;
-    int result = pthread_getschedparam(m_tid, &policy, &scheduling_parameters);
-    if (result != 0)
-        return Error::from_errno(result);
-    return scheduling_parameters.sched_priority;
-}
-
 ByteString Thread::thread_name() const { return m_thread_name; }
 
 pthread_t Thread::tid() const { return m_tid; }
@@ -65,6 +55,11 @@ bool Threading::Thread::has_exited() const
 
 void Thread::start()
 {
+    MUST(try_start());
+}
+
+ErrorOr<void> Thread::try_start()
+{
     VERIFY(!is_started());
 
     // Set this first so that the other thread starts out seeing m_state == Running.
@@ -72,8 +67,15 @@ void Thread::start()
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    if (m_stack_size > 0)
-        pthread_attr_setstacksize(&attr, m_stack_size);
+    auto stack_size = m_stack_size;
+#if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID) && !defined(AK_LIBC_GLIBC)
+    // musl gives a thread only 128 KiB of stack by default, where glibc gives it as much as the main thread's stack size
+    // limit, which is 8 MiB on most systems. Deep recursion in script, regular expressions, or layout would overflow it.
+    if (stack_size == 0)
+        stack_size = 8 * MiB;
+#endif
+    if (stack_size > 0)
+        pthread_attr_setstacksize(&attr, stack_size);
 #if defined(AK_OS_MACOS)
     MUST(Core::Platform::apply_thread_qos_to_pthread_attributes(attr, m_qos));
 #endif
@@ -121,7 +123,13 @@ void Thread::start()
 
     pthread_attr_destroy(&attr);
 
-    VERIFY(rc == 0);
+    if (rc != 0) {
+        // NB: The thread would have adopted this reference.
+        unref();
+        m_state = Threading::ThreadState::Startable;
+        return Error::from_errno(rc);
+    }
+    return {};
 }
 
 void Thread::detach()

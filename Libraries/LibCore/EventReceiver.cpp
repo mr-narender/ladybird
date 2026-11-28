@@ -6,6 +6,7 @@
  */
 
 #include <AK/Assertions.h>
+#include <AK/Time.h>
 #include <LibCore/Event.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/EventReceiver.h>
@@ -22,10 +23,12 @@ EventReceiver::~EventReceiver()
 void EventReceiver::event(Core::Event& event)
 {
     switch (event.type()) {
-    case Core::Event::Timer:
-        if (!m_timer_id)
-            break; // Too late, the timer was already stopped.
-        return timer_event(static_cast<TimerEvent&>(event));
+    case Core::Event::Timer: {
+        auto& timer_event = static_cast<TimerEvent&>(event);
+        if (!m_timer_id || timer_event.timer_generation() != m_timer_generation)
+            break; // Too late, the timer was stopped or started again.
+        return this->timer_event(timer_event);
+    }
     case Core::Event::Invalid:
         VERIFY_NOT_REACHED();
         break;
@@ -38,14 +41,15 @@ void EventReceiver::timer_event(Core::TimerEvent&)
 {
 }
 
-void EventReceiver::start_timer(int ms)
+void EventReceiver::start_timer(AK::Duration interval)
 {
     if (m_timer_id) {
         dbgln("{} {:p} already has a timer!", class_name(), this);
         VERIFY_NOT_REACHED();
     }
 
-    m_timer_id = Core::EventLoop::register_timer(*this, ms, true);
+    ++m_timer_generation;
+    m_timer_id = Core::EventLoop::register_timer(*this, interval, true);
 }
 
 void EventReceiver::stop_timer()

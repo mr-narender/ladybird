@@ -13,11 +13,10 @@
 #include <AK/Time.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
-#include <LibMedia/Containers/ContainerNavigator.h>
-#include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/MediaStream.h>
 #include <LibMedia/TimeRanges.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 namespace Media {
 
@@ -42,10 +41,24 @@ public:
     virtual ~FrameScanSource() = default;
 
     // Reads the frame at the position, skipping over bytes that head no frame.
-    virtual Optional<Frame> next_frame(MediaStreamCursor&, size_t position) const = 0;
+    virtual DecoderErrorOr<Optional<Frame>> next_frame(MediaStreamCursor&, size_t position) const = 0;
 
-    virtual Optional<size_t> find_boundary_at_or_after(MediaStreamCursor&, size_t start_byte, size_t upper_bound) const = 0;
-    virtual Optional<size_t> find_boundary_at_or_before(MediaStreamCursor&, size_t target_byte, size_t lower_bound, size_t upper_bound) const = 0;
+    virtual DecoderErrorOr<Optional<size_t>> find_boundary_at_or_after(MediaStreamCursor&, size_t start_byte, size_t upper_bound) const = 0;
+    virtual DecoderErrorOr<Optional<size_t>> find_boundary_at_or_before(MediaStreamCursor&, size_t target_byte, size_t lower_bound, size_t upper_bound) const = 0;
+
+protected:
+    template<typename T>
+    static DecoderErrorOr<Optional<T>> absorb_data_errors(DecoderErrorOr<Optional<T>> result)
+    {
+        if (result.is_error() && !is_stream_control_flow(result.error().category()))
+            return Optional<T> {};
+        return result;
+    }
+};
+
+struct SeekedPosition {
+    i64 byte_position;
+    AK::Duration timestamp;
 };
 
 enum class DurationSource : u8 {
@@ -66,7 +79,7 @@ public:
 
     BufferedRangesScan buffered_time_ranges(NonnullRefPtr<MediaStreamCursor> const& cursor, Vector<MediaStream::ByteRange> const& byte_ranges, Optional<u64> file_size);
     AK::Duration duration();
-    DecoderErrorOr<SeekResult> seek_to_timestamp(NonnullRefPtr<MediaStreamCursor> const& scanning_cursor, NonnullRefPtr<MediaStreamCursor> const& seek_cursor, MediaStream&, AK::Duration timestamp);
+    DecoderErrorOr<SeekedPosition> seek_to_timestamp(NonnullRefPtr<MediaStreamCursor> const& scanning_cursor, NonnullRefPtr<MediaStreamCursor> const& seek_cursor, MediaStream&, AK::Duration timestamp);
 
 private:
     struct ScannedByteRange;
@@ -95,9 +108,9 @@ private:
     ByteRate rate_for_gap(ByteRate const& walked_before_gap, Optional<u64> file_size) const;
     ByteTimePoint last_scanned_endpoint() const;
     Optional<ByteTimePoint> end_anchor(Optional<u64> file_size) const;
-    TimestampLookup look_up_timestamp(MediaStreamCursor&, AK::Duration target, Optional<u64> file_size) const;
+    DecoderErrorOr<TimestampLookup> look_up_timestamp(MediaStreamCursor&, AK::Duration target, Optional<u64> file_size) const;
     Optional<ScannedByteRange> last_range_starting_at_or_before_byte(size_t byte) const;
-    FrameWalk walk_to_timestamp(MediaStreamCursor&, ByteTimePoint const& start, AK::Duration target) const;
+    DecoderErrorOr<FrameWalk> walk_to_timestamp(MediaStreamCursor&, ByteTimePoint const& start, AK::Duration target) const;
     void scan_frames_into_range(MediaStreamCursor&, ScannedByteRange&, size_t limit);
     void update_scanned_ranges(MediaStreamCursor&, Vector<MediaStream::ByteRange> const&, Optional<u64> file_size);
     void drop_ranges_whose_bytes_are_gone(Vector<MediaStream::ByteRange> const&);

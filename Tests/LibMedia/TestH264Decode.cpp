@@ -4,18 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibMedia/Containers/ISOBMFF/ISOBMFFDemuxer.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/DemuxerRegistry.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
-#include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
-#include <LibMedia/FFmpeg/SystemFFmpeg.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegVideoDecoder.h>
+#include <LibMediaCodecs/FFmpeg/SystemFFmpeg.h>
 
 #include "TestMediaCommon.h"
 
 // H.264 is left out of the bundled FFmpeg, so these run against whatever system libavcodec decodes it.
 static Media::FFmpeg::SystemFFmpeg const* h264_library()
 {
+    Media::FFmpeg::SystemFFmpeg::load();
     auto const* library = Media::FFmpeg::SystemFFmpeg::the();
     if (library == nullptr || !library->has_decoder(Media::CodecID::H264)) {
         warnln("No system FFmpeg decodes H.264, skipping");
@@ -68,7 +69,7 @@ TEST_CASE(h264_configuration_change)
         MUST(decoder->receive_coded_data(sample, Media::DecodeIntent::Output));
 
         while (true) {
-            auto decoded_frame_result = decoder->take_next_output(new_track.video_data().cicp);
+            auto decoded_frame_result = decoder->take_next_output(new_track.video_data().color_metadata);
             if (decoded_frame_result.is_error()) {
                 EXPECT_EQ(decoded_frame_result.error().category(), Media::DecoderErrorCategory::NeedsMoreInput);
                 break;
@@ -87,7 +88,7 @@ TEST_CASE(avc_in_mp4_with_reordered_frames)
 
     auto file = MUST(Core::File::open("./avc.mp4"sv, Core::File::OpenMode::Read));
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
-    auto demuxer = MUST(Media::FFmpeg::FFmpegDemuxer::from_stream(stream));
+    auto demuxer = MUST(Media::ISOBMFF::ISOBMFFDemuxer::from_stream(stream));
     auto optional_track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video));
     VERIFY(optional_track.has_value());
     auto track = optional_track.release_value();
@@ -101,7 +102,7 @@ TEST_CASE(avc_in_mp4_with_reordered_frames)
     auto last_timestamp = AK::Duration::min();
 
     auto take_decoded_frame = [&]() -> Media::DecoderErrorOr<void> {
-        auto decoded_frame = TRY(decoder->take_next_output(track.video_data().cicp));
+        auto decoded_frame = TRY(decoder->take_next_output(track.video_data().color_metadata));
 
         EXPECT(last_timestamp <= decoded_frame->timestamp());
         EXPECT(!decoded_frame->duration().is_zero());
@@ -156,7 +157,7 @@ TEST_CASE(h264_reference_only_frames_are_decoded_but_not_produced)
     Vector<AK::Duration> presented_timestamps;
     auto drain = [&] {
         while (true) {
-            auto decoded_frame_result = decoder->take_next_output(track.video_data().cicp);
+            auto decoded_frame_result = decoder->take_next_output(track.video_data().color_metadata);
             if (decoded_frame_result.is_error())
                 return;
             presented_timestamps.append(decoded_frame_result.value()->timestamp());

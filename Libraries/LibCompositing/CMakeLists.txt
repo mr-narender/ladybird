@@ -1,44 +1,42 @@
-include(libcompositing_generators)
-
 set(SOURCES
-    DisplayList/AccumulatedVisualContext.cpp
-    DisplayList/Canvas2DCommandStream.cpp
-    DisplayList/DisplayList.cpp
-    DisplayList/DisplayListDamage.cpp
-    DisplayList/DisplayListPlayerSkia.cpp
-    DisplayList/DisplayListResourceStorage.cpp
-    DisplayList/DisplayListResourceTransaction.cpp
+    CanvasColorSpace.cpp
+    DisplayList/DisplayListResourceEncoding.cpp
+    DisplayList/DisplayListResources.cpp
+    DisplayList/RegisteredImageFrames.cpp
+    DisplayList/RegisteredTypefaces.cpp
     DisplayList/RustFFIAssertions.cpp
-    DisplayList/VisualContextTreeTestBuilder.cpp
-    Scrolling/AsyncScrollTree.cpp
-    Scrolling/AsyncScrollingState.cpp
-    Scrolling/ScrollSnapSelection.cpp
-    Scrolling/ScrollState.cpp
+    FontServiceClient.cpp
     Scrolling/SmoothScrollAnimation.cpp
-    Scrolling/WheelGestureIdentity.cpp
-    Types.cpp
-    WebGL/TextureUpload.cpp
-    WebGL/WebGLCommandList.cpp
+    UIOverlays.cpp
+    Video/VideoFrameHold.cpp
+    Video/VideoFramePresentationPage.cpp
 )
-
-generate_compositing_webgl_implementation()
 
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/Services/Compositor)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorControlClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorControlClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorControlServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorControlServerEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorFontClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorFontClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorFontServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorFontServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorPresentationClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorPresentationClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorPresentationServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorPresentationServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorWebContentClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/CompositorWebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/CompositorWebContentServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/RenderClockClient.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/RenderClockClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/Compositor/RenderClockServer.ipc ${CMAKE_BINARY_DIR}/Services/Compositor/RenderClockServerEndpoint.h)
+compile_ipc(Types.ipc TypesCodecs.h)
+compile_ipc(UIOverlays.ipc UIOverlaysCodecs.h)
+compile_ipc(FontClient.ipc FontClientEndpoint.h)
+compile_ipc(FontServer.ipc FontServerEndpoint.h)
 
 set(GENERATED_SOURCES
-    WebGL/WebGLCommands.cpp
     ../../Services/Compositor/CompositorControlClientEndpoint.h
     ../../Services/Compositor/CompositorControlServerEndpoint.h
-    ../../Services/Compositor/CompositorFontClientEndpoint.h
-    ../../Services/Compositor/CompositorFontServerEndpoint.h
+    ../../Services/Compositor/CompositorPresentationClientEndpoint.h
+    ../../Services/Compositor/CompositorPresentationServerEndpoint.h
     ../../Services/Compositor/CompositorWebContentClientEndpoint.h
     ../../Services/Compositor/CompositorWebContentServerEndpoint.h
+    ../../Services/Compositor/RenderClockClientEndpoint.h
+    ../../Services/Compositor/RenderClockServerEndpoint.h
+    FontClientEndpoint.h
+    FontServerEndpoint.h
 )
 
 import_rust_crate(
@@ -55,17 +53,7 @@ test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libcompositing_rust)
 
 ladybird_lib(LibCompositing compositing EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibCompositing PUBLIC LibWebCommon)
-target_link_libraries(LibCompositing PRIVATE LibCore LibGfx LibIPC LibMedia skia libcompositing_rust)
-
-# The WebGL command stream headers include ANGLE's GLES headers for the GL constants and types,
-# but the GL entry points live in the Compositor. Hand out only ANGLE's compile interface, to this
-# library and to whatever includes its headers, so nothing that links LibCompositing pulls ANGLE in.
-foreach(angle_target IN LISTS ANGLE_TARGETS)
-    target_include_directories(LibCompositing PUBLIC $<TARGET_PROPERTY:${angle_target},INTERFACE_INCLUDE_DIRECTORIES>)
-    target_include_directories(LibCompositing SYSTEM PUBLIC $<TARGET_PROPERTY:${angle_target},INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>)
-    target_compile_definitions(LibCompositing PUBLIC $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_DEFINITIONS>)
-    target_compile_options(LibCompositing PRIVATE $<TARGET_PROPERTY:${angle_target},INTERFACE_COMPILE_OPTIONS>)
-endforeach()
+target_link_libraries(LibCompositing PRIVATE LibCore LibGfx LibIPC LibMedia LibThreading libcompositing_rust)
 
 get_target_property(_libcompositing_rust_lib libcompositing_rust IMPORTED_LOCATION)
 if ((LINUX OR BSD) AND NOT BUILD_SHARED_LIBS)
@@ -92,7 +80,7 @@ if(NOT BUILD_SHARED_LIBS)
 
     # POST_BUILD steps don't track inputs, so the bridge files depend on the Rust archive: when it
     # changes, LibCompositing re-archives and the merge picks up the fresh objects.
-    foreach(bridge IN ITEMS DisplayList/AccumulatedVisualContext.cpp DisplayList/DisplayList.cpp DisplayList/DisplayListDamage.cpp DisplayList/DisplayListResourceStorage.cpp DisplayList/VisualContextTreeTestBuilder.cpp)
+    foreach(bridge IN ITEMS DisplayList/RegisteredImageFrames.cpp Scrolling/SmoothScrollAnimation.cpp)
         set_property(SOURCE ${bridge} APPEND PROPERTY OBJECT_DEPENDS ${_libcompositing_rust_lib})
     endforeach()
 endif()

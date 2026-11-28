@@ -11,9 +11,11 @@
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/DecodedImageData.h>
+#include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/SVGComponentTransferFunctionElement.h>
 #include <LibWeb/SVG/SVGFEBlendElement.h>
 #include <LibWeb/SVG/SVGFEColorMatrixElement.h>
@@ -34,6 +36,8 @@
 #include <LibWeb/SVG/SVGFEOffsetElement.h>
 #include <LibWeb/SVG/SVGFETurbulenceElement.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
+#include <LibWeb/SVG/SVGLength.h>
+#include <LibWeb/SVG/SVGUnitTypes.h>
 
 namespace Web::SVG {
 
@@ -50,24 +54,14 @@ void SVGFilterElement::visit_edges(Cell::Visitor& visitor)
     SVGURIReferenceMixin::visit_edges(visitor);
 }
 
-void SVGFilterElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
-{
-    Base::attribute_changed(name, old_value, value, namespace_);
-
-    if (name == AttributeNames::filterUnits)
-        m_filter_units = parse_units(value.value_or({}));
-    else if (name == AttributeNames::primitiveUnits)
-        m_primitive_units = parse_units(value.value_or({}));
-}
-
 namespace {
 
 // A view of a string's code units for the Rust graph builder, valid for as long as the string is.
 Layout::RustFFI::FfiUtf16View view_of(Utf16View view)
 {
     return {
-        .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
-        .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
+        .latin1 = view.has_latin1_storage() ? view.latin1_span().data() : nullptr,
+        .utf16 = view.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
         .length = view.length_in_code_units(),
     };
 }
@@ -75,7 +69,7 @@ Layout::RustFFI::FfiUtf16View view_of(Utf16View view)
 }
 
 // https://drafts.fxtf.org/filter-effects-1/#ColorInterpolationFiltersProperty
-void SVGFilterElement::push_primitives(void* sink)
+void SVGFilterElement::push_primitives(void* sink, Gfx::IntSize dest_size)
 {
     using PrimitiveKind = Layout::RustFFI::FfiSvgFilterPrimitiveKind;
 
@@ -86,10 +80,63 @@ void SVGFilterElement::push_primitives(void* sink)
         return CSS::to_interpolation_color_space(color_interpolation_filters);
     };
 
+    // https://drafts.csswg.org/filter-effects-1/#FilterEffectsRegion
+    // A coordinate or length attribute, as a number of user units or a percentage.
+    // FIXME: Resolve font-relative lengths and math functions too.
+    auto parsed_attribute = [](DOM::Element const& element, Utf16FlyString const& name) -> Optional<NumberPercentage> {
+        auto value = element.get_attribute(name);
+        if (!value.has_value())
+            return {};
+        auto parsed = SVGLength::parse_scalar_value(*value);
+        if (!parsed.has_value())
+            return {};
+        switch (parsed->kind()) {
+        case SVGLengthValue::Kind::Number:
+            return NumberPercentage::create_number(parsed->value());
+        case SVGLengthValue::Kind::Percentage:
+            return NumberPercentage::create_percentage(parsed->value());
+        case SVGLengthValue::Kind::Length: {
+            auto length = parsed->to_length();
+            // A zero length is zero in any unit, so it resolves even where its unit doesn't yet.
+            if (length.raw_value() == 0)
+                return NumberPercentage::create_number(0);
+            if (!length.is_absolute())
+                return {};
+            return NumberPercentage::create_number(length.absolute_length_to_px_without_rounding());
+        }
+        }
+        VERIFY_NOT_REACHED();
+    };
+    Layout::RustFFI::FfiSvgFilterRegion region {
+        .filter_units_are_object_bounding_box = filter_units()->base_val() == to_underlying(SVGUnitType::ObjectBoundingBox),
+        .primitive_units_are_object_bounding_box = primitive_units()->base_val() == to_underlying(SVGUnitType::ObjectBoundingBox),
+        // If the attribute is not specified, the effect is as if a value of -10% (x, y) or 120% (width, height) were
+        // specified.
+        .x = Layout::to_ffi_number_percentage(parsed_attribute(*this, AttributeNames::x).value_or(NumberPercentage::create_percentage(-10))),
+        .y = Layout::to_ffi_number_percentage(parsed_attribute(*this, AttributeNames::y).value_or(NumberPercentage::create_percentage(-10))),
+        .width = Layout::to_ffi_number_percentage(parsed_attribute(*this, AttributeNames::width).value_or(NumberPercentage::create_percentage(120))),
+        .height = Layout::to_ffi_number_percentage(parsed_attribute(*this, AttributeNames::height).value_or(NumberPercentage::create_percentage(120))),
+    };
+    Layout::RustFFI::layout_arena_paint_set_svg_filter_region(sink, &region);
+
     for_each_child_of_type<DOM::Element>([&](auto& node) {
         Layout::RustFFI::FfiSvgFilterPrimitive primitive {};
         auto& values = primitive.values;
         values.operating_color_space = operating_color_space(node);
+
+        // https://drafts.csswg.org/filter-effects-1/#FilterPrimitiveSubRegion
+        // An attribute the primitive doesn't specify takes its value from the default subregion, which depends on the
+        // primitive's inputs, so the builder resolves that.
+        auto set_subregion_attribute = [&](Utf16FlyString const& name, auto& field, u8 specified_bit) {
+            if (auto value = parsed_attribute(node, name); value.has_value()) {
+                field = Layout::to_ffi_number_percentage(*value);
+                values.subregion_specified |= specified_bit;
+            }
+        };
+        set_subregion_attribute(AttributeNames::x, values.subregion_x, 1 << 0);
+        set_subregion_attribute(AttributeNames::y, values.subregion_y, 1 << 1);
+        set_subregion_attribute(AttributeNames::width, values.subregion_width, 1 << 2);
+        set_subregion_attribute(AttributeNames::height, values.subregion_height, 1 << 3);
 
         // The builder copies what the primitive's views point at while it is pushed, so this
         // storage only has to outlive the push.
@@ -171,23 +218,58 @@ void SVGFilterElement::push_primitives(void* sink)
             set_in1(*colormatrix_primitive);
             set_result(*colormatrix_primitive);
         } else if (auto* image_primitive = as_if<SVGFEImageElement>(node)) {
-            auto image_data = image_primitive->image_data();
-            if (!image_data)
-                return IterationDecision::Continue;
-
-            // FIXME: Should we use the dest rect as the size here?
-            image_frame = image_data->default_frame({});
-            if (!image_frame.has_value())
-                return IterationDecision::Continue;
-
-            auto src_rect = image_primitive->content_rect();
-            if (!src_rect.has_value())
-                return IterationDecision::Continue;
-
+            // https://drafts.csswg.org/filter-effects-1/#feImageElement
+            // An feImage whose image can't be rendered produces transparent black, which the builder makes of an Image
+            // primitive without a frame.
             values.kind = PrimitiveKind::Image;
-            values.image_src_rect = *src_rect;
-            primitive.image_frame = &image_frame.value();
             set_result(*image_primitive);
+            auto image_data = image_primitive->image_data();
+            // A vector image draws at whatever size it's asked for, letterboxing itself into a size of another aspect
+            // ratio. So ask for a frame of the image's own aspect ratio, large enough to cover the filtered element,
+            // but no larger along either axis than the largest frame that size would ask for anyway.
+            auto natural_width = image_data ? image_data->intrinsic_width().map([](auto width) { return width.to_float(); }).value_or(0) : 0;
+            auto natural_height = image_data ? image_data->intrinsic_height().map([](auto height) { return height.to_float(); }).value_or(0) : 0;
+            // An image missing a width or a height (an SVG with only a viewBox, e.g.) still has an aspect ratio, which
+            // the missing dimensions follow — so it fits the subregion at that ratio.
+            if (image_data && (natural_width <= 0 || natural_height <= 0)) {
+                if (auto aspect_ratio = image_data->intrinsic_aspect_ratio(); aspect_ratio.has_value() && aspect_ratio->to_float() > 0) {
+                    auto ratio = aspect_ratio->to_float();
+                    if (natural_width > 0) {
+                        natural_height = natural_width / ratio;
+                    } else if (natural_height > 0) {
+                        natural_width = natural_height * ratio;
+                    } else {
+                        natural_width = ratio;
+                        natural_height = 1;
+                    }
+                }
+            }
+            auto frame_size = dest_size;
+            if (natural_width > 0 && natural_height > 0 && !dest_size.is_empty()) {
+                auto largest_side = static_cast<float>(max(dest_size.width(), dest_size.height()));
+                auto scale = max(dest_size.width() / natural_width, dest_size.height() / natural_height);
+                scale = min(scale, largest_side / max(natural_width, natural_height));
+                frame_size = { max(1, static_cast<int>(ceilf(natural_width * scale))), max(1, static_cast<int>(ceilf(natural_height * scale))) };
+            }
+            if (image_data)
+                image_frame = image_data->default_frame(frame_size);
+            if (!image_frame.has_value()) {
+                primitive.in1 = view_of(in1);
+                primitive.in2 = view_of(in2);
+                primitive.result = view_of(result);
+                Layout::RustFFI::layout_arena_paint_push_svg_filter_primitive(sink, &primitive);
+                return IterationDecision::Continue;
+            }
+
+            values.image_src_rect = { 0, 0, image_frame->width(), image_frame->height() };
+            values.image_natural_width = natural_width;
+            values.image_natural_height = natural_height;
+            PreserveAspectRatio preserve_aspect_ratio {};
+            if (auto value = image_primitive->get_attribute(AttributeNames::preserveAspectRatio); value.has_value())
+                preserve_aspect_ratio = parse_preserve_aspect_ratio(*value).value_or({});
+            values.image_preserve_aspect_ratio_align = to_underlying(preserve_aspect_ratio.align);
+            values.image_preserve_aspect_ratio_meet_or_slice = to_underlying(preserve_aspect_ratio.meet_or_slice);
+            primitive.image_frame = &image_frame.value();
         } else if (auto* merge_primitive = as_if<SVGFEMergeElement>(node)) {
             values.kind = PrimitiveKind::Merge;
             merge_primitive->template for_each_child_of_type<SVGFEMergeNodeElement>([&](auto& merge_node) {
@@ -234,7 +316,8 @@ void SVGFilterElement::push_primitives(void* sink)
             values.base_frequency_y = turbulence->base_frequency_y()->base_val();
             values.num_octaves = turbulence->num_octaves()->base_val();
             values.seed = turbulence->seed()->base_val();
-            if (turbulence->stitch_tiles()->base_val() == to_underlying(SVGFETurbulenceElement::StitchType::Stitch)) {
+            values.turbulence_stitches_tiles = turbulence->stitch_tiles()->base_val() == to_underlying(SVGFETurbulenceElement::StitchType::Stitch);
+            if (values.turbulence_stitches_tiles) {
                 // FIXME: Use the correct width and height
                 auto maybe_width = turbulence->width()->base_val()->value();
                 auto maybe_height = turbulence->height()->base_val()->value();
@@ -264,15 +347,15 @@ void SVGFilterElement::push_primitives(void* sink)
 }
 
 // https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-filterunits
-GC::Ref<SVGAnimatedEnumeration> SVGFilterElement::filter_units() const
+GC::Ref<SVGAnimatedEnumeration> SVGFilterElement::filter_units()
 {
-    return SVGAnimatedEnumeration::create(to_underlying(m_filter_units.value_or(SVGUnits::ObjectBoundingBox)));
+    return svg_animated_enumeration_for_attribute(AttributeNames::filterUnits, svg_unit_type_keywords, to_underlying(SVGUnitType::ObjectBoundingBox));
 }
 
 // https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-primitiveunits
-GC::Ref<SVGAnimatedEnumeration> SVGFilterElement::primitive_units() const
+GC::Ref<SVGAnimatedEnumeration> SVGFilterElement::primitive_units()
 {
-    return SVGAnimatedEnumeration::create(to_underlying(m_primitive_units.value_or(SVGUnits::UserSpaceOnUse)));
+    return svg_animated_enumeration_for_attribute(AttributeNames::primitiveUnits, svg_unit_type_keywords, to_underlying(SVGUnitType::UserSpaceOnUse));
 }
 
 }

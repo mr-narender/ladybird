@@ -1,13 +1,13 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <div id="trigger"></div>
 <script>
-    function settleAndReset(triggerElement) {
+    function settle(triggerElement) {
         getComputedStyle(triggerElement).color;
         getComputedStyle(triggerElement).color;
         internals.updateStyle();
-        internals.resetStyleInvalidationCounters();
     }
 
     function addBystanders(parent, count) {
@@ -18,26 +18,28 @@
         }
     }
 
-    function dumpCounters(label) {
-        const c = internals.getStyleInvalidationCounters();
-        println(`${label}: elementStyleRecomputations=${c.elementStyleRecomputations}, elementStyleNoopRecomputations=${c.elementStyleNoopRecomputations}`);
+    function dumpWork(label, mutate) {
+        const work = styleWork(mutate);
+        const fullPass = work.passes().includes("FULL") ? " (full pass)" : "";
+        println(`${label}: restyled [${work.restyled().map(shortStyleName).join(", ")}]${fullPass}`);
     }
 
     test(() => {
         const trigger = document.getElementById("trigger");
         addBystanders(document.body, 25);
-        settleAndReset(trigger);
+        settle(trigger);
 
         // Adding a sheet whose only rule's rightmost compound is :hover
         // should be targeted to the hovered element, of which there are at
         // most a handful at any moment. Without an interaction-state pseudo
         // optimization, the walk falls back to a whole-subtree invalidation
         // that recomputes every element.
-        const hoverStyle = document.createElement("style");
-        hoverStyle.textContent = ":hover { color: rgb(0, 128, 0); }";
-        document.head.appendChild(hoverStyle);
-        getComputedStyle(trigger).color;
-
-        dumpCounters(":hover-only sheet add");
+        // Nothing, not even the arriving style element, as nothing is hovered.
+        dumpWork(":hover-only sheet add", () => {
+            const hoverStyle = document.createElement("style");
+            hoverStyle.textContent = ":hover { color: rgb(0, 128, 0); }";
+            document.head.appendChild(hoverStyle);
+            getComputedStyle(trigger).color;
+        });
     });
 </script>

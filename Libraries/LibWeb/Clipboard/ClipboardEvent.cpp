@@ -1,44 +1,25 @@
 /*
  * Copyright (c) 2024, Tim Flynn <trflynn89@serenityos.org>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGC/Heap.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Clipboard/ClipboardEvent.h>
+#include <LibWeb/HTML/DragDataStore.h>
 
 namespace Web::Clipboard {
 
-GC_DEFINE_ALLOCATOR(ClipboardEvent);
-
-GC::Ref<ClipboardEvent> ClipboardEvent::create(FlyString const& event_name, ClipboardEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
-{
-    return GC::Heap::the().allocate<ClipboardEvent>(event_name, event_init, time_stamp);
+extern "C" {
+// Defined in Bindings/Rust/src/clipboard/exports.rs.
+DOM::Event* web_rust_clipboard_create_clipboard_event(JSVM*, void* realm, FlatPtr event_name, bool bubbles, bool cancelable, bool composed, HTML::RustDragDataStore const* store);
 }
 
-GC::Ref<ClipboardEvent> ClipboardEvent::create(Utf16FlyString const& event_name, ClipboardEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
+GC::Ref<DOM::Event> create_clipboard_event(JS::Realm& realm, Utf16FlyString const& event_name, DOM::EventInit const& event_init, HTML::DragDataStore const& store)
 {
-    return GC::Heap::the().allocate<ClipboardEvent>(event_name, event_init, time_stamp);
-}
-
-ClipboardEvent::ClipboardEvent(FlyString const& event_name, ClipboardEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
-    : DOM::Event(event_name, event_init, time_stamp)
-    , m_clipboard_data(event_init.clipboard_data)
-{
-}
-
-ClipboardEvent::ClipboardEvent(Utf16FlyString const& event_name, ClipboardEventInit const& event_init, HighResolutionTime::DOMHighResTimeStamp time_stamp)
-    : DOM::Event(event_name, event_init, time_stamp)
-    , m_clipboard_data(event_init.clipboard_data)
-{
-}
-
-ClipboardEvent::~ClipboardEvent() = default;
-
-void ClipboardEvent::visit_edges(GC::Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_clipboard_data);
+    return *web_rust_clipboard_create_clipboard_event(JS::HostABI::vm_to_abi(realm.vm()), &realm, event_name.raw_identity(), event_init.bubbles, event_init.cancelable, event_init.composed, store.rust_store());
 }
 
 }

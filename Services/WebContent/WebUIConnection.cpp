@@ -34,9 +34,9 @@ static Utf16FlyString const& web_ui_loaded_event()
     return *event;
 }
 
-static FlyString const& web_ui_message_event()
+static Utf16FlyString const& web_ui_message_event()
 {
-    static NeverDestroyed<FlyString> event { "WebUIMessage"_fly_string };
+    static NeverDestroyed<Utf16FlyString> event { "WebUIMessage"_utf16_fly_string };
     return *event;
 }
 
@@ -54,7 +54,7 @@ WebUIConnection::WebUIConnection(NonnullOwnPtr<IPC::Transport> transport, Web::D
     auto& window = Web::HTML::relevant_window(realm.global_object());
     realm.global_object().define_direct_property(ladybird_property(), Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, Web::Internals::WebUI::create(window)), JS::default_attributes);
 
-    Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, m_document, GC::create_function(GC::Heap::the(), [&document = *m_document]() {
+    Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, m_document, GC::create_function(GC::Heap::the(), GC::captures(*m_document), [](auto& document) {
         document.dispatch_event(Web::DOM::Event::create(Web::HTML::relevant_global_object(document), web_ui_loaded_event()));
     }));
 }
@@ -90,10 +90,7 @@ void WebUIConnection::send_message(String name, JsonValue data)
         return;
     }
 
-    Web::DOM::CustomEventInit event_init {};
-    event_init.detail = serialized_detail.value();
-
-    m_document->dispatch_event(Web::DOM::CustomEvent::create(realm.global_object(), web_ui_message_event(), event_init));
+    m_document->dispatch_event(Web::DOM::create_custom_event(realm, web_ui_message_event(), serialized_detail.value()));
 }
 
 void WebUIConnection::received_message_from_web_ui(Utf16String const& name, JS::Value data)

@@ -16,6 +16,8 @@
 
 namespace Web::Bindings {
 
+enum class InterfaceName : u16;
+class RustInterfaceCell;
 struct EventInit;
 
 }
@@ -33,6 +35,8 @@ class WEB_API Event : public Bindings::GCAllocatedWrappable {
     GC_DECLARE_ALLOCATOR(Event);
 
 public:
+    virtual Bindings::RustInterfaceCell* rust_event_owner(Bindings::InterfaceName) const { return nullptr; }
+
     enum Phase : u16 {
         None = 0,
         CapturingPhase = 1,
@@ -220,7 +224,9 @@ private:
     bool m_initialized { false };
     bool m_dispatch { false };
 
-    bool m_is_trusted { false };
+    // NB: Every way that script obtains an event initializes isTrusted to false: the bindings for constructors,
+    //     createEvent(), initEvent(), dispatchEvent() and click().
+    bool m_is_trusted { true };
 
     Path m_path;
     TouchTargetList m_touch_target_list;

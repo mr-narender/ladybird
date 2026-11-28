@@ -4,11 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/QuickSort.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/SourceSet.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
@@ -273,8 +275,10 @@ descriptor_parser:
         auto last_character = descriptor_view.code_unit_at(descriptor_view.length_in_code_units() - 1);
         auto descriptor_without_last_character = descriptor_view.substring_view(0, descriptor_view.length_in_code_units() - 1);
 
-        auto as_int = descriptor_without_last_character.to_number<i32>();
-        auto as_float = descriptor_without_last_character.to_number<float>();
+        auto is_valid_non_negative_integer = !descriptor_without_last_character.is_empty()
+            && all_of(descriptor_without_last_character, [](auto code_point) { return is_ascii_digit(code_point); });
+        auto as_int = is_valid_non_negative_integer ? descriptor_without_last_character.to_number<i32>(TrimWhitespace::No) : Optional<i32> {};
+        auto as_float = is_valid_floating_point_number(descriptor_without_last_character) ? descriptor_without_last_character.to_number<float>(TrimWhitespace::No) : Optional<float> {};
 
         // - If the descriptor consists of a valid non-negative integer followed by a U+0077 LATIN SMALL LETTER W character
         if (last_character == 'w' && as_int.has_value()) {
@@ -286,9 +290,12 @@ descriptor_parser:
                 error = true;
             }
 
-            // FIXME: 3. Apply the rules for parsing non-negative integers to the descriptor.
-            //           If the result is zero, let error be yes. Otherwise, let width be the result.
-            width = as_int.value();
+            // 3. Apply the rules for parsing non-negative integers to the descriptor. If the result is zero, let error be yes.
+            //    Otherwise, let width be the result.
+            if (as_int.value() == 0)
+                error = true;
+            else
+                width = as_int.value();
         }
 
         // - If the descriptor consists of a valid floating-point number followed by a U+0078 LATIN SMALL LETTER X character
@@ -298,9 +305,12 @@ descriptor_parser:
                 error = true;
             }
 
-            // FIXME: 2. Apply the rules for parsing floating-point number values to the descriptor.
-            //           If the result is less than zero, let error be yes. Otherwise, let density be the result.
-            density = as_float.value();
+            // 2. Apply the rules for parsing floating-point number values to the descriptor. If the result is less than zero,
+            //    let error be yes. Otherwise, let density be the result.
+            if (as_float.value() < 0)
+                error = true;
+            else
+                density = as_float.value();
         }
         // - If the descriptor consists of a valid non-negative integer followed by a U+0068 LATIN SMALL LETTER H character
         else if (last_character == 'h' && as_int.has_value()) {
@@ -309,9 +319,12 @@ descriptor_parser:
             if (future_compat_h.has_value() || density.has_value()) {
                 error = true;
             }
-            // FIXME: 2. Apply the rules for parsing non-negative integers to the descriptor.
-            //           If the result is zero, let error be yes. Otherwise, let future-compat-h be the result.
-            future_compat_h = as_int.value();
+            // 2. Apply the rules for parsing non-negative integers to the descriptor. If the result is zero, let error be yes.
+            //    Otherwise, let future-compat-h be the result.
+            if (as_int.value() == 0)
+                error = true;
+            else
+                future_compat_h = as_int.value();
         }
         // - Anything else
         else {
@@ -343,14 +356,14 @@ descriptor_parser:
 }
 
 // https://html.spec.whatwg.org/multipage/images.html#parse-a-sizes-attribute
-NonnullRefPtr<CSS::StyleValue const> parse_a_sizes_attribute(DOM::Element const& element, Utf16View sizes, HTML::HTMLImageElement const* img)
+NonnullRefPtr<CSS::StyleValue const> parse_a_sizes_attribute(DOM::Document const& document, Utf16View sizes, HTML::HTMLImageElement const* img)
 {
-    CSS::Parser::Parser css_parser { CSS::Parser::ParsingParams { element.document() } };
-    return css_parser.parse_as_sizes_attribute(sizes, element, img);
+    CSS::Parser::Parser css_parser { CSS::Parser::ParsingParams { document } };
+    return css_parser.parse_as_sizes_attribute(sizes, img);
 }
 
 // https://html.spec.whatwg.org/multipage/images.html#create-a-source-set
-SourceSet SourceSet::create(DOM::Element const& element, Utf16View default_source, Utf16View srcset, Utf16View sizes, HTML::HTMLImageElement const* img)
+SourceSet SourceSet::create(DOM::Document const& document, Utf16View default_source, Utf16View srcset, Utf16View sizes, HTML::HTMLImageElement const* img)
 {
     // When asked to create a source set given a string default source, a string srcset, a string sizes, and an element or null img:
 
@@ -362,7 +375,7 @@ SourceSet SourceSet::create(DOM::Element const& element, Utf16View default_sourc
         source_set = parse_a_srcset_attribute(srcset);
 
     // 3. Set source set's source size to the result of parsing sizes with img.
-    source_set.m_source_size = parse_a_sizes_attribute(element, sizes, img);
+    source_set.m_source_size = parse_a_sizes_attribute(document, sizes, img);
 
     // 4. If default source is not the empty string and source set does not contain an image source
     //    with a pixel density descriptor value of 1, and no image source with a width descriptor,
@@ -383,14 +396,14 @@ SourceSet SourceSet::create(DOM::Element const& element, Utf16View default_sourc
     }
 
     // 5. Normalize the source densities of source set.
-    source_set.normalize_source_densities(element);
+    source_set.normalize_source_densities(document);
 
     // 6. Return source set.
     return source_set;
 }
 
 // https://html.spec.whatwg.org/multipage/images.html#normalise-the-source-densities
-void SourceSet::normalize_source_densities(DOM::Element const& element)
+void SourceSet::normalize_source_densities(DOM::Document const& document)
 {
     // 1. Let source size be source set's source size.
 
@@ -401,7 +414,7 @@ void SourceSet::normalize_source_densities(DOM::Element const& element)
     // https://drafts.csswg.org/mediaqueries/#units
     // Relative length units in media queries are based on the initial value, which means that units are never based on
     // results of declarations.
-    auto const& length_resolution_context = CSS::Length::ResolutionContext::for_document(element.document());
+    auto const& length_resolution_context = CSS::Length::ResolutionContext::for_document(document);
 
     auto source_size = CSS::Length::from_style_value(m_source_size->absolutized({ length_resolution_context }), {}).absolute_length_to_px();
 

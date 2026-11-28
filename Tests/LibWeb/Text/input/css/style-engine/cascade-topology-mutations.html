@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <script src="plan.js"></script>
 <style id="first">
     @layer base, theme;
@@ -46,6 +47,23 @@
         const sheet = first.sheet;
         plan("declare the layers in the other order", () => sheet.insertRule("@layer theme, base;", 0));
         plan("take that statement away again", () => sheet.deleteRule(0));
+
+        const item = document.getElementById("item");
+        const printItem = () => println(`  item color: ${getComputedStyle(item).color}`);
+        const gatedStatement = document.createElement("style");
+        gatedStatement.media = "print";
+        gatedStatement.textContent = "@layer theme, base;";
+        plan("attach a layer statement reversing the layers, behind a media attribute that does not match", () => head.insertBefore(gatedStatement, first));
+        printItem();
+        plan("ungate it", () => gatedStatement.removeAttribute("media"));
+        printItem();
+        plan("detach it", () => gatedStatement.remove());
+        printItem();
+
+        const emptyStatement = document.createElement("style");
+        emptyStatement.textContent = "@layer unused-b, unused-a;";
+        plan("attach a sheet declaring only layers nothing is in", () => head.appendChild(emptyStatement));
+        plan("detach that sheet", () => emptyStatement.remove());
 
         // An important declaration reverses the layer ordering it participates in, so adding one
         // changes the winner in the opposite direction from a normal declaration.
@@ -103,10 +121,8 @@
             innerLayered.insertRule("@layer inner-b, inner-a;", 0);
         });
 
-        // A topology change that moves nothing has nothing to say.
-        // FIXME: Re-appending the sheet that is already last reaches the element its rules match. The
-        //        order token is rewritten either way, so nothing notices that the order it describes
-        //        is the one it already had.
+        // A topology change that moves nothing has nothing to say: re-appending the sheet that is already
+        // last moves none of its rules against another, and changes only the style element it moved.
         plan("append a sheet that is already last", () => head.appendChild(head.lastElementChild));
     });
 </script>

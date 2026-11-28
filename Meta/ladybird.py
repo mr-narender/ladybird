@@ -3,6 +3,7 @@
 # Copyright (c) 2025, ayeteadoe <ayeteadoe@gmail.com>
 # Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
 # Copyright (c) 2025, Nicolas Danelon <nicolasdanelon@gmail.com>
+# Copyright (c) 2026, Ali Mohammad Pur <ali@ladybird.org>
 #
 # SPDX-License-Identifier: BSD-2-Clause
 
@@ -23,6 +24,7 @@ from Utils.host_platform import HostArchitecture
 from Utils.host_platform import HostSystem
 from Utils.host_platform import Platform
 from Utils.utils import run_command
+from Utils.vcpkg_deps import build_dependencies
 
 LADYBIRD_SOURCE_DIR = Path(__file__).resolve().parent.parent
 
@@ -108,6 +110,14 @@ def main():
     )
     vcpkg_parser.add_argument("--jobs", "-j", required=False)
 
+    deps_parser = subparsers.add_parser(
+        "deps", help="Builds the third-party dependencies", parents=[preset_parser, compiler_parser]
+    )
+    deps_parser.add_argument("--fetch", action="store_true", help="Only download dependency sources")
+    deps_parser.add_argument(
+        "--rebuild", action="store_true", help="Rebuild all dependencies through the graph, ignoring prior state"
+    )
+
     subparsers.add_parser("clean", help="Cleans the build environment", parents=[preset_parser])
 
     rebuild_parser = subparsers.add_parser(
@@ -152,10 +162,13 @@ def main():
         sys.exit(1)
 
     if "target" in args:
-        if platform.host_system != HostSystem.Windows and args.target == "ladybird":
-            args.target = "Ladybird"
+        if args.target == "Ladybird":
+            args.target = "ladybird"
+        # Accept a helper's executable name in place of its target name.
+        targets_by_executable_name = {name: target for target, name in HELPER_EXECUTABLE_NAMES.items()}
+        args.target = targets_by_executable_name.get(args.target, args.target)
         if not args.target and args.command not in ("build", "rebuild"):
-            args.target = "ladybird" if platform.host_system == HostSystem.Windows else "Ladybird"
+            args.target = "ladybird"
 
     if args.command == "build":
         build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
@@ -163,7 +176,7 @@ def main():
     elif args.command == "test":
         build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs)
-        test_main(build_dir, args.preset, args.pattern)
+        test_main(build_dir, args.preset, args.jobs, args.pattern)
     elif args.command == "run":
         if args.preset == "Sanitizer":
             # FIXME: Find some way to centralize these b/w CMakePresets.json, CI files, Documentation and here.
@@ -193,6 +206,17 @@ def main():
         build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
         build_main(build_dir, args.jobs, args.target, args.args)
         build_main(build_dir, args.jobs, "install", args.args)
+    elif args.command == "deps":
+        if platform.host_system == HostSystem.Windows:
+            parser.error(
+                "The deps command is not supported on Windows; dependencies are built during CMake configuration"
+            )
+        build_preset_dir, vcpkg_preset_dir = configure_build_env(platform, args.preset, args.jobs)
+        build_vcpkg(vcpkg_preset_dir)
+        (cc, cxx) = pick_host_compiler(platform, args.cc, args.cxx)
+        build_dependencies(
+            platform, args.preset, build_preset_dir, cc, cxx, args.jobs, fetch_only=args.fetch, rebuild=args.rebuild
+        )
     elif args.command == "clean":
         clean_main(platform, args.preset)
     elif args.command == "rebuild":
@@ -209,12 +233,21 @@ def configure_main(platform: Platform, preset: str, cc: str, cxx: str, jobs: Opt
     build_preset_dir, vcpkg_preset_dir = configure_build_env(platform, preset, jobs)
     build_vcpkg(vcpkg_preset_dir)
 
+    # On Windows the dependencies are still built by vcpkg's toolchain file at configure time.
+    staged_deps = platform.host_system != HostSystem.Windows
+    vcpkg_triplet = None
+
+    if staged_deps:
+        (cc, cxx) = pick_host_compiler(platform, cc, cxx)
+        vcpkg_triplet = build_dependencies(platform, preset, build_preset_dir, cc, cxx, jobs)
+
     if build_preset_dir.joinpath("build.ninja").exists() or build_preset_dir.joinpath("ladybird.sln").exists():
         return build_preset_dir
 
     validate_cmake_version()
 
-    (cc, cxx) = pick_host_compiler(platform, cc, cxx)
+    if not staged_deps:
+        (cc, cxx) = pick_host_compiler(platform, cc, cxx)
 
     config_args = [
         "cmake",
@@ -227,6 +260,15 @@ def configure_main(platform: Platform, preset: str, cc: str, cxx: str, jobs: Opt
         f"-DCMAKE_C_COMPILER={cc}",
         f"-DCMAKE_CXX_COMPILER={cxx}",
     ]
+
+    if staged_deps:
+        config_args.extend(
+            [
+                "-DVCPKG_MANIFEST_INSTALL=OFF",
+                f"-DVCPKG_TARGET_TRIPLET={vcpkg_triplet}",
+                f"-DVCPKG_HOST_TRIPLET={vcpkg_triplet}",
+            ]
+        )
 
     if platform.host_system == HostSystem.Linux and platform.host_architecture == HostArchitecture.AArch64:
         config_args.extend(configure_skia_jemalloc())
@@ -396,7 +438,7 @@ def build_main(build_dir: Path, jobs: Optional[str], target: Optional[str] = Non
     run_command(build_args, exit_on_failure=True)
 
 
-def test_main(build_dir: Path, preset: str, pattern: Optional[str]):
+def test_main(build_dir: Path, preset: str, jobs: Optional[str], pattern: Optional[str]):
     test_args = [
         "ctest",
         "--preset",
@@ -406,26 +448,46 @@ def test_main(build_dir: Path, preset: str, pattern: Optional[str]):
         str(build_dir),
     ]
 
+    if jobs:
+        test_args.extend(["--parallel", jobs])
+    elif "CTEST_PARALLEL_LEVEL" not in os.environ:
+        test_args.append("--parallel")
+
     if pattern:
         test_args.extend(["-R", pattern])
 
     run_command(test_args, exit_on_failure=True)
 
 
-def run_main(host_system: HostSystem, build_dir: Path, target: str, args: list[str]):
-    run_args = []
+# The executables of these targets have other names, which share a prefix so that tools like pgrep find all of them.
+HELPER_EXECUTABLE_NAMES = {
+    "AudioServer": "ladybird-audio",
+    "Compositor": "ladybird-gpu",
+    "Hub": "ladybird-hub",
+    "ImageDecoder": "ladybird-image",
+    "MediaServer": "ladybird-media",
+    "ProcessReaper": "ladybird-reaper",
+    "RequestServer": "ladybird-net",
+    "SystemProbe": "ladybird-probe",
+    "VideoDecoderServer": "ladybird-video",
+    "WebContent": "ladybird-render",
+    "WebDriver": "ladybird-driver",
+    "WebRTCClient": "ladybird-webrtc",
+}
 
-    if host_system == HostSystem.macOS and target in (
-        "ImageDecoder",
-        "Ladybird",
-        "RequestServer",
-        "WebContent",
-        "WebDriver",
-        "WebWorker",
-    ):
-        run_args.append(str(build_dir.joinpath("bin", "Ladybird.app", "Contents", "MacOS", target)))
-    else:
-        run_args.append(str(build_dir.joinpath("bin", target)))
+
+def executable_path(host_system: HostSystem, build_dir: Path, target: str) -> Path:
+    name = HELPER_EXECUTABLE_NAMES.get(target, target)
+    if host_system == HostSystem.macOS and (target == "ladybird" or target in HELPER_EXECUTABLE_NAMES):
+        return build_dir.joinpath("bin", "Ladybird.app", "Contents", "MacOS", name)
+    # Elsewhere, the helpers are built into libexec, except on Windows, where everything is next to the browser.
+    if host_system != HostSystem.Windows and target in HELPER_EXECUTABLE_NAMES and target != "WebDriver":
+        return build_dir.joinpath("libexec", name)
+    return build_dir.joinpath("bin", name)
+
+
+def run_main(host_system: HostSystem, build_dir: Path, target: str, args: list[str]):
+    run_args = [str(executable_path(host_system, build_dir, target))]
 
     run_args.extend(args)
 
@@ -446,12 +508,12 @@ def debug_main(host_system: HostSystem, build_dir: Path, target: str, debugger: 
     for cmd in debugger_commands:
         gdb_args.extend(["-ex" if debugger == "gdb" else "-o", cmd])
 
-    if target == "Ladybird" and host_system == HostSystem.macOS:
+    if target == "ladybird" and host_system == HostSystem.macOS:
         gdb_args.append(str(build_dir.joinpath("bin", "Ladybird.app")))
     elif host_system == HostSystem.Windows:
-        gdb_args.append(str(build_dir.joinpath("bin", target + ".exe")))
+        gdb_args.append(str(build_dir.joinpath("bin", HELPER_EXECUTABLE_NAMES.get(target, target) + ".exe")))
     else:
-        gdb_args.append(str(build_dir.joinpath("bin", target)))
+        gdb_args.append(str(executable_path(host_system, build_dir, target)))
 
     run_command(gdb_args, exit_on_failure=True)
 
@@ -463,10 +525,10 @@ def profile_main(host_system: HostSystem, build_dir: Path, target: str, args: li
 
     valgrind_args = ["valgrind", "--tool=callgrind", "--instr-atstart=yes"]
 
-    if target == "Ladybird" and host_system == HostSystem.macOS:
+    if target == "ladybird" and host_system == HostSystem.macOS:
         valgrind_args.append(str(build_dir.joinpath("bin", "Ladybird.app")))
     else:
-        valgrind_args.append(str(build_dir.joinpath("bin", target)))
+        valgrind_args.append(str(executable_path(host_system, build_dir, target)))
 
     valgrind_args.extend(args)
 
@@ -486,11 +548,13 @@ def addr2line_main(build_dir, target: str, program: str, addresses: list[str]):
         print(f"Please install {program}!", file=sys.stderr)
         sys.exit(1)
 
+    executable_name = HELPER_EXECUTABLE_NAMES.get(target, target)
     binary_file_path = None
     for root, _, files in os.walk(build_dir):
-        if target in files:
-            candidate = Path(root) / target
-            if os.access(candidate, os.X_OK):
+        if executable_name in files:
+            candidate = Path(root) / executable_name
+            # Links may point at an installed build, whose addresses differ from this build's.
+            if not candidate.is_symlink() and os.access(candidate, os.X_OK):
                 binary_file_path = str(candidate)
 
     if not binary_file_path:

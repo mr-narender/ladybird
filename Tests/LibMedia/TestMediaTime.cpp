@@ -39,7 +39,7 @@ TEST_CASE(audio_anchor_refined_by_timing_ring)
 
     for (i64 block = 0; block < 4; ++block)
         writer.timing_ring().enqueue(make_timing(block));
-    writer.publish_audio_anchor(base, 0, AK::Duration::zero(), SAMPLE_RATE, true);
+    writer.publish_audio_anchor(base, 0, AK::Duration::zero(), SAMPLE_RATE, Media::MediaTimeProgression::Advancing);
 
     auto at_10ms = reader.current_time(base + AK::Duration::from_milliseconds(10));
     EXPECT_EQ(at_10ms, media_time_for_frame(480));
@@ -56,7 +56,7 @@ TEST_CASE(time_clamps_at_ring_end)
 
     for (i64 block = 0; block < 4; ++block)
         writer.timing_ring().enqueue(make_timing(block));
-    writer.publish_audio_anchor(base, 0, AK::Duration::zero(), SAMPLE_RATE, true);
+    writer.publish_audio_anchor(base, 0, AK::Duration::zero(), SAMPLE_RATE, Media::MediaTimeProgression::Advancing);
 
     auto far_future = reader.current_time(base + AK::Duration::from_seconds(10));
     EXPECT_EQ(far_future, make_timing(3).media_time_end());
@@ -70,10 +70,31 @@ TEST_CASE(paused_anchor_freezes_time)
 
     for (i64 block = 0; block < 4; ++block)
         writer.timing_ring().enqueue(make_timing(block));
-    writer.publish_audio_anchor(base, 2400, media_time_for_frame(2400), SAMPLE_RATE, false);
+    writer.publish_audio_anchor(base, 2400, media_time_for_frame(2400), SAMPLE_RATE, Media::MediaTimeProgression::Stopped);
 
     EXPECT_EQ(reader.current_time(base), media_time_for_frame(2400));
     EXPECT_EQ(reader.current_time(base + AK::Duration::from_seconds(5)), media_time_for_frame(2400));
+}
+
+TEST_CASE(resuming_anchor_holds_time_until_the_output_anchors_it)
+{
+    auto writer = MUST(Media::MediaTimeWriter::create());
+    auto reader = MUST(Media::MediaTimeReader::create(writer.buffer()));
+    auto base = MonotonicTime::now();
+
+    for (i64 block = 0; block < 4; ++block)
+        writer.timing_ring().enqueue(make_timing(block));
+    writer.publish_audio_anchor(base, 2400, media_time_for_frame(2400), SAMPLE_RATE, Media::MediaTimeProgression::Resuming);
+
+    auto while_resuming = reader.time_state(base + AK::Duration::from_milliseconds(50));
+    EXPECT_EQ(while_resuming.time, media_time_for_frame(2400));
+    EXPECT(while_resuming.is_advancing);
+    EXPECT_EQ(reader.output_frame_index(base + AK::Duration::from_milliseconds(50)).value(), 2400);
+
+    // The output then anchors the same frame to when it will be heard, and the time advances from there.
+    writer.publish_audio_anchor(base + AK::Duration::from_milliseconds(60), 2400, media_time_for_frame(2400), SAMPLE_RATE, Media::MediaTimeProgression::Advancing);
+    EXPECT_EQ(reader.current_time(base + AK::Duration::from_milliseconds(60)), media_time_for_frame(2400));
+    EXPECT_EQ(reader.current_time(base + AK::Duration::from_milliseconds(70)), media_time_for_frame(2880));
 }
 
 TEST_CASE(empty_ring_falls_back_to_anchor_without_extrapolating)
@@ -83,7 +104,7 @@ TEST_CASE(empty_ring_falls_back_to_anchor_without_extrapolating)
     auto base = MonotonicTime::now();
 
     auto anchor_time = AK::Duration::from_seconds(10);
-    writer.publish_audio_anchor(base, 480000, anchor_time, SAMPLE_RATE, true);
+    writer.publish_audio_anchor(base, 480000, anchor_time, SAMPLE_RATE, Media::MediaTimeProgression::Advancing);
 
     EXPECT_EQ(reader.current_time(base + AK::Duration::from_seconds(5)), anchor_time);
 }
@@ -96,7 +117,7 @@ TEST_CASE(hard_seek_lowers_time_across_epochs)
 
     for (i64 block = 0; block < 4; ++block)
         writer.timing_ring().enqueue(make_timing(block));
-    writer.publish_audio_anchor(base, 0, AK::Duration::zero(), SAMPLE_RATE, true);
+    writer.publish_audio_anchor(base, 0, AK::Duration::zero(), SAMPLE_RATE, Media::MediaTimeProgression::Advancing);
 
     // Raise the reader's floor within the first epoch.
     auto before_seek = reader.current_time(base + AK::Duration::from_milliseconds(50));
@@ -116,11 +137,11 @@ TEST_CASE(floor_is_monotonic_within_an_epoch)
     auto reader = MUST(Media::MediaTimeReader::create(writer.buffer()));
     auto base = MonotonicTime::now();
 
-    writer.publish_audio_anchor(base, 4800, AK::Duration::from_milliseconds(100), SAMPLE_RATE, false);
+    writer.publish_audio_anchor(base, 4800, AK::Duration::from_milliseconds(100), SAMPLE_RATE, Media::MediaTimeProgression::Stopped);
     EXPECT_EQ(reader.current_time(base), AK::Duration::from_milliseconds(100));
 
     // An anchor that regresses without a seek must not move time backwards.
-    writer.publish_audio_anchor(base, 4320, AK::Duration::from_milliseconds(90), SAMPLE_RATE, false);
+    writer.publish_audio_anchor(base, 4320, AK::Duration::from_milliseconds(90), SAMPLE_RATE, Media::MediaTimeProgression::Stopped);
     EXPECT_EQ(reader.current_time(base), AK::Duration::from_milliseconds(100));
 }
 
@@ -130,11 +151,11 @@ TEST_CASE(monotonic_mode_scales_by_playback_rate)
     auto reader = MUST(Media::MediaTimeReader::create(writer.buffer()));
     auto base = MonotonicTime::now();
 
-    writer.publish_monotonic_anchor(base, AK::Duration::from_seconds(1), 2.0f, true);
+    writer.publish_monotonic_anchor(base, AK::Duration::from_seconds(1), 2.0f, Media::MediaTimeProgression::Advancing);
     EXPECT_EQ(reader.current_time(base + AK::Duration::from_milliseconds(500)), AK::Duration::from_seconds(2));
 
     // A rate change re-anchors at the current media time.
-    writer.publish_monotonic_anchor(base + AK::Duration::from_milliseconds(500), AK::Duration::from_seconds(2), 1.0f, true);
+    writer.publish_monotonic_anchor(base + AK::Duration::from_milliseconds(500), AK::Duration::from_seconds(2), 1.0f, Media::MediaTimeProgression::Advancing);
     EXPECT_EQ(reader.current_time(base + AK::Duration::from_milliseconds(1500)), AK::Duration::from_seconds(3));
 }
 
@@ -147,7 +168,7 @@ TEST_CASE(clock_is_readable_through_a_second_mapping)
     auto reader = MUST(Media::MediaTimeReader::create(reader_buffer));
 
     auto base = MonotonicTime::now();
-    writer.publish_monotonic_anchor(base, AK::Duration::from_seconds(7), 1.0f, false);
+    writer.publish_monotonic_anchor(base, AK::Duration::from_seconds(7), 1.0f, Media::MediaTimeProgression::Stopped);
     EXPECT_EQ(reader.current_time(base + AK::Duration::from_seconds(1)), AK::Duration::from_seconds(7));
 }
 
@@ -194,7 +215,7 @@ TEST_CASE(concurrent_writer_and_reader)
 
     auto writer_thread = Threading::Thread::construct("ClockWriter"sv, [&writer, &writer_done, base]() {
         for (i64 i = 1; i <= anchor_count; ++i)
-            writer.publish_monotonic_anchor(base, AK::Duration::from_microseconds(i), 1.0f, false);
+            writer.publish_monotonic_anchor(base, AK::Duration::from_microseconds(i), 1.0f, Media::MediaTimeProgression::Stopped);
         writer_done.store(true);
         return 0;
     });
@@ -211,4 +232,42 @@ TEST_CASE(concurrent_writer_and_reader)
     (void)writer_thread->join();
 
     EXPECT_EQ(reader.current_time(base), AK::Duration::from_microseconds(anchor_count));
+}
+
+// The clock's record and timings are written by another process, so ones that describe a clock that cannot run must
+// read as a clock stopped at its anchor rather than abort the reader.
+TEST_CASE(clocks_that_cannot_advance_read_as_stopped)
+{
+    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(sizeof(Media::MediaTimeData)));
+    auto& data = *new (buffer.data<void>()) Media::MediaTimeData;
+    auto reader = MUST(Media::MediaTimeReader::create(buffer));
+    auto base = MonotonicTime::now();
+
+    auto write_record = [&](Media::MediaTimeMode mode, u32 sample_rate, float playback_rate) {
+        data.record.write([&](TearableAtomic<Media::MediaTimeRecord>& slot) {
+            auto record = slot.load_relaxed();
+            record.mode = mode;
+            record.progression = Media::MediaTimeProgression::Advancing;
+            record.anchor_monotonic_nanoseconds = base.nanoseconds();
+            record.anchor_media_time_nanoseconds = AK::Duration::from_seconds(5).to_nanoseconds();
+            record.sample_rate = sample_rate;
+            record.playback_rate = playback_rate;
+            slot.store_relaxed(record);
+        });
+    };
+
+    write_record(Media::MediaTimeMode::AudioDriven, 0, 1.0f);
+    auto state = reader.time_state(base + AK::Duration::from_seconds(1));
+    EXPECT_EQ(state.time, AK::Duration::from_seconds(5));
+    EXPECT(!state.is_advancing);
+    EXPECT_EQ(reader.output_frame_index(base + AK::Duration::from_seconds(1)), 0);
+
+    write_record(Media::MediaTimeMode::MonotonicDriven, 0, NAN);
+    EXPECT_EQ(reader.current_time(base + AK::Duration::from_seconds(1)), AK::Duration::from_seconds(5));
+
+    write_record(Media::MediaTimeMode::AudioDriven, 48000, 1.0f);
+    Media::AudioBlockTiming empty_block;
+    empty_block.initialize(static_cast<i64>(0), 48000, 0);
+    data.timing_ring.enqueue(empty_block);
+    EXPECT_EQ(reader.current_time(base), AK::Duration::from_seconds(5));
 }

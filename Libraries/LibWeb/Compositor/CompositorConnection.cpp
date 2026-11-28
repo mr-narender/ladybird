@@ -8,23 +8,40 @@
 #include <LibWeb/Compositor/CompositorConnection.h>
 
 #include <AK/Debug.h>
+#include <AK/Mutex.h>
+#include <AK/NeverDestroyed.h>
+#include <LibCompositing/CanvasColorSpace.h>
 #include <LibCore/AnonymousBuffer.h>
+#include <LibCore/ElapsedTimer.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/PaintingSurface.h>
+#include <LibGfx/Font/Font.h>
+#include <LibGfx/Font/Typeface.h>
+#include <LibIPC/File.h>
 #include <LibIPC/Limits.h>
 #include <LibIPC/Transport.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibMediaClient/Client.h>
+#include <LibWeb/Compositor/RenderClock.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/Canvas/PredefinedColorSpace.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Platform/ImageCodecPlugin.h>
+
+// The Paint stage presents frames, and only the connection hands it the poster it presents them through, and the
+// screenshots it asks for after them.
+extern "C" {
+void paint_stage_adopt_compositor_poster(IPC::FfiThreadSafeMessagePoster poster);
+void paint_stage_request_screenshot(void* request);
+}
 
 namespace Web::Compositor {
-
-CompositorConnection::CompositorConnection(NonnullOwnPtr<IPC::Transport> transport)
-    : IPC::ConnectionToServer<CompositorWebContentClientEndpoint, CompositorWebContentServerEndpoint>(*this, move(transport))
-{
-}
 
 void CompositorConnection::die()
 {
@@ -33,9 +50,11 @@ void CompositorConnection::die()
 
 void CompositorConnection::ensure_video_presentation_channel()
 {
-    if (!can_send_message_to_compositor())
+    if (!can_send_message_to_compositor() || !on_request_video_presentation_channel)
         return;
 
+    // Acquiring the client has the Browser connect this process to a media server, which the Browser then connects to
+    // the Compositor on request. A replacement server needs a channel of its own.
     auto media_client_or_error = MediaClient::Client::acquire();
     if (media_client_or_error.is_error()) {
         dbgln("Failed to reach the media server for a video presentation channel: {}", media_client_or_error.error());
@@ -45,15 +64,17 @@ void CompositorConnection::ensure_video_presentation_channel()
     if (m_video_presentation_channel_media_client_generation == media_client->generation())
         return;
 
-    auto handle_or_error = media_client->create_video_presentation_channel();
-    if (handle_or_error.is_error()) {
-        dbgln("Failed to create video presentation channel: {}", handle_or_error.error());
-        return;
-    }
-
-    async_offer_video_presentation_channel(handle_or_error.release_value());
+    on_request_video_presentation_channel();
     m_video_presentation_channel_media_client_generation = media_client->generation();
-    dbgln_if(VIDEO_PRESENTATION_CHANNEL_DEBUG, "WebContent: offered the media server's video presentation channel to Compositor");
+    dbgln_if(VIDEO_PRESENTATION_CHANNEL_DEBUG, "WebContent: asked the Browser for a video presentation channel to the Compositor");
+}
+
+void CompositorConnection::attach_render_clock(IPC::TransportHandle handle)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    if (auto result = RenderClock::the().attach(move(handle)); result.is_error())
+        dbgln("Failed to attach the render clock to the compositor: {}", result.error());
 }
 
 void CompositorConnection::set_parent_context(Web::CompositorContextId context_id, Optional<Web::CompositorContextId> parent_context_id)
@@ -78,82 +99,245 @@ void CompositorConnection::destroy_context(Web::CompositorContextId context_id)
     async_destroy_context(context_id);
 }
 
-// A font backed by raw font data carries the descriptor of its typeface's buffer, and an image frame the descriptor
-// of its shared bitmap. One IPC message holds at most IPC::MAX_MESSAGE_FD_COUNT of them, so a transaction's fonts and
-// image frames travel ahead of the display list, in messages of at most this many resources each.
-static constexpr size_t max_resources_per_message = 100;
-static_assert(max_resources_per_message <= IPC::MAX_MESSAGE_FD_COUNT);
+// An image frame carries the descriptor of its shared bitmap. One IPC message holds at most IPC::MAX_MESSAGE_FD_COUNT
+// of them, so image frames are registered in messages of at most this many image frames each.
+static constexpr size_t max_image_frames_per_message = 100;
+static_assert(max_image_frames_per_message <= IPC::MAX_MESSAGE_FD_COUNT);
 
-bool CompositorConnection::post_resource_additions_in_batches(Web::CompositorContextId context_id, Compositing::DisplayListResourceTransaction& resource_transaction)
+struct ResourcesRegisteredWithCompositor {
+    HashTable<u64> typeface_ids;
+    HashMap<u64, Gfx::DecodedImageFrame::SharedIdentity const*> image_frame_identities_by_id;
+};
+
+struct ResourcesRegisteredWithCompositors {
+    Mutex mutex;
+    HashMap<IPC::ThreadSafeMessagePoster*, ResourcesRegisteredWithCompositor> resources_by_poster;
+};
+
+static ResourcesRegisteredWithCompositors& resources_registered_with_compositors()
 {
-    auto fonts = move(resource_transaction.fonts);
-    auto image_frames = move(resource_transaction.image_frames);
+    static NeverDestroyed<ResourcesRegisteredWithCompositors> registry;
+    return *registry;
+}
 
-    // Moves up to `room` resources of one kind into `batch`, starting at `taken`, and returns how many it moved.
-    auto take = [](auto& resources, size_t& taken, size_t room, auto& batch) {
-        auto count = min(room, resources.size() - taken);
-        batch.ensure_capacity(count);
-        for (size_t i = 0; i < count; ++i)
-            batch.unchecked_append(move(resources[taken + i]));
-        taken += count;
-        return count;
-    };
+static void unregister_destroyed_typeface(u64 typeface_id)
+{
+    auto& registry = resources_registered_with_compositors();
+    MutexLocker locker(registry.mutex);
+    for (auto& [poster, resources] : registry.resources_by_poster) {
+        if (!resources.typeface_ids.remove(typeface_id))
+            continue;
+        auto encoded_message = MUST(Messages::CompositorWebContentServer::UnregisterTypeface::static_encode(typeface_id));
+        (void)poster->try_post(encoded_message);
+    }
+}
 
-    size_t fonts_taken = 0;
-    size_t image_frames_taken = 0;
-    while (fonts_taken < fonts.size() || image_frames_taken < image_frames.size()) {
-        Compositing::DisplayListResourceTransaction batch;
-        auto room = max_resources_per_message;
-        room -= take(fonts, fonts_taken, room, batch.fonts);
-        room -= take(image_frames, image_frames_taken, room, batch.image_frames);
-        auto encoded_batch = MUST(Messages::CompositorWebContentServer::UpdateDisplayListResources::static_encode(context_id, batch));
-        if (post_message(encoded_batch).is_error()) {
-            did_lose_compositor();
+// A frame decoded again takes the id of the frame it replaces, so an id is unregistered only by the identity that is
+// registered under it.
+static void unregister_destroyed_image_frame(Gfx::DecodedImageFrame::SharedIdentity const& identity)
+{
+    auto& registry = resources_registered_with_compositors();
+    MutexLocker locker(registry.mutex);
+    for (auto& [poster, resources] : registry.resources_by_poster) {
+        auto registered_identity = resources.image_frame_identities_by_id.find(identity.id());
+        if (registered_identity == resources.image_frame_identities_by_id.end() || registered_identity->value != &identity)
+            continue;
+        resources.image_frame_identities_by_id.remove(registered_identity);
+        auto encoded_message = MUST(Messages::CompositorWebContentServer::UnregisterImageFrame::static_encode(Compositing::ImageFrameResourceId { identity.id() }));
+        (void)poster->try_post(encoded_message);
+    }
+}
+
+static void start_registering_resources_with_compositor(IPC::ThreadSafeMessagePoster& poster)
+{
+    Gfx::Typeface::set_destruction_observer(unregister_destroyed_typeface);
+    Gfx::DecodedImageFrame::set_identity_destruction_observer(unregister_destroyed_image_frame);
+    auto& registry = resources_registered_with_compositors();
+    MutexLocker locker(registry.mutex);
+    registry.resources_by_poster.set(&poster, {});
+}
+
+static void stop_registering_resources_with_compositor(IPC::ThreadSafeMessagePoster& poster)
+{
+    auto& registry = resources_registered_with_compositors();
+    MutexLocker locker(registry.mutex);
+    registry.resources_by_poster.remove(&poster);
+}
+
+// The registration of a typeface is posted while the registry is locked, so that it reaches the compositor ahead of
+// whatever any thread then posts that names the typeface.
+static bool register_typefaces_of_fonts_with_compositor(IPC::ThreadSafeMessagePoster& poster, ReadonlySpan<Gfx::Font const*> fonts)
+{
+    auto& registry = resources_registered_with_compositors();
+    MutexLocker locker(registry.mutex);
+    auto resources = registry.resources_by_poster.find(&poster);
+    if (resources == registry.resources_by_poster.end())
+        return false;
+    for (auto const* font : fonts) {
+        auto const& typeface = font->typeface();
+        if (resources->value.typeface_ids.contains(typeface.id()))
+            continue;
+        auto encoded_message = MUST(Messages::CompositorWebContentServer::RegisterTypeface::static_encode(Compositing::TypefaceRegistration { typeface.id(), typeface }));
+        if (!poster.try_post(encoded_message))
             return false;
-        }
+        resources->value.typeface_ids.set(typeface.id());
     }
     return true;
 }
 
-void CompositorConnection::update_display_list(Web::CompositorContextId context_id, NonnullRefPtr<Compositing::DisplayList> const& display_list, Compositing::AccumulatedVisualContextTree const& visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction, Compositing::ScrollStateSnapshot const& scroll_state_snapshot)
+// The image frames stay registered for as long as the caller holds them, which has to be until it has posted whatever
+// names them. Their registrations are posted while the registry is locked, as those of typefaces are.
+static bool register_image_frames_with_compositor(IPC::ThreadSafeMessagePoster& poster, ReadonlySpan<Gfx::DecodedImageFrame const*> image_frames)
+{
+    auto& registry = resources_registered_with_compositors();
+    MutexLocker locker(registry.mutex);
+    auto resources = registry.resources_by_poster.find(&poster);
+    if (resources == registry.resources_by_poster.end())
+        return false;
+    auto& registered_identities = resources->value.image_frame_identities_by_id;
+    Vector<Compositing::DisplayListImageFrameResource> batch;
+    auto post_batch = [&] {
+        auto encoded_message = MUST(Messages::CompositorWebContentServer::RegisterImageFrames::static_encode(batch));
+        batch.clear();
+        return poster.try_post(encoded_message);
+    };
+    for (auto const* image_frame : image_frames) {
+        if (registered_identities.get(image_frame->id()).value_or(nullptr) == &image_frame->identity())
+            continue;
+        registered_identities.set(image_frame->id(), &image_frame->identity());
+        batch.append({ Compositing::ImageFrameResourceId { image_frame->id() }, *image_frame });
+        if (batch.size() == max_image_frames_per_message && !post_batch())
+            return false;
+    }
+    return batch.is_empty() || post_batch();
+}
+
+static Vector<Compositing::DisplayListFontDescription> descriptions_of_fonts(ReadonlySpan<Gfx::Font const*> fonts)
+{
+    Vector<Compositing::DisplayListFontDescription> descriptions;
+    descriptions.ensure_capacity(fonts.size());
+    for (auto const* font : fonts)
+        descriptions.unchecked_append(Compositing::DisplayListFontDescription::of(*font));
+    return descriptions;
+}
+
+// Shared memory Rust writes a message into, which stays mapped until Rust releases it.
+struct SharedBufferForRust {
+    AK_ALLOC_WITH_KMALLOC;
+
+    Core::AnonymousBuffer buffer;
+};
+
+// Registers what `fonts` and `image_frames` need registered, posts the descriptions of `fonts` for the context to
+// hold, and answers whether the compositor could still be reached.
+static bool post_fonts_and_register_image_frames(IPC::ThreadSafeMessagePoster& poster, Web::CompositorContextId context_id, ReadonlySpan<Gfx::Font const*> fonts, ReadonlySpan<Gfx::DecodedImageFrame const*> image_frames)
+{
+    if (!register_image_frames_with_compositor(poster, image_frames))
+        return false;
+    if (fonts.is_empty())
+        return true;
+    if (!register_typefaces_of_fonts_with_compositor(poster, fonts))
+        return false;
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::DescribeDisplayListFonts::static_encode(context_id, descriptions_of_fonts(fonts)));
+    return poster.try_post(encoded_message);
+}
+
+static Atomic<u64> s_next_connection_serial { 1 };
+
+CompositorConnection::CompositorConnection(NonnullOwnPtr<IPC::Transport> transport)
+    : IPC::ConnectionToServer<CompositorWebContentClientEndpoint, CompositorWebContentServerEndpoint>(*this, move(transport))
+    , m_poster(IPC::ThreadSafeMessagePoster::create(this->transport()))
+    , m_serial(s_next_connection_serial++)
+{
+    start_registering_resources_with_compositor(*m_poster);
+}
+
+CompositorConnection::~CompositorConnection()
+{
+    stop_registering_resources_with_compositor(*m_poster);
+    m_poster->detach_from_transport();
+}
+
+// A screenshot of what the compositor composes for a context, on its way to the Paint thread, which asks for it after
+// the frames handed to it before.
+struct ScreenshotRequestForPaintThread {
+    AK_ALLOC_WITH_KMALLOC;
+
+    Web::CompositorContextId context_id;
+    Compositing::ScreenshotRequestId request_id;
+    Gfx::ShareableBitmap target;
+};
+
+void CompositorConnection::hand_poster_to_paint_thread()
+{
+    paint_stage_adopt_compositor_poster(m_poster->to_ffi_with_one_reference());
+}
+
+// Gives the compositor a connection of its own to this process's image decoder, so that an animated image keeps getting
+// frames while the main thread is busy.
+void CompositorConnection::ensure_image_decoder_channel()
+{
+    auto& image_codec = Platform::ImageCodecPlugin::the();
+    if (m_image_decoder_channel_client_generation == image_codec.client_generation())
+        return;
+
+    auto channel_or_error = IPC::TransportHandle::create_pair();
+    if (channel_or_error.is_error()) {
+        dbgln("Failed to create an image decoder channel for the Compositor: {}", channel_or_error.error());
+        return;
+    }
+    auto channel = channel_or_error.release_value();
+    image_codec.connect_frame_client(move(channel.first));
+    async_connect_to_image_decoder(channel.second);
+    m_image_decoder_channel_client_generation = image_codec.client_generation();
+}
+
+void CompositorConnection::add_animated_image(u64 frame_id, AnimatedImageRegistration const& image)
 {
     if (!can_send_message_to_compositor())
         return;
+    ensure_image_decoder_channel();
+    // NB: Session ids start over with each decoder, so a session of a replaced decoder could name one of another image.
+    auto session_id = image.image_decoder_client_generation == Platform::ImageCodecPlugin::the().client_generation() ? image.session_id : 0;
+    async_add_animated_image(frame_id, session_id, image.size, image.color_space, image.frame_durations_in_milliseconds, image.loop_count);
+}
 
-    if (!post_resource_additions_in_batches(context_id, resource_transaction))
-        return;
+void CompositorConnection::remove_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_remove_animated_image(frame_id);
+}
 
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateDisplayList::static_encode(context_id, display_list, visual_context_tree, resource_transaction, scroll_state_snapshot));
-    if (post_message(encoded_message).is_error())
+void CompositorConnection::start_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_start_animated_image(frame_id);
+}
+
+void CompositorConnection::stop_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_stop_animated_image(frame_id);
+}
+
+AnimatedImageState CompositorConnection::animated_image_state_for_testing(u64 frame_id)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AnimatedImageStateForTesting>(frame_id);
+    if (!response) {
         did_lose_compositor();
+        return {};
+    }
+    return { .is_animating = response->is_animating(), .frame_index = response->frame_index(), .shown_frame_index = response->shown_frame_index(), .loops_completed = response->loops_completed() };
 }
 
-void CompositorConnection::update_visual_context_tree(Web::CompositorContextId context_id, Compositing::AccumulatedVisualContextTree const& visual_context_tree, Compositing::DisplayListResourceTransaction resource_transaction)
-{
-    if (!can_send_message_to_compositor())
-        return;
-
-    if (!post_resource_additions_in_batches(context_id, resource_transaction))
-        return;
-
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateVisualContextTree::static_encode(context_id, visual_context_tree, resource_transaction));
-    if (post_message(encoded_message).is_error())
-        did_lose_compositor();
-}
-
-void CompositorConnection::update_scroll_state(Web::CompositorContextId context_id, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Compositing::KeyboardScrollState const& keyboard_scroll_state)
-{
-    if (!can_send_message_to_compositor())
-        return;
-    async_update_scroll_state(context_id, scroll_state_snapshot, keyboard_scroll_state);
-}
-
-void CompositorConnection::add_video_sink(Media::VideoSinkHandle video_sink_handle)
+void CompositorConnection::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
 {
     if (!can_send_message_to_compositor())
         return;
     ensure_video_presentation_channel();
-    async_add_video_sink(video_sink_handle);
+    async_add_video_sink(video_sink_handle, move(presentation_page));
 }
 
 void CompositorConnection::remove_video_sink(Media::VideoSinkHandle video_sink_handle)
@@ -163,51 +347,46 @@ void CompositorConnection::remove_video_sink(Media::VideoSinkHandle video_sink_h
     async_remove_video_sink(video_sink_handle);
 }
 
-void CompositorConnection::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
+void CompositorConnection::release_video_frame_hold(Media::VideoSinkHandle video_sink_handle, u64 generation)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_set_video_sink_ticking(video_sink_handle, should_tick);
+    async_release_video_frame_hold(video_sink_handle, generation);
 }
 
-Optional<Compositing::CanvasId> CompositorConnection::create_canvas_2d_context(Gfx::IntSize size, bool alpha)
+RefPtr<IPC::ThreadSafeMessagePoster> CompositorConnection::poster_while_compositor_is_reachable()
 {
     if (!can_send_message_to_compositor())
-        return {};
-
-    auto response = send_sync<Messages::CompositorWebContentServer::CreateCanvas2dContext>(size, alpha);
-    if (!response->success())
-        return {};
-    return response->canvas_id();
+        return nullptr;
+    return m_poster;
 }
 
-void CompositorConnection::update_canvas_2d_stream(Compositing::Canvas2DCommandStream& stream)
+bool CompositorConnection::post_canvas_2d_stream_batch_fonts_and_image_frames(ReadonlySpan<Gfx::Font const*> fonts, ReadonlySpan<Gfx::DecodedImageFrame const*> image_frames)
 {
-    // The stream is drained only here, and only when the message can actually
-    // be delivered: a flush through a connection that has been lost must leave
-    // the segments in place for whoever flushes through a live one.
-    if (stream.is_empty() || !can_send_message_to_compositor())
-        return;
-
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::UpdateCanvas2dStream::static_encode(stream.take_segments(), stream.take_fonts()));
-    if (post_message(encoded_message).is_error())
+    if (!register_typefaces_of_fonts_with_compositor(*m_poster, fonts) || !register_image_frames_with_compositor(*m_poster, image_frames)) {
         did_lose_compositor();
+        return false;
+    }
+    if (fonts.is_empty())
+        return true;
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::DescribeCanvas2dFonts::static_encode(descriptions_of_fonts(fonts)));
+    if (!m_poster->try_post(encoded_message)) {
+        did_lose_compositor();
+        return false;
+    }
+    return true;
 }
 
-void CompositorConnection::destroy_canvas_context(Compositing::CanvasId canvas_id)
+void CompositorConnection::did_fail_to_post_canvas_2d_message()
 {
-    if (!can_send_message_to_compositor())
-        return;
-    async_destroy_canvas_context(canvas_id);
+    did_lose_compositor();
 }
 
-Gfx::ShareableBitmap CompositorConnection::get_canvas_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect)
+bool CompositorConnection::register_image_frames(ReadonlySpan<Gfx::DecodedImageFrame const*> image_frames)
 {
     if (!can_send_message_to_compositor())
-        return {};
-
-    auto response = send_sync<Messages::CompositorWebContentServer::GetCanvasPixels>(canvas_id, rect);
-    return response->take_pixels();
+        return false;
+    return register_image_frames_with_compositor(*m_poster, image_frames);
 }
 
 Optional<Web::Compositor::PlaceholderCanvasLink> CompositorConnection::allocate_placeholder_canvas()
@@ -215,7 +394,11 @@ Optional<Web::Compositor::PlaceholderCanvasLink> CompositorConnection::allocate_
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::AllocatePlaceholderCanvas>();
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AllocatePlaceholderCanvas>();
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     return Web::Compositor::PlaceholderCanvasLink { response->canvas_id(), response->secret() };
 }
 
@@ -238,9 +421,76 @@ Web::Compositor::PlaceholderCanvasPixels CompositorConnection::get_placeholder_c
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync<Messages::CompositorWebContentServer::GetPlaceholderCanvasPixels>(canvas_id, rect);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::GetPlaceholderCanvasPixels>(canvas_id, rect);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
     auto pixels = response->take_pixels();
     return { pixels.is_valid() ? pixels.bitmap() : nullptr, response->origin_clean() };
+}
+
+bool CompositorConnection::rasterize_image(Layout::RustFFI::FfiImageRasterization const& image, NonnullRefPtr<Gfx::Bitmap> target)
+{
+    if (!can_send_message_to_compositor())
+        return false;
+
+    // The compositor draws straight into the target, so it has to be memory both processes can map.
+    VERIFY(target->anonymous_buffer().is_valid());
+    auto token = m_next_rasterization_token++;
+    return did_rasterize(Layout::RustFFI::render_state_rasterize_image(to_ffi_with_one_reference(), m_poster->to_ffi_with_one_reference(), token, &image, target.ptr()));
+}
+
+bool CompositorConnection::rasterize_last_recording(Layout::RustFFI::DocumentHost const& document_host, Layout::BegunRead const& read, NonnullRefPtr<Gfx::Bitmap> target)
+{
+    if (!can_send_message_to_compositor())
+        return false;
+
+    // The compositor draws straight into the target, so it has to be memory both processes can map.
+    VERIFY(target->anonymous_buffer().is_valid());
+    auto token = m_next_rasterization_token++;
+    return did_rasterize(Layout::RustFFI::render_state_rasterize_last_recording(to_ffi_with_one_reference(), m_poster->to_ffi_with_one_reference(), token, &document_host, &read, target.ptr()));
+}
+
+bool CompositorConnection::did_rasterize(Layout::RustFFI::RasterizationOutcome outcome)
+{
+    switch (outcome) {
+    case Layout::RustFFI::RasterizationOutcome::Rasterized:
+        return true;
+    case Layout::RustFFI::RasterizationOutcome::NotRasterized:
+        return false;
+    case Layout::RustFFI::RasterizationOutcome::CompositorLost:
+        did_lose_compositor();
+        return false;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+void CompositorConnection::bring_video_sink_up_to_date(Media::VideoSinkHandle video_sink_handle, Optional<MonotonicTime> deadline)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    auto token = m_next_video_sink_up_to_date_token++;
+    async_bring_video_sink_up_to_date(video_sink_handle, token);
+    while (true) {
+        OwnPtr<Messages::CompositorWebContentClient::VideoSinkIsUpToDate> answer;
+        if (deadline.has_value())
+            answer = wait_for_specific_endpoint_message_until<Messages::CompositorWebContentClient::VideoSinkIsUpToDate>(deadline.value());
+        else
+            answer = wait_for_specific_endpoint_message<Messages::CompositorWebContentClient::VideoSinkIsUpToDate>();
+        if (!answer) {
+            if (!is_open())
+                did_lose_compositor();
+            return;
+        }
+        if (answer->token() == token)
+            return;
+    }
+}
+
+void CompositorConnection::video_sink_is_up_to_date(u64)
+{
+    // CompositorConnection::bring_video_sink_up_to_date() waits for its answer, and an answer it gave up on goes nowhere.
 }
 
 void CompositorConnection::invalidate_keyboard_scroll_state(Web::CompositorContextId context_id, u64 generation)
@@ -260,37 +510,100 @@ void CompositorConnection::invalidate_wheel_event_listener_state(Web::Compositor
     async_invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking)
+Compositing::WheelEventAnswer CompositorConnection::take_wheel_event_from_main_thread(Web::CompositorContextId context_id, Web::MouseEvent const& event, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelEventRouting routing)
 {
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AsyncScrollBy>(context_id, document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::TakeWheelEventFromMainThread>(context_id, event.clone_without_browser_data(), operation_tracking, routing);
     if (!response) {
         did_lose_compositor();
         return {};
     }
-    return response->take_result();
+    return response->take_answer();
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorConnection::smooth_scroll_to(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
+Compositing::WheelEventAnswer CompositorConnection::wheel_event_let_through(Web::CompositorContextId context_id, Compositing::WheelStepLetThrough const& step, Compositing::AsyncScrollOperationTracking operation_tracking)
 {
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::SmoothScrollTo>(context_id, stable_node_id, offset, main_thread_offset, viewport_rect, animation_kind, initiator);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::WheelEventLetThrough>(context_id, step, operation_tracking);
     if (!response) {
         did_lose_compositor();
         return {};
     }
-    return response->take_result();
+    return response->take_answer();
 }
 
-void CompositorConnection::cancel_smooth_scroll(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stable_node_id)
+void CompositorConnection::wheel_event_canceled(Web::CompositorContextId context_id, u64 wheel_gesture_id)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_cancel_smooth_scroll(context_id, stable_node_id);
+    async_wheel_event_canceled(context_id, wheel_gesture_id);
+}
+
+String CompositorConnection::scroll_state_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stretched_scroller)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::ScrollStateForTesting>(context_id, stretched_scroller);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    return response->take_scroll_state();
+}
+
+void CompositorConnection::synchronize_for_testing()
+{
+    if (!can_send_message_to_compositor())
+        return;
+    if (!send_sync_but_allow_failure<Messages::CompositorWebContentServer::SynchronizeForTesting>())
+        did_lose_compositor();
+}
+
+Optional<Compositing::FirstWheelStepRouteForTesting> CompositorConnection::route_first_wheel_step_for_testing(Web::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::RouteFirstWheelStepForTesting>(context_id, position, delta_in_css_pixels);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    if (!response->decision().has_value())
+        return {};
+    return Compositing::FirstWheelStepRouteForTesting { .route = { *response->decision(), response->scroller() }, .document_id = response->document_id() };
+}
+
+void CompositorConnection::begin_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    if (!send_sync_but_allow_failure<Messages::CompositorWebContentServer::BeginInputTraceForTesting>(context_id))
+        did_lose_compositor();
+}
+
+void CompositorConnection::clear_per_test_input_state_for_testing(Web::CompositorContextId context_id)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    if (!send_sync_but_allow_failure<Messages::CompositorWebContentServer::ClearPerTestInputStateForTesting>(context_id))
+        did_lose_compositor();
+}
+
+Vector<Web::InputTraceRecord> CompositorConnection::take_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::TakeInputTraceForTesting>(context_id);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    return response->take_records();
 }
 
 Compositing::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_scroll_updates(Web::CompositorContextId context_id, Compositing::AsyncScrollUpdateFreshness freshness)
@@ -331,16 +644,20 @@ Compositing::PendingAsyncScrollUpdates CompositorConnection::take_pending_async_
     updates.completed_operation_ids = move(pending->completed_operation_ids);
     updates.operation_ids_taken_over_by_user_input = move(pending->operation_ids_taken_over_by_user_input);
     updates.started_user_scrolls = move(pending->started_user_scrolls);
+    updates.applied_scroll_requests = move(pending->applied_scroll_requests);
     updates.document_id = pending->document_id;
-    updates.user_scroll_gesture_in_progress = pending->user_scroll_gesture_in_progress;
-    updates.user_scroll_gesture_ended = pending->user_scroll_gesture_ended;
+    updates.boxes_in_user_scroll_gesture = pending->boxes_in_user_scroll_gesture;
+    updates.boxes_whose_user_scroll_gesture_ended = move(pending->boxes_whose_user_scroll_gesture_ended);
+    updates.wheel_latched_scroller = pending->wheel_latched_scroller;
+    updates.context_user_input_scroll_count = pending->context_user_input_scroll_count;
     // Whether a gesture is in progress is a state the compositor process keeps current; the rest
     // was consumed here.
     pending->scroll_offsets.clear();
     pending->completed_operation_ids.clear();
     pending->operation_ids_taken_over_by_user_input.clear();
     pending->started_user_scrolls.clear();
-    pending->user_scroll_gesture_ended = false;
+    pending->applied_scroll_requests.clear();
+    pending->boxes_whose_user_scroll_gesture_ended.clear();
     return updates;
 }
 
@@ -355,11 +672,11 @@ void CompositorConnection::merge_async_scroll_updates(Web::CompositorContextId c
     // Whether a gesture is in progress is a state, not an event: the newest publication decides it.
     bool const is_newest = updates.sequence >= pending.sequence;
     pending.sequence = max(pending.sequence, updates.sequence);
+    pending.context_user_input_scroll_count = max(pending.context_user_input_scroll_count, updates.context_user_input_scroll_count);
     for (auto const& scroll_offset : updates.scroll_offsets) {
         auto existing = pending.scroll_offsets.find_if([&](auto const& existing) { return existing.stable_node_id == scroll_offset.stable_node_id; });
         if (existing != pending.scroll_offsets.end()) {
-            existing->compositor_scroll_offset = scroll_offset.compositor_scroll_offset;
-            existing->unadopted_scroll_delta.translate_by(scroll_offset.unadopted_scroll_delta);
+            existing->merge_later_scroll(scroll_offset);
         } else {
             pending.scroll_offsets.append(scroll_offset);
         }
@@ -367,18 +684,23 @@ void CompositorConnection::merge_async_scroll_updates(Web::CompositorContextId c
     pending.completed_operation_ids.extend(move(updates.completed_operation_ids));
     pending.operation_ids_taken_over_by_user_input.extend(move(updates.operation_ids_taken_over_by_user_input));
     pending.started_user_scrolls.extend(move(updates.started_user_scrolls));
+    pending.applied_scroll_requests.extend(move(updates.applied_scroll_requests));
     if (is_newest) {
         pending.document_id = updates.document_id;
-        pending.user_scroll_gesture_in_progress = updates.user_scroll_gesture_in_progress;
+        pending.boxes_in_user_scroll_gesture = move(updates.boxes_in_user_scroll_gesture);
+        pending.wheel_latched_scroller = updates.wheel_latched_scroller;
     }
-    pending.user_scroll_gesture_ended |= updates.user_scroll_gesture_ended;
+    for (auto box : updates.boxes_whose_user_scroll_gesture_ended) {
+        if (!pending.boxes_whose_user_scroll_gesture_ended.contains_slow(box))
+            pending.boxes_whose_user_scroll_gesture_ended.append(box);
+    }
 }
 
-void CompositorConnection::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
+void CompositorConnection::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
     if (!can_send_message_to_compositor())
         return;
-    async_viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
+    async_viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
 }
 
 bool CompositorConnection::request_rendering_opportunity(Web::CompositorContextId context_id, double maximum_frames_per_second)
@@ -396,137 +718,33 @@ void CompositorConnection::hurry_rendering_opportunity(Web::CompositorContextId 
     async_hurry_rendering_opportunity(context_id);
 }
 
-void CompositorConnection::present_frame(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect)
-{
-    if (!can_send_message_to_compositor())
-        return;
-    async_present_frame(context_id, viewport_rect);
-}
-
-Optional<Compositing::CanvasId> CompositorConnection::create_webgl_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias, Vector<String>& out_supported_extensions)
-{
-    if (!can_send_message_to_compositor())
-        return {};
-
-    auto response = send_sync<Messages::CompositorWebContentServer::CreateWebglContext>(webgl_version, size, depth, stencil, antialias);
-    out_supported_extensions = response->take_supported_extensions();
-    if (!response->success())
-        return {};
-    return response->canvas_id();
-}
-
-void CompositorConnection::set_webgl_command_buffer(Compositing::CanvasId canvas_id, Core::AnonymousBuffer const& command_buffer)
-{
-    if (!can_send_message_to_compositor())
-        return;
-
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::WebglSetCommandBuffer::static_encode(canvas_id, command_buffer));
-    if (post_message(encoded_message).is_error())
-        did_lose_compositor();
-}
-
-void CompositorConnection::send_webgl_commands_from_shared_buffer(Compositing::CanvasId canvas_id, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Gfx::DecodedImageFrame> const& bitmaps)
-{
-    if (!can_send_message_to_compositor())
-        return;
-
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::WebglCommandsFromSharedBuffer::static_encode(canvas_id, offset, size_in_bytes, flush_sequence_number, bitmaps));
-    if (post_message(encoded_message).is_error())
-        did_lose_compositor();
-}
-
-bool CompositorConnection::drain_webgl_command_buffer(Compositing::CanvasId canvas_id)
-{
-    if (!can_send_message_to_compositor())
-        return false;
-
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::WebglDrainCommandBuffer>(canvas_id);
-    if (!response) {
-        did_lose_compositor();
-        return false;
-    }
-    return true;
-}
-
-void CompositorConnection::send_webgl_commands(Compositing::CanvasId canvas_id, ByteBuffer const& commands, Vector<Gfx::DecodedImageFrame> const& bitmaps)
-{
-    if (!can_send_message_to_compositor())
-        return;
-
-    auto shared_commands = MUST(Core::AnonymousBuffer::create_with_size(commands.size()));
-    commands.bytes().copy_to({ shared_commands.data<u8>(), shared_commands.size() });
-
-    auto encoded_message = MUST(Messages::CompositorWebContentServer::WebglCommands::static_encode(canvas_id, shared_commands, bitmaps));
-    if (post_message(encoded_message).is_error())
-        did_lose_compositor();
-}
-
-void CompositorConnection::present_webgl_canvas(Compositing::CanvasId canvas_id, bool preserve_drawing_buffer)
-{
-    if (!can_send_message_to_compositor())
-        return;
-
-    async_webgl_present_canvas(canvas_id, preserve_drawing_buffer);
-}
-
-void CompositorConnection::clear_webgl_drawing_buffer(Compositing::CanvasId canvas_id)
-{
-    if (!can_send_message_to_compositor())
-        return;
-
-    async_webgl_clear_drawing_buffer(canvas_id);
-}
-
-ByteBuffer CompositorConnection::webgl_sync_call(Compositing::CanvasId canvas_id, ByteBuffer request)
-{
-    if (!can_send_message_to_compositor())
-        return {};
-
-    auto response = send_sync<Messages::CompositorWebContentServer::WebglSyncCall>(canvas_id, move(request));
-    return response->take_reply();
-}
-
-Compositing::WebGL::ReadPixelsResult CompositorConnection::read_webgl_pixels(Compositing::CanvasId canvas_id, Compositing::WebGL::GLint x, Compositing::WebGL::GLint y, Compositing::WebGL::GLsizei width, Compositing::WebGL::GLsizei height, Compositing::WebGL::GLenum format, Compositing::WebGL::GLenum type, Compositing::WebGL::GLsizei buf_size, Core::AnonymousBuffer const& pixels)
-{
-    if (!can_send_message_to_compositor())
-        return {};
-
-    auto response = send_sync<Messages::CompositorWebContentServer::WebglReadPixels>(canvas_id, x, y, width, height, format, type, buf_size, pixels);
-    return {
-        .length = response->length(),
-        .columns = response->columns(),
-        .rows = response->rows(),
-    };
-}
-
-bool CompositorConnection::read_webgl_buffer_sub_data(Compositing::CanvasId canvas_id, Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer const& data)
-{
-    if (!can_send_message_to_compositor())
-        return false;
-
-    auto response = send_sync<Messages::CompositorWebContentServer::WebglReadBufferSubData>(canvas_id, target, offset, size, data);
-    return response->success();
-}
-
-void CompositorConnection::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
+void CompositorConnection::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void(ScreenshotResult)>&& callback)
 {
     if (!can_send_message_to_compositor()) {
         if (callback)
-            callback();
+            callback(ScreenshotResult::Failed);
         return;
     }
 
-    auto target_bitmap = MUST(Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, target_surface->size()));
+    // The compositor paints straight into the target, so it has to be memory both processes can map.
+    VERIFY(target_bitmap->anonymous_buffer().is_valid());
     auto shareable_bitmap = Gfx::ShareableBitmap { target_bitmap, Gfx::ShareableBitmap::ConstructWithKnownGoodBitmap };
     auto request_id = Compositing::ScreenshotRequestId { m_next_screenshot_request_id++ };
-    m_screenshots.set(request_id, PendingScreenshot { move(target_surface), move(target_bitmap), move(callback) });
-    async_request_screenshot(context_id, request_id, move(shareable_bitmap));
+    m_screenshots.set(request_id, PendingScreenshot { move(target_bitmap), move(callback) });
+    // The screenshot is of what the compositor composes, so it goes after the frames handed to the Paint thread before.
+    paint_stage_request_screenshot(new ScreenshotRequestForPaintThread { context_id, request_id, move(shareable_bitmap) });
 }
 
 void CompositorConnection::key_event(u64 page_id, Web::KeyEvent event)
 {
     if (on_key_event)
         on_key_event(Web::PageId { page_id }, move(event));
+}
+
+void CompositorConnection::pinch_event(u64 page_id, Web::PinchEvent event)
+{
+    if (on_pinch_event)
+        on_pinch_event(Web::PageId { page_id }, event);
 }
 
 void CompositorConnection::mouse_event(u64 page_id, Web::MouseEvent event)
@@ -539,20 +757,41 @@ void CompositorConnection::mouse_event(u64 page_id, Web::MouseEvent event)
 void CompositorConnection::request_rendering_update()
 {
     for (auto& navigable : Web::HTML::all_local_navigables()) {
-        if (navigable->is_local_root() && navigable->has_compositor_context())
-            navigable->page().client().request_frame();
+        if (navigable.is_local_root() && navigable.has_compositor_context())
+            navigable.page().client().request_frame();
     }
 }
 
-void CompositorConnection::rendering_opportunity(Web::CompositorContextId context_id, i64 frame_time_nanoseconds, double frame_interval_milliseconds)
+void CompositorConnection::rendering_opportunity(Web::CompositorContextId context_id, i64 frame_time_nanoseconds, double frame_interval_milliseconds, double display_interval_milliseconds, Compositing::RenderingOpportunityFrameTime frame_time_kind)
 {
     for (auto& navigable : Web::HTML::all_local_navigables()) {
-        if (!navigable->is_local_root() || !navigable->has_compositor_context())
+        if (!navigable.is_local_root() || !navigable.has_compositor_context())
             continue;
-        if (navigable->compositor_context().id() != context_id)
+        if (navigable.compositor_context().id() != context_id)
             continue;
-        navigable->page().client().rendering_opportunity(frame_time_nanoseconds, frame_interval_milliseconds);
+        navigable.page().client().rendering_opportunity(frame_time_nanoseconds, frame_interval_milliseconds, display_interval_milliseconds, frame_time_kind);
         return;
+    }
+}
+
+void CompositorConnection::animated_content_moved_under_pointer(Web::CompositorContextId context_id, i64 frame_time_nanoseconds)
+{
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
+        if (!navigable.has_compositor_context() || navigable.compositor_context().id() != context_id)
+            continue;
+        navigable.event_handler().note_animated_content_moved_under_pointer(frame_time_nanoseconds);
+        return;
+    }
+}
+
+void CompositorConnection::overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> visibilities)
+{
+    // Each scroller belongs to the active document of one of our navigables, which takes its scrollbar's visibility.
+    for (auto const& visibility : visibilities) {
+        for (auto& navigable : Web::HTML::all_local_navigables()) {
+            if (navigable.set_overlay_scrollbar_hidden(visibility.scroller_stable_node_id, visibility.vertical, visibility.hidden))
+                break;
+        }
     }
 }
 
@@ -561,15 +800,60 @@ void CompositorConnection::placeholder_canvas_committed(Compositing::CanvasId ca
     Web::HTML::HTMLCanvasElement::placeholder_frame_committed(canvas_id, size, origin_clean);
 }
 
+void CompositorConnection::prepare_remote_descendants_for_screenshot(Web::CompositorContextId context_id, Function<void()>&& callback)
+{
+    if (!can_send_message_to_compositor()) {
+        callback();
+        return;
+    }
+    auto request_id = m_next_remote_descendant_preparation_id++;
+    m_remote_descendant_preparations.set(request_id, move(callback));
+    async_prepare_remote_descendants_for_screenshot(context_id, request_id);
+}
+
+void CompositorConnection::remote_descendants_prepared_for_screenshot(u64 request_id)
+{
+    if (auto callback = m_remote_descendant_preparations.take(request_id); callback.has_value())
+        (*callback)();
+}
+
+void CompositorConnection::paint_contexts_for_screenshot(u64 preparation_id, Vector<Web::CompositorContextId> context_ids)
+{
+    // The compositor names a context before those below it, and each is painted after them, as a rendering update would.
+    GC::RootVector<GC::Ref<Web::HTML::LocalNavigable>> navigables;
+    for (auto context_id : context_ids.in_reverse()) {
+        for (auto& navigable : Web::HTML::all_local_navigables()) {
+            if (navigable.has_been_destroyed() || !navigable.has_compositor_context() || navigable.compositor_context().id() != context_id)
+                continue;
+            navigables.append(navigable);
+            break;
+        }
+    }
+    GC::RootVector<GC::Ref<Web::Page>> prepared_pages;
+    for (auto& navigable : navigables) {
+        if (any_of(prepared_pages, [&](auto const& page) { return page.ptr() == &navigable->page(); }))
+            continue;
+        prepared_pages.append(navigable->page());
+        navigable->page().prepare_canvas_contexts_for_compositing();
+    }
+    // A document that has just loaded may not have painted since, and the screenshot would show the frame it painted
+    // before, so paint each one.
+    for (auto& navigable : navigables)
+        navigable->paint_next_frame_if_needed(Web::DOM::UpdateLayoutReason::ProcessScreenshot);
+    // The frames reach the compositor on this connection once the Paint thread has handed them over, ahead of the
+    // answer.
+    Web::HTML::main_thread_event_loop().take_committed_frames_in();
+    async_did_paint_contexts_for_screenshot(preparation_id);
+}
+
 void CompositorConnection::did_complete_screenshot(Compositing::ScreenshotRequestId request_id)
 {
     auto pending_screenshot = take_screenshot(request_id);
     if (!pending_screenshot.has_value())
         return;
 
-    pending_screenshot->target_surface->write_from_bitmap(*pending_screenshot->target_bitmap);
     if (pending_screenshot->callback)
-        pending_screenshot->callback();
+        pending_screenshot->callback(ScreenshotResult::Taken);
 }
 
 void CompositorConnection::did_fail_screenshot(Compositing::ScreenshotRequestId request_id)
@@ -579,7 +863,7 @@ void CompositorConnection::did_fail_screenshot(Compositing::ScreenshotRequestId 
         return;
 
     if (pending_screenshot->callback)
-        pending_screenshot->callback();
+        pending_screenshot->callback(ScreenshotResult::Failed);
 }
 
 void CompositorConnection::did_lose_compositor()
@@ -587,12 +871,18 @@ void CompositorConnection::did_lose_compositor()
     if (m_has_lost_compositor)
         return;
     m_has_lost_compositor = true;
+    stop_registering_resources_with_compositor(*m_poster);
+    m_poster->detach_from_transport();
 
     for (auto& entry : m_screenshots) {
         if (entry.value.callback)
-            entry.value.callback();
+            entry.value.callback(ScreenshotResult::Failed);
     }
     m_screenshots.clear();
+
+    // Nothing will answer the preparations now, and a screenshot that waits for one goes on without a compositor.
+    for (auto& entry : exchange(m_remote_descendant_preparations, {}))
+        entry.value();
 
     if (on_compositor_lost)
         on_compositor_lost();
@@ -608,4 +898,118 @@ Optional<CompositorConnection::PendingScreenshot> CompositorConnection::take_scr
     return m_screenshots.take(request_id);
 }
 
+}
+
+extern "C" WEB_API bool web_compositor_post_fonts_and_image_frames(void* poster, u64 context_id, void const* const* fonts, size_t font_count, void const* const* image_frames, size_t image_frame_count);
+extern "C" WEB_API bool web_compositor_create_shared_buffer(size_t size, Web::Compositor::FfiSharedBuffer* out);
+extern "C" WEB_API void web_compositor_shared_buffer_release(void* owner);
+extern "C" WEB_API int web_compositor_shared_buffer_clone_descriptor(void* owner);
+extern "C" WEB_API Gfx::DecodedImageFrame* web_compositor_shared_buffer_image_frame(void* owner, i32 width, i32 height, u8 alpha_type, u8 color_space);
+extern "C" WEB_API u64 web_compositor_connection_serial(Web::Compositor::CompositorConnection const*);
+extern "C" WEB_API bool web_compositor_connection_for_sync_requests(Web::Compositor::CompositorConnection*, IPC::FfiConnection* out_connection);
+extern "C" WEB_API bool web_compositor_connection_register_image_frames(Web::Compositor::CompositorConnection*, void const* const* image_frames, size_t image_frame_count);
+extern "C" WEB_API bool web_compositor_post_screenshot_request(void* poster, void* request);
+extern "C" WEB_API void web_screenshot_request_destroy(void* request);
+extern "C" WEB_API bool web_compositor_stage_rasterization(void* poster, u64 token, void const* const* fonts, size_t font_count, void const* const* image_frames, size_t image_frame_count, void const* target_bitmap);
+
+extern "C" WEB_API bool web_compositor_post_fonts_and_image_frames(void* poster, u64 context_id, void const* const* fonts, size_t font_count, void const* const* image_frames, size_t image_frame_count)
+{
+    return Web::Compositor::post_fonts_and_register_image_frames(
+        *static_cast<IPC::ThreadSafeMessagePoster*>(poster),
+        Web::CompositorContextId { context_id },
+        { reinterpret_cast<Gfx::Font const* const*>(fonts), font_count },
+        { reinterpret_cast<Gfx::DecodedImageFrame const* const*>(image_frames), image_frame_count });
+}
+
+extern "C" WEB_API bool web_compositor_create_shared_buffer(size_t size, Web::Compositor::FfiSharedBuffer* out)
+{
+    // Sealed where the platform supports it, so the receiver cannot be faulted by the file shrinking.
+    auto buffer = Core::AnonymousBuffer::create_with_size(size);
+    if (buffer.is_error())
+        return false;
+    auto descriptor = IPC::File::clone_fd(buffer.value().fd());
+    if (descriptor.is_error())
+        return false;
+    auto owner = make<Web::Compositor::SharedBufferForRust>(buffer.release_value());
+    *out = {
+        .data = owner->buffer.data<u8>(),
+        .size = owner->buffer.size(),
+        .descriptor = descriptor.value().take_fd(),
+        .owner = owner.leak_ptr(),
+    };
+    return true;
+}
+
+extern "C" WEB_API void web_compositor_shared_buffer_release(void* owner)
+{
+    delete static_cast<Web::Compositor::SharedBufferForRust*>(owner);
+}
+
+extern "C" WEB_API int web_compositor_shared_buffer_clone_descriptor(void* owner)
+{
+    auto descriptor = IPC::File::clone_fd(static_cast<Web::Compositor::SharedBufferForRust*>(owner)->buffer.fd());
+    if (descriptor.is_error())
+        return -1;
+    return descriptor.value().take_fd();
+}
+
+// NB: A color space is the underlying value of a Bindings::PredefinedColorSpace.
+extern "C" WEB_API Gfx::DecodedImageFrame* web_compositor_shared_buffer_image_frame(void* owner, i32 width, i32 height, u8 alpha_type, u8 color_space)
+{
+    VERIFY(Gfx::is_valid_alpha_type(alpha_type));
+    auto& buffer = static_cast<Web::Compositor::SharedBufferForRust*>(owner)->buffer;
+    auto format = static_cast<Gfx::AlphaType>(alpha_type) == Gfx::AlphaType::Unpremultiplied ? Gfx::BitmapFormat::RGBA8888 : Gfx::BitmapFormat::BGRA8888;
+    auto gfx_color_space = Compositing::gfx_color_space_for(Web::HTML::predefined_color_space_from_underlying(color_space));
+    auto frame = Gfx::DecodedImageFrame::create_over_shared_memory(buffer, 0, { width, height }, format, static_cast<Gfx::AlphaType>(alpha_type), move(gfx_color_space));
+    if (frame.is_error())
+        return nullptr;
+    return new Gfx::DecodedImageFrame { frame.release_value() };
+}
+
+extern "C" WEB_API u64 web_compositor_connection_serial(Web::Compositor::CompositorConnection const* connection)
+{
+    return connection->serial();
+}
+
+extern "C" WEB_API bool web_compositor_connection_for_sync_requests(Web::Compositor::CompositorConnection* connection, IPC::FfiConnection* out_connection)
+{
+    if (!connection->can_send_message_to_compositor())
+        return false;
+    *out_connection = connection->to_ffi_with_one_reference();
+    return true;
+}
+
+extern "C" WEB_API bool web_compositor_connection_register_image_frames(Web::Compositor::CompositorConnection* connection, void const* const* image_frames, size_t image_frame_count)
+{
+    return connection->register_image_frames({ reinterpret_cast<Gfx::DecodedImageFrame const* const*>(image_frames), image_frame_count });
+}
+
+extern "C" WEB_API bool web_compositor_post_screenshot_request(void* poster, void* request_pointer)
+{
+    auto request = adopt_own(*static_cast<Web::Compositor::ScreenshotRequestForPaintThread*>(request_pointer));
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::RequestScreenshot::static_encode(request->context_id, request->request_id, request->target));
+    return static_cast<IPC::ThreadSafeMessagePoster*>(poster)->try_post(encoded_message);
+}
+
+extern "C" WEB_API void web_screenshot_request_destroy(void* request)
+{
+    delete static_cast<Web::Compositor::ScreenshotRequestForPaintThread*>(request);
+}
+
+extern "C" WEB_API bool web_compositor_stage_rasterization(void* poster, u64 token, void const* const* fonts, size_t font_count, void const* const* image_frames, size_t image_frame_count, void const* target_bitmap)
+{
+    auto& message_poster = *static_cast<IPC::ThreadSafeMessagePoster*>(poster);
+    ReadonlySpan<Gfx::Font const*> staged_fonts { reinterpret_cast<Gfx::Font const* const*>(fonts), font_count };
+    if (!Web::Compositor::register_typefaces_of_fonts_with_compositor(message_poster, staged_fonts))
+        return false;
+    ReadonlySpan<Gfx::DecodedImageFrame const*> staged_image_frames { reinterpret_cast<Gfx::DecodedImageFrame const* const*>(image_frames), image_frame_count };
+    if (!Web::Compositor::register_image_frames_with_compositor(message_poster, staged_image_frames))
+        return false;
+    Vector<Compositing::ImageFrameResourceId> staged_image_frame_ids;
+    staged_image_frame_ids.ensure_capacity(staged_image_frames.size());
+    for (auto const* image_frame : staged_image_frames)
+        staged_image_frame_ids.unchecked_append(Compositing::ImageFrameResourceId { image_frame->id() });
+    auto& target = const_cast<Gfx::Bitmap&>(*static_cast<Gfx::Bitmap const*>(target_bitmap));
+    auto encoded_message = MUST(Messages::CompositorWebContentServer::StageRasterization::static_encode(token, Web::Compositor::descriptions_of_fonts(staged_fonts), staged_image_frame_ids, Gfx::ShareableBitmap { target, Gfx::ShareableBitmap::ConstructWithKnownGoodBitmap }));
+    return message_poster.try_post(encoded_message);
 }

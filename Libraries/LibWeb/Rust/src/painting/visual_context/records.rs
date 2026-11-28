@@ -7,29 +7,32 @@
 //! What the main thread keeps alongside a visual context tree while it builds and updates it: the
 //! document's state, and the records the builder keeps per box.
 
-use std::rc::Rc;
-
 use super::{ClipNodeIndex, ContextRef, EffectNodeIndex, SpatialNodeIndex, VisualContextTree, dirty, scroll_state};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::host::FfiCompositorAnimationPublishOutcome;
 use crate::painting::visual_animation::VisualAnimation;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct VisualContextState {
-    pub tree: Option<Rc<VisualContextTree>>,
-    pub paintables_with_mask_nodes: Vec<crate::layout::node_data::NodeSlotId>,
+    pub tree: Option<std::sync::Arc<VisualContextTree>>,
     pub scroll_state: scroll_state::ScrollState,
     pub needs_to_refresh_scroll_state: bool,
-    pub build_count: u64,
     pub dirty_boxes: dirty::VisualContextDirtySet,
-    pub incremental_update_count: u64,
+    pub(crate) last_compositor_scroll_inputs: Option<super::compositor_scroll_table::CompositorScrollInputs>,
+    // The owners of the tree's compositor scroll rows, in row order, so refresh can find boxes that left the table.
+    pub(crate) compositor_scroll_owners: Vec<NodeSlotId>,
+    // The paint generation the table's snap geometry was last brought up to.
+    pub(crate) compositor_snap_records_as_of: Option<crate::painting::record::change_ticks::PaintGeneration>,
     pub last_tree_inputs: Option<crate::painting::host::FfiVisualContextTreeInputs>,
-    pub last_full_build_reason: dirty::VisualContextGlobalRebuildReason,
+    // The viewport's overflow when the tree was last updated. A sticky box finds its scrolling box by it.
+    pub last_viewport_overflow: (u8, u8),
     pub quarantined_slots_are_releasable: bool,
-    // The compositor animations the effects of the current update pass have published so far.
-    pub pending_compositor_animations: Vec<VisualAnimation>,
     // The list the tree was last given, which the next pass compares its own against.
     pub published_compositor_animations: Vec<VisualAnimation>,
+    // The boxes whose transform node has an offset path, which depends on the geometry of their containing block.
+    pub offset_path_boxes: crate::cow_map::CowSet<NodeSlotId>,
+    // What the updates did since a test began tracing them.
+    pub(crate) trace: Option<super::trace::VisualContextTrace>,
 }
 
 impl VisualContextState {
@@ -48,7 +51,7 @@ impl VisualContextState {
         }
         self.quarantined_slots_are_releasable = false;
         if let Some(tree) = self.tree.as_mut() {
-            Rc::make_mut(tree).release_quarantined_slots_after_recording();
+            std::sync::Arc::make_mut(tree).release_quarantined_slots_after_recording();
         }
     }
 }
@@ -58,14 +61,8 @@ impl VisualContextState {
 /// changed for the counters the document keeps.
 pub fn publish_compositor_animations(
     visual_context: &mut VisualContextState,
-    publish_pending: bool,
+    animations: Vec<VisualAnimation>,
 ) -> FfiCompositorAnimationPublishOutcome {
-    let animations = if publish_pending {
-        std::mem::take(&mut visual_context.pending_compositor_animations)
-    } else {
-        visual_context.pending_compositor_animations.clear();
-        Vec::new()
-    };
     let Some(tree) = visual_context.tree.as_mut() else {
         return FfiCompositorAnimationPublishOutcome::default();
     };
@@ -91,7 +88,7 @@ pub fn publish_compositor_animations(
         }
     }
     *published = animations.clone();
-    Rc::make_mut(tree).set_visual_animations(animations);
+    std::sync::Arc::make_mut(tree).set_visual_animations(animations);
     FfiCompositorAnimationPublishOutcome {
         published: true,
         parameters_changed,
@@ -117,27 +114,28 @@ pub static EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES: BoxVisualContextNodeHandles = 
 };
 
 impl BoxVisualContextNodeHandles {
+    /// Whether the box owns no node.
+    pub fn is_empty(&self) -> bool {
+        self.spatial.is_empty()
+            && self.chain_clips.is_empty()
+            && self.descendant_clips.is_empty()
+            && self.effects.is_empty()
+    }
+
     pub fn clip_handles(&self) -> impl Iterator<Item = ClipNodeIndex> + '_ {
         self.chain_clips.iter().chain(&self.descendant_clips).copied()
     }
 }
 
-// Nearest ancestor scroll node resolved along the containing block chain, drilled down alongside
-// the visual context indices. A fixed-position ancestor decouples its subtree from all outer
-// scrollers, but sticky boxes must still reference a scrollport through fixed-position ancestors
-// for their sticky offset computation, so both resolutions are carried.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NearestScrollNodeIndices {
-    pub stopping_at_fixed_position_ancestors: SpatialNodeIndex,
-    pub continuing_through_fixed_position_ancestors: SpatialNodeIndex,
-}
-
-// One positioning chain; effects are shared by all three chains.
+// One positioning chain; effects are shared by all three chains. The nearest scroll-like node is
+// what a sticky box sticks to, resolved along the containing block chain: a fixed-position ancestor
+// takes its subtree off the spatial chain of outer scrollers, but sticky boxes must still reference
+// a scrollport through it for their sticky offset computation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PositioningContext {
     pub spatial: SpatialNodeIndex,
     pub clip: ClipNodeIndex,
-    pub nearest_scroll_nodes: NearestScrollNodeIndices,
+    pub nearest_scroll_like_node: SpatialNodeIndex,
     pub plane_root: SpatialNodeIndex,
 }
 
@@ -166,10 +164,44 @@ pub(crate) struct DescendantVisualContexts {
 pub(crate) struct PaintableVisualContextRecord {
     pub inherited_input: DescendantVisualContexts,
     pub output_for_descendants: DescendantVisualContexts,
-    pub node_handles: BoxVisualContextNodeHandles,
-    pub has_mask_nodes: bool,
-    pub may_be_root_element: bool,
     pub owns_geometry_dependent_nodes: bool,
     pub subtree_may_own_geometry_dependent_nodes: bool,
     pub stacking_context: crate::painting::stacking_context::StackingContextFacts,
+}
+
+/// A box's [`PaintableVisualContextRecord`] as its row holds it.
+///
+/// OPTIMIZATION: Almost every box hands its descendants the contexts it inherited, which are the contexts its parent
+///               hands every child. So a row shares the contexts it holds with the rows around it, rather than
+///               holding two copies of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldVisualContextRecord {
+    pub inherited_input: std::sync::Arc<DescendantVisualContexts>,
+    pub output_for_descendants: std::sync::Arc<DescendantVisualContexts>,
+    pub owns_geometry_dependent_nodes: bool,
+    pub subtree_may_own_geometry_dependent_nodes: bool,
+    pub stacking_context: crate::painting::stacking_context::StackingContextFacts,
+}
+
+/// The descendant contexts the rows written last hold, the latest first, which the next rows written share where
+/// theirs are the same: a walk writes a box's children right after the box.
+#[derive(Clone, Default)]
+pub(crate) struct SharedDescendantVisualContexts {
+    recent: Vec<std::sync::Arc<DescendantVisualContexts>>,
+}
+
+impl SharedDescendantVisualContexts {
+    const HELD: usize = 8;
+
+    /// `contexts`, shared with the rows written lately that hold the same.
+    pub(crate) fn share(&mut self, contexts: DescendantVisualContexts) -> std::sync::Arc<DescendantVisualContexts> {
+        if let Some(position) = self.recent.iter().position(|held| **held == contexts) {
+            self.recent[..=position].rotate_right(1);
+            return self.recent[0].clone();
+        }
+        let shared = std::sync::Arc::new(contexts);
+        self.recent.truncate(Self::HELD - 1);
+        self.recent.insert(0, shared.clone());
+        shared
+    }
 }

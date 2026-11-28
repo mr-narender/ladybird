@@ -25,8 +25,8 @@ public:
     GC::Ptr<Element> last_element_child();
     u32 child_element_count() const;
 
-    WebIDL::ExceptionOr<GC::Ptr<Element>> query_selector(Utf16View);
-    WebIDL::ExceptionOr<GC::Ref<NodeList>> query_selector_all(Utf16View);
+    WebIDL::ExceptionOr<GC::Ptr<Element>> query_selector(Utf16String const&);
+    WebIDL::ExceptionOr<GC::Ref<NodeList>> query_selector_all(Utf16String const&);
 
     GC::Ref<HTMLCollection> children();
 
@@ -50,6 +50,8 @@ protected:
 
 private:
     friend class Node;
+
+    GC::Ref<HTMLCollection> create_elements_by_tag_name_collection(Utf16FlyString const&);
 
     // The counters behind Node::dom_tree_version() and Node::character_data_version(), for the tree rooted here.
     u64 m_dom_tree_version { 0 };

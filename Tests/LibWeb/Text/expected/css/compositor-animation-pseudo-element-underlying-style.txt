@@ -1,0 +1,3 @@
+compositor animations:
+  opacity div#target
+keyframes resolved again: [compositor keyframe values resolved]

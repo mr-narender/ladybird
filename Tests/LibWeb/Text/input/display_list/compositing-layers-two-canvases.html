@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<style>
+    body { margin: 0; }
+    canvas { position: absolute; left: 20px; }
+    #upper { top: 20px; }
+    #lower { top: 530px; }
+    #over-both { position: absolute; left: 100px; top: 60px; width: 40px; height: 500px; background: rgba(255, 255, 255, 0.5); }
+    #over-lower { position: absolute; left: 150px; top: 550px; width: 50px; height: 20px; background: green; }
+</style>
+<canvas id="upper" width="200" height="120"></canvas>
+<canvas id="lower" width="200" height="60"></canvas>
+<div id="over-both"></div>
+<div id="over-lower"></div>
+<script>
+    test(() => {
+        for (const canvas of document.querySelectorAll("canvas")) {
+            const context = canvas.getContext("2d");
+            context.fillStyle = "blue";
+            context.fillRect(0, 0, canvas.width, canvas.height);
+        }
+        println(internals.dumpDisplayList());
+    });
+</script>

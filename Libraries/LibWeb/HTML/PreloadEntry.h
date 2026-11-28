@@ -9,12 +9,14 @@
 #include <AK/HashMap.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <LibGC/Forward.h>
 #include <LibGC/Function.h>
 #include <LibGC/Ptr.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/URL.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/Fetch/Engine/BodyIntent.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::HTML {
@@ -41,13 +43,13 @@ struct PreloadKey {
 };
 
 // https://html.spec.whatwg.org/multipage/links.html#create-a-preload-key
-PreloadKey create_a_preload_key(Fetch::Infrastructure::Request const&);
+WEB_API PreloadKey create_a_preload_key(Fetch::Infrastructure::Request const&);
 
 // https://html.spec.whatwg.org/multipage/links.html#translate-a-preload-destination
 Variant<Empty, Optional<Fetch::Infrastructure::Request::Destination>> translate_a_preload_destination(Utf16View destination);
 
 // https://html.spec.whatwg.org/multipage/links.html#preload-entry
-class PreloadEntry final : public JS::Cell {
+class WEB_API PreloadEntry final : public JS::Cell {
     GC_CELL(PreloadEntry, JS::Cell);
     GC_DECLARE_ALLOCATOR(PreloadEntry);
 
@@ -62,18 +64,25 @@ public:
 
     // response
     //     Null or a response
-    GC::Ptr<Fetch::Infrastructure::Response> response;
+    RefPtr<Fetch::Infrastructure::Response> response;
 
     // on response available
     //     Null, or an algorithm accepting a response or null
-    // The callback is always invoked with a non-null response — either entry's resolved response,
-    // or the response delivered by the preload's fetch.
-    GC::Ptr<GC::Function<void(GC::Ref<Fetch::Infrastructure::Response>)>> on_response_available;
+    // AD-HOC: It is called with null only for a cancelled entry.
+    GC::Ptr<GC::Function<void(RefPtr<Fetch::Infrastructure::Response>)>> on_response_available;
 
-    // AD-HOC: The controller of the fetch loading this entry. A consumer whose own fetch runs on a parallel queue (a
-    //         sync XHR send(), whose event loop is paused while it's blocked) re-targets that fetch thru this, so it
-    //         delivers its response without the event loop as well; see consume_a_preloaded_resource().
+    // AD-HOC: Whether the preload's fetch was stopped before the entry had a response. A cancelled entry takes no
+    //         response, and a consumer fetches on its own instead.
+    bool cancelled { false };
+    void cancel();
+
+    // AD-HOC: The controller of the fetch loading this entry. A sync XHR consumer, whose event loop is paused while it's
+    //         blocked, re-targets that fetch thru this, so it delivers its response without the event loop as well; see
+    //         consume_a_preloaded_resource().
     GC::Ptr<Fetch::Infrastructure::FetchController> controller;
+
+    // AD-HOC: Whether this entry offers a speculative fetch's response to the normal parser's fetch.
+    bool is_speculative { false };
 };
 
 // https://html.spec.whatwg.org/multipage/links.html#consume-a-preloaded-resource
@@ -84,8 +93,12 @@ bool consume_a_preloaded_resource(
     Fetch::Infrastructure::Request::Mode mode,
     Fetch::Infrastructure::Request::CredentialsMode credentials_mode,
     Utf16View integrity_metadata,
-    GC::Ref<GC::Function<void(GC::Ref<Fetch::Infrastructure::Response>)>> on_response_available,
-    Fetch::Infrastructure::TaskDestination const& consumer_task_destination);
+    GC::Ref<GC::Function<void(RefPtr<Fetch::Infrastructure::Response>)>> on_response_available,
+    Fetch::Engine::BodyIntent consumer_body_intent,
+    bool& preload_reports_timing);
+
+// AD-HOC: Speculative fetches' responses that the normal parser didn't use must not be handed to a later fetch.
+void discard_speculative_preloads(DOM::Document&);
 
 }
 
@@ -109,3 +122,5 @@ struct Traits<Web::HTML::PreloadKey> : public DefaultTraits<Web::HTML::PreloadKe
 };
 
 }
+
+GC_UNTRACED_CAPTURE(Web::HTML::PreloadKey);

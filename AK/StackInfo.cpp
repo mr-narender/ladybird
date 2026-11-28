@@ -7,6 +7,7 @@
 #include <AK/Assertions.h>
 #include <AK/Platform.h>
 #include <AK/StackInfo.h>
+#include <AK/StdLibExtras.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -15,6 +16,9 @@
 #elif defined(AK_OS_LINUX) || defined(AK_LIBC_GLIBC) || defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_NETBSD) || defined(AK_OS_SOLARIS) || defined(AK_OS_HAIKU)
 #    include <pthread.h>
 #    include <sys/resource.h>
+#    if defined(AK_OS_LINUX)
+#        include <sys/auxv.h>
+#    endif
 #elif defined(AK_OS_FREEBSD) || defined(AK_OS_OPENBSD)
 #    include <pthread.h>
 #    include <pthread_np.h>
@@ -28,6 +32,19 @@ namespace AK {
 
 StackInfo::StackInfo()
 {
+    // Stack bounds never change; glibc queries them for the main thread by parsing /proc/self/maps.
+    struct CachedBounds {
+        FlatPtr base { 0 };
+        size_t size { 0 };
+    };
+    static thread_local CachedBounds s_cached_bounds;
+    if (s_cached_bounds.size != 0) {
+        m_base = s_cached_bounds.base;
+        m_size = s_cached_bounds.size;
+        m_top = m_base + m_size;
+        return;
+    }
+
 #ifdef AK_OS_SERENITY
     if (get_stack_bounds(&m_base, &m_size) < 0) {
         perror("get_stack_bounds");
@@ -92,6 +109,11 @@ StackInfo::StackInfo()
     ULONG_PTR high_limit = 0;
     GetCurrentThreadStackLimits(&low_limit, &high_limit);
 
+    // The stack overflows before reaching its low limit by the size reserved for handling that overflow.
+    ULONG stack_guarantee = 0;
+    SetThreadStackGuarantee(&stack_guarantee);
+    low_limit += stack_guarantee;
+
     m_base = static_cast<FlatPtr>(low_limit);
     m_size = static_cast<size_t>(high_limit - low_limit);
 #else
@@ -103,19 +125,28 @@ StackInfo::StackInfo()
     m_top = m_base + m_size;
 
 #if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID) && !defined(AK_LIBC_GLIBC)
-    // Note: musl libc always gives the initial size of the main thread's stack
-    if (getpid() == static_cast<pid_t>(gettid())) {
+    // musl reports only the part of the main thread's stack that is mapped so far, and from below the argument and
+    // environment strings at its top. But the kernel grows the stack on demand until it spans the stack size limit, from
+    // the top of its mapping. The kernel puts the executable's file name at that top, under one pointer, so the top
+    // follows from where the file name ends.
+    if (auto const* file_name = reinterpret_cast<char const*>(getauxval(AT_EXECFN)); file_name && getpid() == static_cast<pid_t>(gettid())) {
+        auto page_size = static_cast<FlatPtr>(sysconf(_SC_PAGESIZE));
+        auto file_name_end = reinterpret_cast<FlatPtr>(file_name) + strlen(file_name) + 1 + sizeof(void*);
+        m_top = (file_name_end + page_size - 1) & ~(page_size - 1);
         rlimit limit;
         getrlimit(RLIMIT_STACK, &limit);
         rlim_t size = limit.rlim_cur;
         if (size == RLIM_INFINITY)
             size = 8 * 0x10000;
         // account for a guard page
-        size -= static_cast<rlim_t>(sysconf(_SC_PAGESIZE));
-        m_size = static_cast<size_t>(size);
-        m_base = m_top - m_size;
+        size -= static_cast<rlim_t>(page_size);
+        // The stack reaches at least as far as musl reports, even where an unlimited size limit is taken as less.
+        m_base = min(m_top - static_cast<FlatPtr>(size), m_base);
+        m_size = m_top - m_base;
     }
 #endif
+
+    s_cached_bounds = { m_base, m_size };
 }
 
 }

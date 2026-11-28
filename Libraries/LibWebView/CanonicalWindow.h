@@ -32,10 +32,15 @@ public:
     CanonicalSimilarOriginWindowAgent& agent() const { return m_agent; }
 
     CanonicalEnvironmentSettingsObject const& relevant_settings_object() const;
-    void set_up_a_window_environment_settings_object(Optional<Web::HTML::EnvironmentId> id);
+    void set_up_a_window_environment_settings_object(Optional<Web::HTML::EnvironmentId> id, URL::URL top_level_creation_url);
 
+    bool has_associated_document() const { return m_associated_document; }
     CanonicalDocument const& associated_document() const;
     void set_associated_document(Badge<CanonicalDocument>, CanonicalDocument&);
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#sticky-activation
+    bool has_sticky_activation() const { return m_has_sticky_activation; }
+    void set_has_sticky_activation(bool value) { m_has_sticky_activation = value; }
 
 private:
     explicit CanonicalWindow(NonnullRefPtr<CanonicalSimilarOriginWindowAgent>);
@@ -43,6 +48,9 @@ private:
     NonnullRefPtr<CanonicalSimilarOriginWindowAgent> m_agent;
     OwnPtr<CanonicalEnvironmentSettingsObject> m_relevant_settings_object;
     WeakPtr<CanonicalDocument> m_associated_document;
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#has-sticky-activation
+    bool m_has_sticky_activation { false };
 };
 
 }

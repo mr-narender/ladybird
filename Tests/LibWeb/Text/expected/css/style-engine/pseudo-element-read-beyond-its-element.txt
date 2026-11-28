@@ -1,0 +1,3 @@
+document ::before: --own document
+shadow ::before: --own shadow
+host ::after: --own host

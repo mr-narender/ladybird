@@ -2011,6 +2011,21 @@
         "category": "sync"
     },
     {
+        "name": "glGetFloatv",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLenum",
+                "name": "pname"
+            },
+            {
+                "type": "GLfloat*",
+                "name": "data"
+            }
+        ],
+        "category": "custom"
+    },
+    {
         "name": "glGetFloatvRobustANGLE",
         "return": "void",
         "args": [
@@ -2061,6 +2076,21 @@
             }
         ],
         "category": "sync"
+    },
+    {
+        "name": "glGetIntegerv",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLenum",
+                "name": "pname"
+            },
+            {
+                "type": "GLint*",
+                "name": "data"
+            }
+        ],
+        "category": "custom"
     },
     {
         "name": "glGetIntegervRobustANGLE",
@@ -2512,6 +2542,99 @@
         "category": "sync"
     },
     {
+        "name": "glGetUniformfvRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "program",
+                "object": true
+            },
+            {
+                "type": "GLint",
+                "name": "location"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLfloat*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize"
+            }
+        ],
+        "category": "sync"
+    },
+    {
+        "name": "glGetUniformivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "program",
+                "object": true
+            },
+            {
+                "type": "GLint",
+                "name": "location"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize"
+            }
+        ],
+        "category": "sync"
+    },
+    {
+        "name": "glGetUniformuivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "program",
+                "object": true
+            },
+            {
+                "type": "GLint",
+                "name": "location"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLuint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize"
+            }
+        ],
+        "category": "sync"
+    },
+    {
         "name": "glGetUniformBlockIndex",
         "return": "GLuint",
         "args": [
@@ -2631,6 +2754,66 @@
                 "name": "pointer"
             }
         ]
+    },
+    {
+        "name": "glGetVertexAttribIivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "index"
+            },
+            {
+                "type": "GLenum",
+                "name": "pname"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize * sizeof(GLint)"
+            }
+        ],
+        "category": "sync"
+    },
+    {
+        "name": "glGetVertexAttribIuivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "index"
+            },
+            {
+                "type": "GLenum",
+                "name": "pname"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLuint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize * sizeof(GLuint)"
+            }
+        ],
+        "category": "sync"
     },
     {
         "name": "glGetVertexAttribfvRobustANGLE",

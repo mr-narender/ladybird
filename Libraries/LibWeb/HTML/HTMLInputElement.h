@@ -23,6 +23,7 @@
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWebCommon/HTML/ColorPickerUpdateState.h>
 #include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace JS {
@@ -72,7 +73,7 @@ class WEB_API HTMLInputElement final
 public:
     virtual ~HTMLInputElement() override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
     virtual void set_being_activated(bool) override;
 
     enum class TypeAttributeState {
@@ -92,6 +93,8 @@ public:
     virtual Utf16String form_value() const override { return value(); }
     virtual Optional<Utf16String> optional_value() const override;
     WebIDL::ExceptionOr<void> set_value(Utf16View);
+    Utf16String value_binding() const { return value(); }
+    WebIDL::ExceptionOr<void> set_value_binding(Utf16View);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
     virtual Utf16String relevant_value() const override;
@@ -104,6 +107,7 @@ public:
     void set_user_validity(bool);
 
     void commit_pending_changes();
+    void clear_search_value(Badge<HTMLButtonElement>);
     bool has_uncommitted_changes() { return m_has_uncommitted_changes; }
 
     void ensure_user_agent_shadow_tree(Badge<Internals::Internals>) { create_shadow_tree_if_needed(); }
@@ -120,8 +124,32 @@ public:
     bool can_have_text_editing_cursor() const;
 
     GC::Ptr<HTMLDataListElement const> list() const;
+    void suggestions_source_element_did_change();
 
     void did_pick_color(Optional<Color> picked_color, ColorPickerUpdateState state);
+    void did_pick_date(Optional<Utf16String> picked_value);
+    bool has_date_picker() const;
+    bool handle_date_time_field_key(UIEvents::KeyCode, u32 modifiers, u32 code_point);
+    bool handle_range_key(UIEvents::KeyCode, u32 modifiers);
+    void start_slider_drag(CSSPixelPoint viewport_position);
+    void activate_last_date_time_field();
+    void update_date_time_fields_for_step();
+
+    struct DateTimeField {
+        enum class Kind : u8 {
+            Year,
+            Month,
+            Day,
+            Week,
+            Hour,
+            Minute,
+            Second,
+            DayPeriod,
+        };
+        Kind kind;
+        Optional<i32> value;
+        GC::Ptr<DOM::Element> element;
+    };
 
     enum class MultipleHandling {
         Replace,
@@ -134,17 +162,17 @@ public:
 
     FileFilter parse_accept_attribute() const;
 
-    // NOTE: User interaction
-    // https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
-    void update_the_file_selection(GC::Ref<FileAPI::FileList>);
-
     WebIDL::Long max_length() const;
     WebIDL::ExceptionOr<void> set_max_length(WebIDL::Long);
 
     WebIDL::Long min_length() const;
+
+    virtual bool suffering_from_being_too_long() const override;
+    virtual bool suffering_from_being_too_short() const override;
     WebIDL::ExceptionOr<void> set_min_length(WebIDL::Long);
 
     WebIDL::UnsignedLong size() const;
+    Optional<u32> number_input_size_in_characters() const;
     WebIDL::ExceptionOr<void> set_size(WebIDL::UnsignedLong value);
 
     WebIDL::UnsignedLong height() const;
@@ -164,11 +192,23 @@ public:
     GC::Ptr<JS::Object> value_as_date_object(JS::Object& relevant_global_object) const;
     WebIDL::ExceptionOr<void> set_value_as_date_object(GC::Ptr<JS::Object>);
 
+    Color value_as_color() const;
+
     double value_as_number() const;
     WebIDL::ExceptionOr<void> set_value_as_number(double value);
 
     WebIDL::ExceptionOr<void> step_up(WebIDL::Long n = 1);
     WebIDL::ExceptionOr<void> step_down(WebIDL::Long n = 1);
+
+    enum class StepDirection : u8 {
+        Up,
+        Down,
+    };
+    enum class CommitChange : u8 {
+        No,
+        Yes,
+    };
+    void step_for_user_interaction(StepDirection, CommitChange);
 
     WebIDL::ExceptionOr<void> show_picker();
 
@@ -260,7 +300,7 @@ public:
 
     // ^FormAssociatedTextControlElement
     virtual HTMLElement& text_control_to_html_element() override { return *this; }
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) override;
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value) override;
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() override { return m_text_node; }
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() override { return m_inner_text_element; }
 
@@ -280,6 +320,7 @@ public:
 
     virtual bool is_mutable() const override;
     virtual bool uses_button_layout() const override;
+    virtual bool is_devolvable_widget() const override;
     bool is_allowed_to_be_readonly() const;
 
 private:
@@ -290,6 +331,7 @@ private:
     void update_radio_button_group_registration();
     virtual void computed_properties_changed() override;
     virtual void prepare_for_style_computation() override { create_shadow_tree_if_needed(); }
+    virtual bool needs_preparation_for_style_computation() const override { return true; }
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
@@ -314,7 +356,6 @@ private:
     // ^Layout::ImageProvider
     virtual bool is_image_pending() const override;
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override { return image_data(); }
-    virtual Layout::Node const* image_provider_layout_node() const override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
 
@@ -322,7 +363,7 @@ private:
     Optional<double> convert_string_to_number(Utf16View input) const;
     Utf16String convert_number_to_string(double input) const;
 
-    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(StringView input) const;
+    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(Utf16View input) const;
     WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(Utf16String const& input) const;
     Utf16String convert_date_to_string(double input) const;
 
@@ -332,7 +373,15 @@ private:
     double step_scale_factor() const;
     Optional<double> allowed_value_step() const;
     double step_base() const;
-    WebIDL::ExceptionOr<void> step_up_or_down(bool is_down, WebIDL::Long n);
+    enum class StepTrigger : u8 {
+        Script,
+        UserInteraction,
+    };
+    enum class StepResult : u8 {
+        NotStepped,
+        Stepped,
+    };
+    WebIDL::ExceptionOr<StepResult> step_up_or_down(bool is_down, WebIDL::Long n, StepTrigger = StepTrigger::Script);
 
     static TypeAttributeState parse_type_attribute(Utf16View);
 
@@ -358,6 +407,14 @@ private:
     // https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
     Utf16String value_sanitization_algorithm(Utf16View) const;
 
+    enum class ColorSpaceState : u8 {
+        LimitedSRGB,
+        DisplayP3,
+    };
+    ColorSpaceState color_space_state() const;
+    Utf16String update_a_color_well_control_color(Utf16View element_value) const;
+    Utf16String serialize_a_color_well_control_color(CSS::StyleValue const&) const;
+
     enum class ValueAttributeMode {
         Value,
         Default,
@@ -367,13 +424,37 @@ private:
     static ValueAttributeMode value_attribute_mode_for_type_state(TypeAttributeState);
     ValueAttributeMode value_attribute_mode() const;
 
-    void update_placeholder_visibility();
+    void update_text_input_decorations();
     GC::Ptr<DOM::Element> m_placeholder_element;
+    GC::Ptr<DOM::Element> m_search_clear_button;
     GC::Ptr<DOM::Text> m_placeholder_text_node;
 
     void update_button_input_shadow_tree();
 
     void update_text_input_shadow_tree();
+
+    void create_date_time_fields();
+    void update_date_time_fields();
+    void update_date_time_field_elements();
+    void set_active_date_time_field(size_t index);
+    void date_time_fields_did_change();
+    void commit_date_time_value(Utf16String new_value);
+    bool date_time_fields_want_seconds() const;
+    bool date_time_fields_use_12_hour_clock() const;
+    bool date_time_fields_describe_bad_input() const;
+    Optional<DateTimeField const&> date_time_field(DateTimeField::Kind) const;
+    Optional<i32> date_time_field_value(DateTimeField::Kind) const;
+    i32 date_time_field_minimum(DateTimeField::Kind) const;
+    i32 date_time_field_maximum(DateTimeField::Kind) const;
+
+    GC::Ptr<DOM::Element> m_date_time_fields_container;
+    Vector<DateTimeField> m_date_time_fields;
+    Vector<Utf16String> m_day_period_names;
+    Optional<Utf16String> m_date_time_fields_value;
+    size_t m_active_date_time_field { 0 };
+    u8 m_date_time_field_typed_digits { 0 };
+    bool m_date_time_fields_show_seconds { false };
+
     GC::Ptr<DOM::Element> m_inner_text_element;
     GC::Ptr<DOM::Text> m_text_node;
     GC::Ptr<DOM::Text> m_image_button_alt_text_node;
@@ -389,9 +470,17 @@ private:
     GC::Ptr<DOM::Element> m_file_label;
 
     void update_slider_shadow_tree_elements();
+    void update_slider_ticks();
     GC::Ptr<DOM::Element> m_slider_runnable_track;
     GC::Ptr<DOM::Element> m_slider_progress_element;
+    GC::Ptr<DOM::Element> m_slider_thumb_container;
     GC::Ptr<DOM::Element> m_slider_thumb;
+    GC::Ptr<DOM::Element> m_slider_ticks_element;
+    Vector<double> m_slider_tick_positions;
+    void set_slider_value_from_position(CSSPixelPoint viewport_position);
+    void end_slider_drag();
+    GC::Ptr<DOM::IDLEventListener> m_slider_drag_mousemove_listener;
+    GC::Ptr<DOM::IDLEventListener> m_slider_drag_mouseup_listener;
 
     GC::Ptr<DecodedImageData> image_data() const;
     GC::Ptr<SharedResourceRequest> m_resource_request;

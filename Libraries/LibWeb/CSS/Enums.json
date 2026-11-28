@@ -10,6 +10,7 @@
     "xxx-large"
   ],
   "align-content": [
+    "baseline",
     "normal",
     "start",
     "flex-start",
@@ -48,7 +49,8 @@
     "self-start",
     "start",
     "stretch",
-    "unsafe"
+    "unsafe",
+    "anchor-center"
   ],
   "anchor-side": [
     "inside",
@@ -140,6 +142,11 @@
     "mathematical",
     "hanging",
     "text-top"
+  ],
+  "baseline-source": [
+    "auto",
+    "first",
+    "last"
   ],
   "border-collapse": [
     "separate",
@@ -521,6 +528,7 @@
     "table",
     "flex",
     "grid",
+    "grid-lanes",
     "ruby",
     "math",
     "-webkit-box"
@@ -544,6 +552,7 @@
     "inline-table",
     "inline-flex",
     "inline-grid",
+    "inline-grid-lanes",
     "-webkit-flex",
     "-webkit-inline-box",
     "-webkit-inline-flex"
@@ -575,6 +584,10 @@
   "empty-cells": [
     "show",
     "hide"
+  ],
+  "field-sizing": [
+    "fixed",
+    "content"
   ],
   "fill-rule": [
     "nonzero",
@@ -613,6 +626,13 @@
   "font-optical-sizing": [
     "auto",
     "none"
+  ],
+  "font-size-adjust-metric": [
+    "ex-height",
+    "cap-height",
+    "ch-width",
+    "ic-width",
+    "ic-height"
   ],
   "font-smoothing": [
     "auto",
@@ -672,6 +692,11 @@
     "extra-expanded",
     "ultra-expanded"
   ],
+  "forced-color-adjust": [
+    "auto",
+    "none",
+    "preserve-parent-color"
+  ],
   "generic-font-family": [
     "serif",
     "sans-serif",
@@ -695,6 +720,11 @@
     "increasing",
     "decreasing"
   ],
+  "hyphens": [
+    "none",
+    "manual",
+    "auto"
+  ],
   "image-rendering": [
     "auto",
     "crisp-edges",
@@ -703,6 +733,10 @@
     "smooth",
     "optimizespeed",
     "optimizequality"
+  ],
+  "interpolate-size": [
+    "numeric-only",
+    "allow-keywords"
   ],
   "isolation": [
     "auto",
@@ -754,7 +788,15 @@
     "stretch",
     "unsafe",
     "left",
-    "right"
+    "right",
+    "anchor-center"
+  ],
+  "line-break": [
+    "anywhere",
+    "auto",
+    "loose",
+    "normal",
+    "strict"
   ],
   "line-style": [
     "none",
@@ -857,6 +899,12 @@
     "break-word",
     "anywhere"
   ],
+  "overscroll-behavior": [
+    "auto",
+    "chain",
+    "contain",
+    "none"
+  ],
   "page-size": [
     "a5",
     "a4",
@@ -876,6 +924,14 @@
   ],
   "pointer-events": [
     "auto",
+    "bounding-box",
+    "visiblepainted",
+    "visiblefill",
+    "visiblestroke",
+    "visible",
+    "painted",
+    "fill",
+    "stroke",
     "all",
     "none"
   ],
@@ -1095,10 +1151,19 @@
     "left",
     "right",
     "match-parent",
-    "-libweb-center",
+    "-webkit-center",
     "-libweb-inherit-or-center",
-    "-libweb-left",
-    "-libweb-right"
+    "-webkit-left",
+    "-webkit-right"
+  ],
+  "text-align-last": [
+    "auto",
+    "start",
+    "end",
+    "left",
+    "right",
+    "center",
+    "justify"
   ],
   "text-anchor": [
     "start",
@@ -1132,6 +1197,11 @@
     "inter-word",
     "inter-character"
   ],
+  "text-orientation": [
+    "mixed",
+    "upright",
+    "sideways"
+  ],
   "text-overflow": [
     "clip",
     "ellipsis"
@@ -1141,6 +1211,12 @@
     "optimizespeed",
     "optimizelegibility",
     "geometricprecision"
+  ],
+  "text-security": [
+    "none",
+    "disc",
+    "circle",
+    "square"
   ],
   "text-transform": [
     "capitalize",
@@ -1207,7 +1283,9 @@
   "try-tactic": [
     "flip-block",
     "flip-inline",
-    "flip-start"
+    "flip-start",
+    "flip-x",
+    "flip-y"
   ],
   "unicode-bidi": [
     "bidi-override",
@@ -1236,16 +1314,30 @@
     "super",
     "text-bottom",
     "text-top",
-    "top"
+    "top",
+    "-libweb-baseline-middle"
   ],
   "visibility": [
     "collapse",
     "hidden",
     "visible"
   ],
+  "webkit-box-align": [
+    "stretch",
+    "start",
+    "end",
+    "center",
+    "baseline"
+  ],
   "webkit-box-orient": [
     "horizontal",
     "vertical"
+  ],
+  "webkit-box-pack": [
+    "start",
+    "end",
+    "center",
+    "justify"
   ],
   "white-space": [
     "normal",
@@ -1255,7 +1347,6 @@
   ],
   "white-space-collapse": [
     "collapse",
-    "discard",
     "preserve",
     "preserve-breaks",
     "preserve-spaces",

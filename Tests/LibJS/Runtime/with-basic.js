@@ -82,9 +82,108 @@ test("var initializer keeps the resolved with binding through initializer side e
     expect(test262id).toBeUndefined();
 });
 
+test("for-in var initializer keeps the resolved with binding through initializer side effects", () => {
+    const object = { forInId: 1 };
+
+    with (object) {
+        for (var forInId = (delete object.forInId) in {});
+    }
+
+    expect(object.forInId).toBe(true);
+    expect(forInId).toBeUndefined();
+});
+
+test("var patterns resolve their names before getting their values", () => {
+    const object = { forOfId: 1 };
+    var forOfId = "var";
+
+    with (object) {
+        for (var { forOfId = (delete object.forOfId, 2) } of [{}]);
+    }
+
+    expect(object.forOfId).toBe(2);
+    expect(forOfId).toBe("var");
+
+    const other = { evalId: 1 };
+    var evalId = "var";
+
+    with (other) {
+        eval("var [evalId = (delete other.evalId, 2)] = [];");
+    }
+
+    expect(other.evalId).toBe(2);
+    expect(evalId).toBe("var");
+
+    const added = {};
+    var forOfAddedId = "var";
+
+    with (added) {
+        for (var { forOfAddedId = ((added.forOfAddedId = 1), 2) } of [{}]);
+    }
+
+    expect(added.forOfAddedId).toBe(1);
+    expect(forOfAddedId).toBe(2);
+
+    const addedByEval = {};
+    var evalAddedId = "var";
+
+    with (addedByEval) {
+        eval("var [evalAddedId = ((addedByEval.evalAddedId = 1), 2)] = [];");
+    }
+
+    expect(addedByEval.evalAddedId).toBe(1);
+    expect(evalAddedId).toBe(2);
+});
+
+test("var without an initializer does not resolve its name", () => {
+    const names = [];
+    const object = new Proxy(
+        {},
+        {
+            has(target, name) {
+                names.push(name);
+                return false;
+            },
+        }
+    );
+
+    with (object) {
+        var noInitializerId;
+        for (var noInitializerLoopId; false; );
+    }
+
+    expect(names).toEqual([]);
+});
+
 test("with statement updates empty abrupt completions to undefined", () => {
     expect(eval("1; do { 2; with ({}) { 3; break; } 4; } while (false);")).toBe(3);
     expect(eval("5; do { 6; with ({}) { break; } 7; } while (false);")).toBeUndefined();
     expect(eval("8; do { 9; with ({}) { 10; continue; } 11; } while (false);")).toBe(10);
     expect(eval("12; do { 13; with ({}) { continue; } 14; } while (false);")).toBeUndefined();
+});
+
+test("a call of a function named async gets the object of the with statement as this value", () => {
+    const object = {
+        async() {
+            return this === object;
+        },
+        other() {
+            return this === object;
+        },
+    };
+    with (object) {
+        const result = async();
+        expect(result).toBeTrue();
+        expect([async(), other(), async(...[]), async(1, 2)]).toEqual([true, true, true, true]);
+        expect((() => async())()).toBeTrue();
+        expect(eval("async()")).toBeTrue();
+    }
+
+    function async() {
+        "use strict";
+        return this;
+    }
+    expect(async()).toBeUndefined();
+    const arrow = async () => 1;
+    expect(arrow()).toBeInstanceOf(Promise);
 });

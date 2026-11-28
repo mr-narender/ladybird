@@ -64,15 +64,57 @@ Optional<LocaleData&> LocaleData::for_locale(StringView locale)
     return {};
 }
 
+Optional<LocaleData&> LocaleData::for_locale(Utf16View const& locale)
+{
+    if (!locale.is_ascii())
+        return {};
+    if (locale.has_ascii_storage() || locale.has_latin1_storage())
+        return for_locale(locale.ascii_bytes());
+    return for_locale(MUST(locale.to_utf8()));
+}
+
+LocaleData& LocaleData::for_locale_or_default(Utf16View const& locale)
+{
+    auto locale_data = for_locale(locale);
+    if (!locale_data.has_value())
+        locale_data = for_locale(default_locale());
+    VERIFY(locale_data.has_value());
+    return *locale_data;
+}
+
 LocaleData::LocaleData(icu::Locale locale)
     : m_locale(move(locale))
 {
 }
 
-Utf16String LocaleData::canonicalize(StringView locale)
+icu::UnicodeString const& LocaleData::quotation_mark(ULocaleDataDelimiterType mark)
+{
+    if (!m_quotation_marks.has_value()) {
+        m_quotation_marks.emplace();
+        UErrorCode status = U_ZERO_ERROR;
+        icu::LocalULocaleDataPointer data { ulocdata_open(m_locale.getName(), &status) };
+        if (icu_success(status) && status != U_USING_DEFAULT_WARNING) {
+            for (size_t i = 0; i < m_quotation_marks->size(); ++i) {
+                status = U_ZERO_ERROR;
+                auto delimiter = static_cast<ULocaleDataDelimiterType>(i);
+                auto length = ulocdata_getDelimiter(data.getAlias(), delimiter, nullptr, 0, &status);
+                if ((icu_failure(status) && status != U_BUFFER_OVERFLOW_ERROR) || length <= 0)
+                    continue;
+                auto& string = (*m_quotation_marks)[i];
+                status = U_ZERO_ERROR;
+                ulocdata_getDelimiter(data.getAlias(), delimiter, string.getBuffer(length), length, &status);
+                string.releaseBuffer(icu_success(status) ? length : 0);
+            }
+        }
+    }
+    return (*m_quotation_marks)[mark];
+}
+
+Optional<Utf16String> LocaleData::canonicalize(StringView locale)
 {
     auto locale_data = LocaleData::for_locale(locale);
-    VERIFY(locale_data.has_value());
+    if (!locale_data.has_value())
+        return {};
 
     if (locale_data->m_canonical_locale_string.has_value())
         return *locale_data->m_canonical_locale_string;
@@ -107,10 +149,12 @@ Utf16String LocaleData::canonicalize(StringView locale)
     // NB: Canonicalize a copy so the cached locale retains its original form.
     auto canonical_locale = locale_data->locale();
     canonical_locale.canonicalize(status);
-    verify_icu_success(status);
+    if (icu_failure(status))
+        return {};
 
     auto result = canonical_locale.toLanguageTag<StringBuilder>(status);
-    verify_icu_success(status);
+    if (icu_failure(status))
+        return {};
 
     if (keywords_with_yes.is_empty()) {
         locale_data->m_canonical_locale_string = Utf16String::from_ascii_without_validation(result.string_view().bytes());
@@ -164,15 +208,25 @@ icu::NumberingSystem& LocaleData::numbering_system()
     return *m_numbering_system;
 }
 
-icu::DateTimePatternGenerator& LocaleData::date_time_pattern_generator()
+Optional<icu::DateTimePatternGenerator&> LocaleData::date_time_pattern_generator()
 {
     if (!m_date_time_pattern_generator) {
         UErrorCode status = U_ZERO_ERROR;
+        m_date_time_pattern_generator = adopt_own_if_nonnull(icu::DateTimePatternGenerator::createInstance(locale(), status));
 
-        m_date_time_pattern_generator = adopt_own(*icu::DateTimePatternGenerator::createInstance(locale(), status));
-        verify_icu_success(status);
+        if (!m_date_time_pattern_generator) {
+            status = U_ZERO_ERROR;
+
+            auto locale_without_numbering_system = locale();
+            locale_without_numbering_system.setUnicodeKeywordValue("nu", {}, status);
+
+            if (icu_success(status))
+                m_date_time_pattern_generator = adopt_own_if_nonnull(icu::DateTimePatternGenerator::createInstance(locale_without_numbering_system, status));
+        }
     }
 
+    if (!m_date_time_pattern_generator)
+        return {};
     return *m_date_time_pattern_generator;
 }
 

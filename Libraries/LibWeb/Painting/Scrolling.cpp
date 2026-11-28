@@ -5,13 +5,11 @@
  */
 
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
-#include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/EventNames.h>
-#include <LibWeb/HTML/HTMLBodyElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
@@ -22,33 +20,40 @@
 
 namespace Web::Painting {
 
+static Web::AsyncScrollNodeKind async_scroll_node_kind_for(Compositing::CompositorScrollNodeKind kind)
+{
+    switch (kind) {
+    case Compositing::CompositorScrollNodeKind::Viewport:
+        return Web::AsyncScrollNodeKind::Viewport;
+    case Compositing::CompositorScrollNodeKind::Element:
+        return Web::AsyncScrollNodeKind::Element;
+    case Compositing::CompositorScrollNodeKind::PseudoElement:
+        return Web::AsyncScrollNodeKind::PseudoElement;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 CSSPixelPoint scroll_offset(Layout::Node const& node)
 {
     if (!has_committed_box(node))
         return {};
-
-    if (node.is_viewport()) {
-        auto navigable = node.document().navigable();
-        VERIFY(navigable);
-        return navigable->viewport_scroll_offset();
-    }
-
-    if (auto pseudo_element = node.generated_for_pseudo_element(); pseudo_element.has_value())
-        return node.pseudo_element_generator()->scroll_offset(*pseudo_element);
-
-    if (auto const* element = as_if<DOM::Element>(node.dom_node()))
-        return element->scroll_offset({});
-    return {};
+    CSSPixelPoint offset;
+    Layout::RustFFI::render_state_row_scroll_offset(node.document_host(), committed_row_slot(node), &offset);
+    return offset;
 }
 
 CSSPixelPoint minimum_scroll_offset(Layout::Node const& node)
 {
-    return Layout::RustFFI::layout_arena_paintable_minimum_scroll_offset(node.arena_handle(), committed_row_slot(node));
+    CSSPixelPoint offset;
+    Layout::RustFFI::layout_row_paintable_minimum_scroll_offset(node.document_host(), committed_row_slot(node), &offset);
+    return offset;
 }
 
 CSSPixelPoint maximum_scroll_offset(Layout::Node const& node)
 {
-    return Layout::RustFFI::layout_arena_paintable_maximum_scroll_offset(node.arena_handle(), committed_row_slot(node));
+    CSSPixelPoint offset;
+    Layout::RustFFI::layout_row_paintable_maximum_scroll_offset(node.document_host(), committed_row_slot(node), &offset);
+    return offset;
 }
 
 CSSPixelPoint clamp_scroll_offset(Layout::Node const& node, CSSPixelPoint offset)
@@ -75,57 +80,15 @@ CSSPixelRect scroll_snapport_rect(Layout::Node const& node, CSSPixelRect scrollp
 {
     if (!has_committed_box(node))
         return scrollport;
-    return Layout::RustFFI::layout_arena_scroll_snapport_rect(node.arena_handle(), committed_row_slot(node), scrollport);
-}
-
-ViewportWheelOverflow overflow_values_applied_to_viewport_for_wheel_scrolling(DOM::Document const& document)
-{
-    auto has_containment = [](CSS::ComputedValues::BoxValues const& style) {
-        return style.size_containment || style.inline_size_containment || style.layout_containment || style.style_containment || style.paint_containment;
-    };
-
-    auto* root_element = document.document_element();
-    auto const* root_style = root_element ? root_element->style_group<CSS::ComputedValues::BoxValues>() : nullptr;
-    if (!root_style)
-        return {};
-
-    auto const* overflow_origin = root_style;
-    if (root_element->is_html_html_element() && !has_containment(*root_style)) {
-        auto root_overflow_x = static_cast<CSS::Overflow>(root_style->overflow_x);
-        auto root_overflow_y = static_cast<CSS::Overflow>(root_style->overflow_y);
-        if (root_overflow_x == CSS::Overflow::Visible && root_overflow_y == CSS::Overflow::Visible) {
-            auto* body_element = root_element->first_child_of_type<HTML::HTMLBodyElement>();
-            auto const* body_style = body_element ? body_element->style_group<CSS::ComputedValues::BoxValues>() : nullptr;
-            if (body_style && !has_containment(*body_style))
-                overflow_origin = body_style;
-        }
-    }
-
-    auto applied = [](CSS::Overflow overflow) {
-        if (overflow == CSS::Overflow::Visible)
-            return CSS::Overflow::Auto;
-        if (overflow == CSS::Overflow::Clip)
-            return CSS::Overflow::Hidden;
-        return overflow;
-    };
-    return {
-        applied(static_cast<CSS::Overflow>(overflow_origin->overflow_x)),
-        applied(static_cast<CSS::Overflow>(overflow_origin->overflow_y)),
-    };
+    CSSPixelRect rect;
+    Layout::RustFFI::layout_row_scroll_snapport_rect(node.document_host(), committed_row_slot(node), scrollport, &rect);
+    return rect;
 }
 
 WheelScrollableAxes wheel_scrollable_axes(Layout::Node const& node)
 {
-    auto overflow = overflow_values_applied_to_viewport_for_wheel_scrolling(node.document());
-    auto axes = Layout::RustFFI::layout_arena_paintable_wheel_scrollable_axes(
-        node.arena_handle(), committed_row_slot(node), to_underlying(overflow.x), to_underlying(overflow.y));
+    auto axes = Layout::RustFFI::layout_row_paintable_wheel_scrollable_axes(node.document_host(), committed_row_slot(node));
     return { axes.horizontal, axes.vertical };
-}
-
-bool could_be_scrolled_by_wheel_event(Layout::Node const& node, ScrollDirection direction)
-{
-    auto axes = wheel_scrollable_axes(node);
-    return direction == ScrollDirection::Horizontal ? axes.horizontal : axes.vertical;
 }
 
 bool could_be_scrolled_by_wheel_event(Layout::Node const& node)
@@ -134,14 +97,7 @@ bool could_be_scrolled_by_wheel_event(Layout::Node const& node)
     return axes.horizontal || axes.vertical;
 }
 
-static GC::Ptr<DOM::EventTarget> scroll_event_target(Layout::Node& node)
-{
-    if (node.generated_for_pseudo_element().has_value())
-        return node.pseudo_element_generator();
-    return node.dom_node();
-}
-
-ScrollHandled set_scroll_offset(Layout::Node& node, CSSPixelPoint offset)
+ScrollHandled set_scroll_offset(Layout::Node& node, CSSPixelPoint offset, CompositorScrollRequest compositor_scroll_request)
 {
     if (!has_committed_box(node))
         return ScrollHandled::No;
@@ -154,61 +110,22 @@ ScrollHandled set_scroll_offset(Layout::Node& node, CSSPixelPoint offset)
     if (scroll_offset(node) == offset)
         return ScrollHandled::No;
 
-    if (node.is_viewport()) {
-        auto navigable = node.document().navigable();
-        VERIFY(navigable);
-        navigable->perform_scroll_of_viewport_scrolling_box(offset);
-        return ScrollHandled::Yes;
-    }
-
-    if (auto pseudo_element = node.generated_for_pseudo_element(); pseudo_element.has_value()) {
-        node.pseudo_element_generator()->set_scroll_offset(*pseudo_element, offset);
-    } else if (auto* element = as_if<DOM::Element>(node.dom_node())) {
-        element->set_scroll_offset({}, offset);
-    } else {
+    auto navigable = node.document().navigable();
+    auto stable_node_id = async_scroll_node_stable_id(node);
+    if (!navigable || !stable_node_id.has_value())
         return ScrollHandled::No;
-    }
-
-    // https://drafts.csswg.org/cssom-view-1/#scrolling-events
-    // Whenever an element gets scrolled (whether in response to user interaction or by an API),
-    // the user agent must run these steps:
-
-    // 1. Let doc be the element’s node document.
-    auto& document = node.document();
-
-    // FIXME: 2. If the element is a snap container, run the steps to update snapchanging targets for the element with
-    //           the element’s eventual snap target in the block axis as newBlockTarget and the element’s eventual snap
-    //           target in the inline axis as newInlineTarget.
-
-    auto event_target = scroll_event_target(node);
-    if (!event_target)
-        return ScrollHandled::Yes;
-
-    // 3. If (element, "scroll") is already in doc’s pending scroll events, abort these steps.
-    // 4. Append (element, "scroll") to doc’s pending scroll events.
-    if (!document.append_pending_scroll_event({ *event_target, HTML::EventNames::scroll }))
-        return ScrollHandled::Yes;
-
-    set_needs_repaint(node, InvalidateDisplayList::No);
-    return ScrollHandled::Yes;
-}
-
-ScrollHandled scroll_by(Layout::Node& node, double delta_x, double delta_y, ScrollKind scroll_kind)
-{
-    if (!has_committed_box(node))
-        return ScrollHandled::No;
-    // A scroll by nothing is not user input: it neither takes over a scroll in flight nor keeps a gesture going.
-    if (delta_x == 0 && delta_y == 0)
-        return ScrollHandled::No;
-    return set_scroll_offset_from_user_input(node, scroll_offset(node).translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y)), scroll_kind);
+    return navigable->store_scroll_offset(*stable_node_id, offset, compositor_scroll_request) ? ScrollHandled::Yes : ScrollHandled::No;
 }
 
 static Optional<Compositing::CompositorScrollNodeKind> scroll_node_kind_for(Layout::Node const& node)
 {
     if (node.is_viewport())
         return Compositing::CompositorScrollNodeKind::Viewport;
-    if (node.generated_for_pseudo_element().has_value())
+    if (node.generated_for_pseudo_element().has_value()) {
+        if (!node.pseudo_element_generator())
+            return {};
         return Compositing::CompositorScrollNodeKind::PseudoElement;
+    }
     if (node.dom_node() && is<DOM::Element>(*node.dom_node()))
         return Compositing::CompositorScrollNodeKind::Element;
     return {};
@@ -239,160 +156,59 @@ Optional<Web::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node 
 
     return Web::AsyncScrollNodeStableID {
         .node_id = scrollable_node_id_for(node),
-        .kind = Compositing::async_scroll_node_kind_for(*scroll_node_kind),
+        .kind = async_scroll_node_kind_for(*scroll_node_kind),
         .pseudo_element_type = pseudo_element_type_for(node),
     };
 }
 
-ScrollHandled set_scroll_offset_from_user_input(Layout::Node& node, CSSPixelPoint offset, ScrollKind scroll_kind)
+ScrollHandled scroll_by(Layout::Node& node, double delta_x, double delta_y)
 {
     if (!has_committed_box(node))
         return ScrollHandled::No;
-
+    // A scroll by nothing is not user input: it neither takes over a scroll in flight nor keeps a gesture going.
+    if (delta_x == 0 && delta_y == 0)
+        return ScrollHandled::No;
     auto navigable = node.document().navigable();
     auto stable_node_id = async_scroll_node_stable_id(node);
+    if (!navigable || !stable_node_id.has_value())
+        return ScrollHandled::No;
 
     auto scroll_offset_before_scroll = scroll_offset(node);
-
-    if (navigable && stable_node_id.has_value())
-        navigable->abort_in_flight_smooth_scrolls_taken_over_by_user_input(*stable_node_id, scroll_offset_before_scroll);
-
-    auto scroll_handled = set_scroll_offset(node, offset);
-    if (scroll_handled == ScrollHandled::Yes && scroll_kind == ScrollKind::Relative)
-        node.document().scroll_state_query_containers().did_scroll_relatively(node, scroll_offset(node) - scroll_offset_before_scroll);
-    if (!navigable)
-        return scroll_handled;
-
-    if (scroll_handled == ScrollHandled::Yes) {
-        if (auto event_target = scroll_event_target(node))
-            navigable->queue_scrollend_event_after_user_scroll(*event_target, stable_node_id, scroll_offset_before_scroll);
-    } else {
+    navigable->abort_in_flight_smooth_scrolls_taken_over_by_user_input(*stable_node_id, scroll_offset_before_scroll);
+    auto offset = scroll_offset_before_scroll.translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y));
+    if (set_scroll_offset(node, offset, CompositorScrollRequest::UserInputJump) == ScrollHandled::No) {
         // User input keeps the scroll gesture in progress even when it does not move the scrolling box.
-        navigable->defer_user_scroll_settlement();
+        navigable->extend_user_scroll_gesture_of(*stable_node_id);
+        return ScrollHandled::No;
     }
-    return scroll_handled;
-}
-
-struct ViewportWheelOverflowValues {
-    u8 x;
-    u8 y;
-};
-
-static ViewportWheelOverflowValues viewport_wheel_overflow(DOM::Document const& document)
-{
-    auto overflow = overflow_values_applied_to_viewport_for_wheel_scrolling(document);
-    return { .x = to_underlying(overflow.x), .y = to_underlying(overflow.y) };
-}
-
-static CSSPixelPoint scroll_offset_of_layout_node_shell(void* layout_node_shell)
-{
-    return scroll_offset(*static_cast<Layout::Node const*>(layout_node_shell));
-}
-
-Layout::Node* wheel_scroll_along_containing_block_chain(Layout::Node& node, double wheel_delta_x, double wheel_delta_y, ScrollKind scroll_kind)
-{
-    struct WheelScrollableBox {
-        Layout::Node* node;
-        double accepted_delta_x;
-        double accepted_delta_y;
-    };
-    Vector<WheelScrollableBox, 4> wheel_scrollable_boxes;
-    auto overflow = viewport_wheel_overflow(node.document());
-    Layout::RustFFI::layout_arena_for_each_wheel_scrollable_box_in_containing_block_chain(
-        node.arena_handle(), committed_row_slot(node), wheel_delta_x, wheel_delta_y, overflow.x, overflow.y, scroll_offset_of_layout_node_shell,
-        &wheel_scrollable_boxes, [](void* context, void* layout_node_shell, double accepted_delta_x, double accepted_delta_y) {
-            static_cast<Vector<WheelScrollableBox, 4>*>(context)->append({ static_cast<Layout::Node*>(layout_node_shell), accepted_delta_x, accepted_delta_y });
-        });
-    for (auto const& wheel_scrollable_box : wheel_scrollable_boxes) {
-        if (scroll_by(*wheel_scrollable_box.node, wheel_scrollable_box.accepted_delta_x, wheel_scrollable_box.accepted_delta_y, scroll_kind) == ScrollHandled::Yes)
-            return wheel_scrollable_box.node;
-    }
-    return nullptr;
-}
-
-Layout::Node* scrolling_box_for_scroll_step_in_containing_block_chain(Layout::Node& target, CSSPixelPoint delta)
-{
-    auto overflow = viewport_wheel_overflow(target.document());
-    return static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_scrolling_box_for_scroll_step(
-        target.arena_handle(), committed_row_slot(target), viewport_row_slot(target.document()), delta, overflow.x, overflow.y, scroll_offset_of_layout_node_shell));
+    node.document().scroll_state_query_containers().did_scroll_relatively(node, scroll_offset(node) - scroll_offset_before_scroll);
+    navigable->note_user_scroll_gesture_of(*stable_node_id, scroll_offset_before_scroll, HTML::LocalNavigable::UserScrollMovedBox::Yes);
+    return ScrollHandled::Yes;
 }
 
 Layout::Node* first_wheel_scrollable_box_in_containing_block_chain(Layout::Node const& node)
 {
-    auto overflow = viewport_wheel_overflow(node.document());
-    return static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_first_wheel_scrollable_box_in_containing_block_chain(
-        node.arena_handle(), committed_row_slot(node), overflow.x, overflow.y));
+    auto const& read = node.held_read();
+    return node.node_arena().node_if_live(read, Layout::RustFFI::render_state_first_wheel_scrollable_box_in_containing_block_chain(node.document_host(), committed_row_slot(node)));
 }
 
-static void scroll_into_view(Layout::Node& node, CSSPixelRect rect)
+Layout::Node* box_ending_scroll_chain(Layout::Node const& node, double delta_x, double delta_y)
 {
-    if (!has_committed_box(node))
-        return;
-
-    auto snapport = scroll_snapport_rect(node);
-    auto current_offset = scroll_offset(node);
-
-    // Both rect and snapport are in layout coordinate space (not scroll-adjusted).
-    auto content_rect = rect.translated(-snapport.x(), -snapport.y());
-    auto new_offset = current_offset;
-
-    if (content_rect.right() > current_offset.x() + snapport.width())
-        new_offset.set_x(content_rect.right() - snapport.width());
-    else if (content_rect.left() < current_offset.x())
-        new_offset.set_x(content_rect.left());
-
-    if (content_rect.bottom() > current_offset.y() + snapport.height())
-        new_offset.set_y(content_rect.bottom() - snapport.height());
-    else if (content_rect.top() < current_offset.y())
-        new_offset.set_y(content_rect.top());
-
-    set_scroll_offset(node, new_offset);
+    auto const& read = node.held_read();
+    return node.node_arena().node_if_live(read, Layout::RustFFI::render_state_box_ending_scroll_chain(node.document_host(), committed_row_slot(node), delta_x, delta_y));
 }
 
-void scroll_text_offset_into_view(DOM::Text const& text, size_t offset, TextAffinity affinity, ScrollBlockDirection scroll_block_direction)
+void scroll_text_offset_into_view(Layout::BegunRead const& read, DOM::Text const& text, size_t offset, TextAffinity affinity, ScrollBlockDirection scroll_block_direction)
 {
-    auto const* layout_node = text.unsafe_layout_node();
+    auto const* layout_node = text.unsafe_layout_node(read);
     if (!layout_node)
         return;
-    auto result = Layout::RustFFI::layout_arena_text_caret_rect_for_position(
-        layout_node->arena_handle(), Layout::Node::slot_id(layout_node), offset,
-        affinity == TextAffinity::Downstream);
-    if (!result.found)
-        return;
-    auto const* style_source_pointer = static_cast<Layout::NodeWithStyle const*>(result.style_source);
-    if (!style_source_pointer)
-        return;
-    auto const& style_source = *style_source_pointer;
-
-    auto cursor_rect = result.rect;
-    if (style_source.writing_mode() == CSS::WritingMode::HorizontalTb) {
-        if (style_source.inline_axis_is_reverse())
-            cursor_rect.set_x(cursor_rect.x() - 1);
-        cursor_rect.set_width(1);
-    } else {
-        if (style_source.inline_axis_is_reverse())
-            cursor_rect.set_y(cursor_rect.y() - 1);
-        cursor_rect.set_height(1);
-    }
-    auto* owner = layout_node_for_committed_slot(layout_node->node_arena(), result.owner_paintable);
-    for (auto* ancestor = owner; ancestor;) {
-        if (Painting::has_scrollable_overflow(*ancestor)) {
-            if (scroll_block_direction == ScrollBlockDirection::No) {
-                auto snapport = scroll_snapport_rect(*ancestor);
-                if (style_source.writing_mode() == CSS::WritingMode::HorizontalTb) {
-                    cursor_rect.set_y(snapport.y() + scroll_offset(*ancestor).y());
-                    cursor_rect.set_height(snapport.height());
-                } else {
-                    cursor_rect.set_x(snapport.x() + scroll_offset(*ancestor).x());
-                    cursor_rect.set_width(snapport.width());
-                }
-            }
-            scroll_into_view(*ancestor, cursor_rect);
-            return;
-        }
-        auto* containing_block_box = ancestor->containing_block();
-        ancestor = containing_block_box && has_committed_box(*containing_block_box) ? containing_block_box : nullptr;
-    }
+    CSSPixelPoint scroll_offset;
+    auto container = Layout::RustFFI::render_state_scroll_target_for_text_position(
+        layout_node->document_host(), Layout::Node::slot_id(layout_node), offset,
+        affinity == TextAffinity::Downstream, scroll_block_direction == ScrollBlockDirection::Yes, &scroll_offset);
+    if (auto* scroll_container = layout_node_for_committed_slot(read, layout_node->node_arena(), container))
+        set_scroll_offset(*scroll_container, scroll_offset, CompositorScrollRequest::ProgrammaticJump);
 }
 
 }

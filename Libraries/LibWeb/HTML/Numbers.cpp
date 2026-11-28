@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Math.h>
 #include <AK/StringConversions.h>
 #include <AK/Utf16View.h>
 #include <LibWeb/HTML/Numbers.h>
@@ -299,12 +300,17 @@ fraction_exit:
             while (!is_eof(string, position) && is_ascii_digit(code_unit_at(string, position)))
                 ++position;
             auto digits = string.substring_view(start_index, position - start_index);
-            auto optional_value = digits.template to_number<i32>();
-            exponent *= optional_value.value();
+            // NB: Any exponent beyond 1000 makes value overflow to infinity or underflow to zero, so clamp it there.
+            //     This also covers digits that do not fit an i32.
+            auto exponent_magnitude = min(digits.template to_number<i32>().value_or(NumericLimits<i32>::max()), 1000);
+            exponent *= static_cast<i16>(exponent_magnitude);
         }
 
         // 14.6. Multiply value by ten raised to the exponentth power.
-        value *= pow(10, exponent);
+        // NB: A zero value stays zero for any exponent. Skip the multiplication, as zero times an infinite power of
+        //     ten would be NaN.
+        if (value != 0)
+            value *= AK::pow<double>(10, exponent);
     }
 
 conversion:
@@ -322,7 +328,7 @@ conversion:
     double rounded_value = value;
 
     // 17. If rounded-value is 2^1024 or −2^1024, return an error.
-    if (abs(rounded_value) >= pow(2, 1024)) {
+    if (abs(rounded_value) >= AK::pow<double>(2, 1024)) {
         return {};
     }
 
@@ -452,6 +458,21 @@ WebIDL::ExceptionOr<String> convert_non_negative_integer_to_string(WebIDL::Long 
     if (value < 0)
         return WebIDL::IndexSizeError::create("The attribute is limited to only non-negative numbers"_utf16);
     return String::number(value);
+}
+
+extern "C" {
+
+// Called from Bindings/Rust/src/html/numbers.rs.
+bool web_html_parse_floating_point_number(ReadonlyBytes string, double* value);
+}
+
+bool web_html_parse_floating_point_number(ReadonlyBytes string, double* value)
+{
+    auto result = parse_floating_point_number(Utf16String::from_utf8(StringView { string }));
+    if (!result.has_value())
+        return false;
+    *value = *result;
+    return true;
 }
 
 }

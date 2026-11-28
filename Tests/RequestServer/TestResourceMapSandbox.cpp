@@ -22,12 +22,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace RequestServer {
-
-OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
-
-}
-
 // The sandbox refuses to apply without Landlock, so there is nothing to test on such a kernel.
 static bool landlock_is_available()
 {
@@ -75,6 +69,113 @@ TEST_CASE(resource_map_files_are_readable_without_granting_access_to_neighbors)
         VERIFY(errno == EACCES);
         VERIFY(open(mapped_path.characters(), O_WRONLY) == -1);
         VERIFY(errno == EACCES || errno == EPERM);
+        _exit(0);
+    }
+
+    int status = 0;
+    VERIFY(waitpid(child, &status, 0) == child);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(certificate_files_are_readable_without_granting_access_to_neighbors)
+{
+    if (!landlock_is_available())
+        return;
+
+    char directory_template[] = "/tmp/ladybird-certificate-XXXXXX";
+    auto* directory = mkdtemp(directory_template);
+    VERIFY(directory);
+    ScopeGuard cleanup = [&] {
+        MUST(FileSystem::remove(ByteString { directory }, FileSystem::RecursionMode::Allowed));
+    };
+
+    auto certificate_path = ByteString::formatted("{}/certificate.pem", directory);
+    auto key_path = ByteString::formatted("{}/key.pem", directory);
+    auto cache_path = ByteString::formatted("{}/cache", directory);
+    auto write_file = [](ByteString const& path, StringView content) {
+        auto file = MUST(Core::File::open(path, Core::File::OpenMode::Write));
+        MUST(file->write_until_depleted(content.bytes()));
+    };
+    write_file(certificate_path, "certificate"sv);
+    write_file(key_path, "key"sv);
+
+    auto child = fork();
+    VERIFY(child >= 0);
+    if (child == 0) {
+        MUST(RequestServer::apply_sandbox({}, { certificate_path }, cache_path));
+
+        auto certificate_file = MUST(Core::File::open(certificate_path, Core::File::OpenMode::Read));
+        auto contents = MUST(certificate_file->read_until_eof());
+        VERIFY(StringView(contents) == "certificate"sv);
+
+        VERIFY(open(key_path.characters(), O_RDONLY) == -1);
+        VERIFY(errno == EACCES);
+        VERIFY(open(directory, O_RDONLY | O_DIRECTORY) == -1);
+        VERIFY(errno == EACCES);
+        _exit(0);
+    }
+
+    int status = 0;
+    VERIFY(waitpid(child, &status, 0) == child);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST_CASE(certificate_directory_links_are_readable_without_granting_access_to_neighbors)
+{
+    if (!landlock_is_available())
+        return;
+
+    char directory_template[] = "/tmp/ladybird-certificate-directory-XXXXXX";
+    auto* directory = mkdtemp(directory_template);
+    VERIFY(directory);
+    ScopeGuard cleanup = [&] {
+        MUST(FileSystem::remove(ByteString { directory }, FileSystem::RecursionMode::Allowed));
+    };
+
+    // Distributions keep the certificates outside of the directory that OpenSSL searches, which only links to them.
+    auto store_path = ByteString::formatted("{}/store", directory);
+    auto shared_path = ByteString::formatted("{}/shared", directory);
+    auto private_path = ByteString::formatted("{}/private", directory);
+    for (auto const& path : { store_path, shared_path, private_path })
+        VERIFY(mkdir(path.characters(), 0700) == 0);
+
+    auto certificate_path = ByteString::formatted("{}/certificate.pem", shared_path);
+    auto neighbor_path = ByteString::formatted("{}/neighbor.pem", shared_path);
+    auto key_path = ByteString::formatted("{}/key.pem", private_path);
+    auto write_file = [](ByteString const& path, StringView content) {
+        auto file = MUST(Core::File::open(path, Core::File::OpenMode::Write));
+        MUST(file->write_until_depleted(content.bytes()));
+    };
+    write_file(certificate_path, "certificate"sv);
+    write_file(neighbor_path, "neighbor"sv);
+    write_file(key_path, "key"sv);
+
+    auto certificate_link_path = ByteString::formatted("{}/0a1b2c3d.0", store_path);
+    VERIFY(symlink("../shared/certificate.pem", certificate_link_path.characters()) == 0);
+    auto directory_link_path = ByteString::formatted("{}/0a1b2c3d.1", store_path);
+    auto unrelated_link_path = ByteString::formatted("{}/neighbor.pem", store_path);
+    VERIFY(symlink(private_path.characters(), directory_link_path.characters()) == 0);
+    VERIFY(symlink("../shared/neighbor.pem", unrelated_link_path.characters()) == 0);
+
+    auto child = fork();
+    VERIFY(child >= 0);
+    if (child == 0) {
+        // A list may name directories that don't exist or can't be searched, and OpenSSL skips those.
+        VERIFY(setenv("SSL_CERT_DIR", ByteString::formatted("{}/missing:{}/certificate.pem/store:{}", directory, shared_path, store_path).characters(), 1) == 0);
+        MUST(RequestServer::apply_sandbox({}, {}, {}));
+
+        auto certificate_file = MUST(Core::File::open(certificate_link_path, Core::File::OpenMode::Read));
+        auto contents = MUST(certificate_file->read_until_eof());
+        VERIFY(StringView(contents) == "certificate"sv);
+
+        VERIFY(open(neighbor_path.characters(), O_RDONLY) == -1);
+        VERIFY(errno == EACCES);
+        VERIFY(open(ByteString::formatted("{}/key.pem", directory_link_path).characters(), O_RDONLY) == -1);
+        VERIFY(errno == EACCES);
         _exit(0);
     }
 

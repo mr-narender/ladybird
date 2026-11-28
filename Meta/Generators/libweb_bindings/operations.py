@@ -21,6 +21,9 @@ from Generators.libweb_bindings.glue_headers import bindings_glue_header_for_int
 from Generators.libweb_bindings.includes import GeneratedIncludes
 from Generators.libweb_bindings.realms import member_passes_realm_to_implementation
 from Generators.libweb_bindings.realms import member_realm_expr
+from Generators.libweb_bindings.rust_types import is_member_implemented_in_rust
+from Generators.libweb_bindings.rust_types import rust_member_definition_entry_point
+from Generators.libweb_bindings.security_checks import implementation_check
 from Generators.libweb_bindings.security_checks import interface_needs_security_check
 from Generators.libweb_bindings.security_checks import on_the_window
 from Generators.libweb_bindings.security_checks import perform_a_security_check
@@ -178,10 +181,21 @@ def define_the_regular_operations(
     interface: Interface,
     unforgeable: bool = False,
 ) -> None:
-    for name, operations in overload_resolution.operation_overload_sets(interface).items():
+    for name, operations in overload_resolution.operation_overload_sets(interface, with_rust_operations=True).items():
         if any("LegacyUnforgeable" in operation.extended_attributes for operation in operations) != unforgeable:
             continue
         operation = operations[0]
+        if is_member_implemented_in_rust(operation):
+            # NB: The Rust bindings define the native function of an operation that they implement.
+            out.write(
+                wrap_with_extended_attribute_exposure_checks(
+                    includes,
+                    operation.extended_attributes,
+                    f"    {rust_member_definition_entry_point(interface, operation)}(&vm, &realm, &object);\n\n",
+                    f"{interface.name}.{name}",
+                )
+            )
+            continue
         out.write(
             wrap_with_extended_attribute_exposure_checks(
                 includes,
@@ -408,9 +422,9 @@ def write_stringifier(
 """
         )
     out.write(
-        f"""    auto* idl_object = TRY(impl_from(vm, this_value));
-    auto& this_object_realm = this_value_realm(realm, this_value);
-    auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, this_object_realm, [&] {{ return {stringifier_call}; }}));
+        f"""    auto* idl_object = TRY({implementation_check("this_value", "toString", "method")});
+    [[maybe_unused]] auto& this_object_realm = this_value.as_object().shape().realm();
+    auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {stringifier_call}; }}));
     return {to_javascript_value(stringifier_type, "R", includes, context, "this_object_realm")};
 }}
 
@@ -464,17 +478,9 @@ def write_operation(
     )
     if should_wrap_promise_rejections:
         includes.add("LibWeb/WebIDL/Promise.h")
-        if operation_invokes_as_static or interface.is_namespace or "NeedsCallerRealm" in operation.extended_attributes:
-            promise_realm_setup = "[[maybe_unused]] auto& promise_realm = realm;"
-        else:
-            promise_realm_setup = """auto promise_realm_this_value = vm.this_value();
-    if (promise_realm_this_value.is_nullish())
-        promise_realm_this_value = &realm.global_object();
-    [[maybe_unused]] auto& promise_realm = this_value_realm(realm, promise_realm_this_value);"""
         out.write(
-            f"""    {promise_realm_setup}
-
-    auto steps = [&realm, &vm]() -> JS::ThrowCompletionOr<GC::Ref<WebIDL::Promise>> {{
+            """
+    auto steps = [&realm, &vm]() -> JS::ThrowCompletionOr<GC::Ref<WebIDL::Promise>> {
         (void)realm;
 """
         )
@@ -493,13 +499,15 @@ def write_operation(
 
 """
             )
-        impl_from_this_value = "TRY(impl_from(vm, this_value))"
+        impl_from_this_value = f"TRY({implementation_check('this_value', operation.name, 'method')})"
+        this_object_realm = "this_value.as_object().shape().realm()"
         if on_remote_window:
             out.write(f"    {the_remote_window(includes, 'this_value')}\n")
             impl_from_this_value = f"remote_window ? nullptr : {impl_from_this_value}"
+            this_object_realm = f"remote_window ? realm : {this_object_realm}"
         out.write(
             f"""    [[maybe_unused]] {fully_qualified_name_for_interface(interface)}* idl_object = {impl_from_this_value};
-    [[maybe_unused]] auto& this_object_realm = this_value_realm(realm, this_value);
+    [[maybe_unused]] auto& this_object_realm = {this_object_realm};
 
 """
         )
@@ -524,19 +532,7 @@ def write_operation(
         interface=interface,
         is_static=operation_invokes_as_static,
     )
-    if operation.parameters:
-        out.write(
-            f"""    JS::VM::TypeErrorRealmScope conversion_type_error_realm {{ vm, {realm_argument} }};
-
-"""
-        )
-    write_operation_parameter_conversions(out, operation.parameters, includes, context, realm_argument)
-    if operation.parameters:
-        out.write(
-            """    conversion_type_error_realm.restore();
-
-"""
-        )
+    write_operation_parameter_conversions(out, operation.parameters, includes, context)
 
     if operation_invokes_as_static:
         callee = fully_qualified_name_for_interface(interface)
@@ -577,10 +573,10 @@ def write_operation(
     // 1. If op has a return type that is a promise type, then return ! Call(%Promise.reject%, %Promise%, «E»).
     // 2. Otherwise, end these steps and allow the exception to propagate.
     if (maybe_R.is_throw_completion())
-        return WebIDL::create_rejected_promise(promise_realm, maybe_R.error_value())->promise();
+        return WebIDL::create_rejected_promise(realm, maybe_R.error_value())->promise();
 
     auto R = maybe_R.release_value();
-    return {to_javascript_value(operation.return_type, "R", includes, context, "promise_realm")};
+    return {to_javascript_value(operation.return_type, "R", includes, context, "realm")};
 }}
 
 """
@@ -606,7 +602,7 @@ def write_operation(
         ce_reactions_steps = wrap_with_ce_reactions(includes, "original_steps()", realm_argument)
         out.write(
             f"""    auto original_steps = [&] {{
-        return WebIDL::throw_dom_exception_if_needed(vm, {realm_argument}, [&] {{ return {operation_call}; }});
+        return WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {operation_call}; }});
     }};
 
     [[maybe_unused]] auto R = TRY({ce_reactions_steps});
@@ -631,7 +627,7 @@ def write_operation(
             )
             out.write(
                 f"""    auto promise = WebIDL::create_promise({realm_argument});
-    TRY(WebIDL::throw_dom_exception_if_needed(vm, {realm_argument}, [&] {{ return {operation_call}; }}));
+    TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {operation_call}; }}));
         return promise;
     }};
 
@@ -641,7 +637,7 @@ def write_operation(
     // 1. If op has a return type that is a promise type, then return ! Call(%Promise.reject%, %Promise%, «E»).
     // 2. Otherwise, end these steps and allow the exception to propagate.
     if (maybe_R.is_throw_completion())
-        return WebIDL::create_rejected_promise(promise_realm, maybe_R.error_value())->promise();
+        return WebIDL::create_rejected_promise(realm, maybe_R.error_value())->promise();
 
     return maybe_R.release_value()->promise();
 }}
@@ -651,7 +647,7 @@ def write_operation(
             return
         if should_wrap_promise_rejections:
             out.write(
-                f"""    [[maybe_unused]] auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, {realm_argument}, [&] {{ return {operation_call}; }}));
+                f"""    [[maybe_unused]] auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {operation_call}; }}));
         return R;
     }};
 
@@ -661,9 +657,9 @@ def write_operation(
     // 1. If op has a return type that is a promise type, then return ! Call(%Promise.reject%, %Promise%, «E»).
     // 2. Otherwise, end these steps and allow the exception to propagate.
     if (maybe_R.is_throw_completion())
-        return WebIDL::create_rejected_promise(promise_realm, maybe_R.error_value())->promise();
+        return WebIDL::create_rejected_promise(realm, maybe_R.error_value())->promise();
 
-    return {to_javascript_value(operation.return_type, "maybe_R.release_value()", includes, context, "promise_realm")};
+    return {to_javascript_value(operation.return_type, "maybe_R.release_value()", includes, context, "realm")};
 }}
 
 """
@@ -675,7 +671,7 @@ def write_operation(
             )
             out.write(
                 f"""    auto promise = WebIDL::create_promise({realm_argument});
-    TRY(WebIDL::throw_dom_exception_if_needed(vm, {realm_argument}, [&] {{ return {operation_call}; }}));
+    TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {operation_call}; }}));
     return promise->promise();
 }}
 
@@ -683,7 +679,7 @@ def write_operation(
             )
         else:
             out.write(
-                f"""    [[maybe_unused]] auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, {realm_argument}, [&] {{ return {operation_call}; }}));
+                f"""    [[maybe_unused]] auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {operation_call}; }}));
     return {to_javascript_value(operation.return_type, "R", includes, context, realm_argument)};
 }}
 
@@ -691,7 +687,7 @@ def write_operation(
             )
         return
     out.write(
-        f"""    [[maybe_unused]] auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, {realm_argument}, [&] {{ return {operation_call}; }}));
+        f"""    [[maybe_unused]] auto R = TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {operation_call}; }}));
     return {to_javascript_value(operation.return_type, "R", includes, context, realm_argument)};
 }}
 
@@ -706,10 +702,8 @@ def default_to_json_getter_steps(
 ) -> str:
     is_reflected = "Reflect" in attribute.extended_attributes
     if is_reflected and attribute.type.name == "boolean":
-        return (
-            f'auto {value_name} = idl_object->has_attribute("{reflected_attribute_name(attribute)}"_utf16_fly_string);'
-        )
-    return f"auto {value_name} = TRY(WebIDL::throw_dom_exception_if_needed(vm, this_object_realm, [&] {{ return idl_object->{idl_implementation_cpp_name(attribute)}(); }}));"
+        return f'auto {value_name} = idl_object->has_attribute_ns({{}}, "{reflected_attribute_name(attribute)}"_utf16_fly_string);'
+    return f"auto {value_name} = TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return idl_object->{idl_implementation_cpp_name(attribute)}(); }}));"
 
 
 # https://webidl.spec.whatwg.org/#collect-attribute-values
@@ -801,8 +795,8 @@ def write_default_to_json_operation(
     auto this_value = vm.this_value();
     if (this_value.is_nullish())
         this_value = &realm.global_object();
-    [[maybe_unused]] auto* idl_object = TRY(impl_from(vm, this_value));
-    [[maybe_unused]] auto& this_object_realm = this_value_realm(realm, this_value);
+    [[maybe_unused]] auto* idl_object = TRY({implementation_check("this_value", operation.name, "method")});
+    [[maybe_unused]] auto& this_object_realm = this_value.as_object().shape().realm();
 
     // 4. Let result be OrdinaryObjectCreate(%Object.prototype%).
     auto result = JS::Object::create(realm, realm.intrinsics().object_prototype());

@@ -17,7 +17,7 @@
 
 namespace WebDriver {
 
-using LaunchBrowserCallback = Function<ErrorOr<Core::Process>(ByteString const& socket_path, bool headless)>;
+using LaunchBrowserCallback = Function<ErrorOr<Core::Process>(ByteString const& socket_path, bool headless, Optional<ByteString> const& proxy_autoconfig_url)>;
 
 class Client final : public Web::WebDriver::Client {
     C_OBJECT_ABSTRACT(Client);
@@ -98,6 +98,7 @@ private:
     virtual ResponsePromise take_screenshot(Web::WebDriver::Parameters parameters, JsonValue payload) override;
     virtual ResponsePromise take_element_screenshot(Web::WebDriver::Parameters parameters, JsonValue payload) override;
     virtual ResponsePromise print_page(Web::WebDriver::Parameters parameters, JsonValue payload) override;
+    virtual ResponsePromise set_permission(Web::WebDriver::Parameters parameters, JsonValue payload) override;
 
     LaunchBrowserCallback m_launch_browser_callback;
 };

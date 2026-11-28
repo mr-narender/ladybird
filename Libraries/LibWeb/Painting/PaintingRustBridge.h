@@ -7,44 +7,39 @@
 #pragma once
 
 #include <AK/Types.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibGfx/Filter.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
+#include <LibWeb/Compositor/NavigablePresenter.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/PaintConfig.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Painting/DisplayListDumpOptions.h>
+#include <LibWeb/Painting/DisplayListRecording.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/GridInspectorOverlay.h>
 #include <LibWeb/Painting/PaintableTypes.h>
+
+namespace Web::Compositor {
+
+class CompositorHost;
+struct FlightPresentation;
+
+}
 
 namespace Web::Painting {
 
 struct ImagePaint;
 struct ImagePaintRequest;
 
-WEB_API void dump_stacking_context_tree(StringBuilder&, DOM::Document const&);
+WEB_API void dump_stacking_context_tree(Layout::BegunRead const&, StringBuilder&, DOM::Document const&);
 WEB_API void dump_layout_tree(StringBuilder&, Layout::Node const&, bool interactive);
 
-WEB_API Layout::RustFFI::FfiVisualContextUpdateOutcome rust_update_accumulated_visual_contexts(DOM::Document&);
-WEB_API Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const&, Layout::RustFFI::FfiVisualContextBoxNodeList);
+WEB_API Compositing::RustFFI::FfiVisualContextTreeInputs visual_context_tree_inputs(DOM::Document&);
 WEB_API bool rust_background_color_can_be_compositor_animated(Layout::Node const&);
-WEB_API void const* retain_rust_main_visual_context_tree(DOM::Document const&);
 WEB_API Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Layout::Node const&);
 WEB_API void register_geometry_host(Layout::NodeArena&);
-WEB_API Layout::RustFFI::FfiRenderingPreparationOutcome rust_prepare_for_rendering(DOM::Document&, bool visual_context_update_pending);
-WEB_API void rust_update_visual_viewport_transform(DOM::Document&);
-enum class ForceScrollStateRefresh {
-    No,
-    Yes,
-};
-// Refreshes the snapshot from the Rust scroll state; false when nothing had invalidated it and
-// the refresh was not forced.
-WEB_API bool rust_refresh_scroll_state(DOM::Document&, Compositing::ScrollStateSnapshot&, ForceScrollStateRefresh = ForceScrollStateRefresh::No);
-WEB_API void rust_invalidate_scroll_state(DOM::Document&);
-WEB_API void mirror_rust_invalidate_paint_cache(Layout::Node const&);
-WEB_API void rust_invalidate_propagated_text_decoration_caches(Layout::Node const&);
+WEB_API void rust_update_visual_viewport_transform(Layout::BegunRead const&, DOM::Document&);
 struct InspectorOverlayInputs {
     Layout::Node const* highlighted_layout_node { nullptr };
     Color tooltip_color;
@@ -63,13 +58,39 @@ struct InspectorOverlayInputs {
     Optional<CSSPixelRect> caret_debug_rect;
 };
 
-WEB_API RefPtr<Compositing::DisplayList> record_rust_display_list(DOM::Document&, Compositing::DisplayList const& placeholder_display_list, Compositing::DisplayListResourceStorage&, PaintCommandCacheMode, HTML::PaintConfig const&, InspectorOverlayInputs const&);
-WEB_API Utf16String serialize_painting_dump(DOM::Document const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayList const&, Compositing::DisplayListResourceStorage const&);
+// Starts recording the document's viewport against its visual context tree, of the structural epoch given, unless it has
+// no box to record. Records the document's viewport for the host to publish, or, given `committed`, the presentation of
+// the navigable's next frame, commits the frame to the render owner, which presents it beside the event loop.
+WEB_API Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&, u64 visual_context_tree_structural_epoch, Optional<Gfx::Color> surface_clear_color, PaintCommandCacheMode, HTML::PaintConfig const&, InspectorOverlayInputs const&, Optional<Compositor::FlightPresentation> committed = {});
+// Commits the navigable's next frame, which keeps the display list the compositor has, to the render owner, which
+// presents it with `presentation` beside the event loop.
+WEB_API void commit_unrecorded_frame(Layout::BegunRead const&, DOM::Document&, Compositor::FlightPresentation presentation);
+// Renders the SVG images of the document's committed frame that waits for them, which only the main thread renders, and
+// hands the frame back to the Paint thread, which presents it with them.
+WEB_API void render_vector_images(Layout::BegunRead const&, DOM::Document&);
+// Publishes the recording, which has landed and stands.
+WEB_API void publish_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&);
+// Hands the document the trace the recording it took in last left, if it left one.
+WEB_API void take_recording_trace_if_pending(Layout::BegunRead const&, DOM::Document&);
+// Dumps the display list the document recorded last.
+WEB_API Utf16String serialize_painting_dump(Layout::BegunRead const&, DOM::Document const&, DisplayListDumpOptions const&);
+WEB_API Utf16String display_list_dump_changes(Optional<StringView> previous_jsonl, StringView jsonl);
 
-WEB_API CSS::ColorResolutionContext gradient_stop_color_resolution_context(Layout::NodeWithStyle const&);
-// The graph applying a list of filter functions in order, or nothing for an empty list.
-WEB_API Optional<Gfx::Filter> filter_from_functions(ReadonlySpan<Compositing::RustFFI::FfiFilterFunction>);
+struct OwnersOfVisualContextNodes {
+    // Zero for a document without a visual context tree.
+    u64 structural_epoch { 0 };
+    // By the position of each node among the spatial nodes and then the effect nodes asked of, empty for a node without
+    // a live owner.
+    Vector<String> owners;
+};
+// Describes the boxes that own the nodes of the document's visual context tree, as the boxes describe themselves.
+WEB_API OwnersOfVisualContextNodes describe_owners_of_visual_context_nodes(DOM::Document const&, ReadonlySpan<u32> spatial_node_indices, ReadonlySpan<u32> effect_node_indices);
 
-WEB_API Compositing::DisplayListResource record_image_paint_display_list(ImagePaint const&, ImagePaintRequest const&, double device_pixels_per_css_pixel);
+WEB_API Layout::RustFFI::FfiVectorImageKey vector_image_key_to_ffi(VectorImageKey const&);
+// Has the compositor rasterize `paint` into `target` as `request` asks, which must be a shareable BGRA8888 bitmap with
+// premultiplied alpha. Returns false if nothing was drawn.
+WEB_API bool rasterize_image_paint(Compositor::CompositorHost const&, ImagePaint const&, ImagePaintRequest const&, double device_pixels_per_css_pixel, NonnullRefPtr<Gfx::Bitmap> target);
+// Has the compositor rasterize one image frame drawn into the destination rectangle, in device pixels, into `target`.
+WEB_API bool rasterize_image_frame(Compositor::CompositorHost const&, Gfx::DecodedImageFrame const&, Gfx::FloatRect const& dest_rect, Gfx::ScalingMode, NonnullRefPtr<Gfx::Bitmap> target);
 
 }

@@ -16,16 +16,16 @@ namespace Web::DOM {
 
 GC_DEFINE_ALLOCATOR(LiveNodeList);
 
-GC::Ref<NodeList> LiveNodeList::create(Node const& root, Scope scope, Function<bool(Node const&)> filter, Kind kind)
+GC::Ref<NodeList> LiveNodeList::create(Node const& root, Scope scope, Filter filter, Kind kind)
 {
-    return GC::Heap::the().allocate<LiveNodeList>(root, scope, move(filter), kind);
+    return GC::Heap::the().allocate<LiveNodeList>(root, scope, filter, kind);
 }
 
-LiveNodeList::LiveNodeList(Node const& root, Scope scope, Function<bool(Node const&)> filter, Kind kind)
+LiveNodeList::LiveNodeList(Node const& root, Scope scope, Filter filter, Kind kind)
     : NodeList()
     , GC::WeakContainer(heap())
     , m_root(root)
-    , m_filter(move(filter))
+    , m_filter(filter)
     , m_scope(scope)
     , m_kind(kind)
 {
@@ -37,7 +37,7 @@ void LiveNodeList::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_root);
-    visitor.visit_possible_values(m_filter.raw_capture_range());
+    visitor.visit(m_filter);
 }
 
 GC::Cell const& LiveNodeList::owner_cell(Badge<GC::Heap>) const
@@ -47,10 +47,7 @@ GC::Cell const& LiveNodeList::owner_cell(Badge<GC::Heap>) const
 
 void LiveNodeList::remove_dead_cells(Badge<GC::Heap>)
 {
-    m_cached_nodes.remove_all_matching([&](GC::RawPtr<Node> const& node) {
-        auto* block = GC::HeapBlock::from_cell(node.ptr());
-        return !heap().is_live_heap_block(block) || node->state() != Cell::State::Live || !node->is_marked();
-    });
+    m_cached_nodes.remove_dead_cells(heap());
 }
 
 void LiveNodeList::update_cache_if_needed() const
@@ -66,13 +63,13 @@ void LiveNodeList::update_cache_if_needed() const
     m_cached_nodes.clear_with_capacity();
     if (m_scope == Scope::Descendants) {
         m_root->for_each_in_subtree([&](auto& node) {
-            if (m_filter(node))
+            if ((*m_filter)(node))
                 m_cached_nodes.append(const_cast<Node&>(node));
             return TraversalDecision::Continue;
         });
     } else {
         m_root->for_each_child([&](auto& node) {
-            if (m_filter(node))
+            if ((*m_filter)(node))
                 m_cached_nodes.append(const_cast<Node&>(node));
             return IterationDecision::Continue;
         });
@@ -102,8 +99,8 @@ Node* LiveNodeList::first_matching(Function<bool(Node const&)> const& filter) co
 {
     update_cache_if_needed();
     for (auto& node : m_cached_nodes) {
-        if (filter(*node))
-            return node.ptr();
+        if (filter(node))
+            return &node;
     }
     return nullptr;
 }
@@ -122,7 +119,7 @@ Node const* LiveNodeList::item(u32 index) const
     update_cache_if_needed();
     if (index >= m_cached_nodes.size())
         return nullptr;
-    return m_cached_nodes[index].ptr();
+    return &m_cached_nodes[index];
 }
 
 }

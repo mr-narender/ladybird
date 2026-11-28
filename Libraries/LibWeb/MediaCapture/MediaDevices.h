@@ -14,6 +14,7 @@
 #include <AK/Vector.h>
 #include <LibGC/Forward.h>
 #include <LibGC/Root.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/MediaStreamConstraints.h>
 #include <LibWeb/DOM/EventTarget.h>
@@ -29,13 +30,29 @@ class MediaStream;
 using MediaStreamConstraints = Bindings::MediaStreamConstraints;
 using MediaTrackSupportedConstraints = Bindings::MediaTrackSupportedConstraints;
 
+// https://w3c.github.io/mediacapture-main/#dfn-required-constraints
+struct DeviceIdConstraint final {
+    Vector<Utf16String> device_ids;
+    // Only an exact constraint rules other devices out. Any other is a preference that falls back to them.
+    bool is_required { false };
+};
+
 // https://w3c.github.io/mediacapture-main/#mediadevices
 class MediaDevices final : public DOM::EventTarget {
     WEB_WRAPPABLE(MediaDevices, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(MediaDevices);
 
 public:
+    // Ends every live track once the document may no longer use the microphone.
+    void end_tracks_without_permission();
+    void track_was_cloned(Badge<MediaStreamTrack>, MediaStreamTrack& clone);
+    void track_source_ended(Badge<MediaStreamTrack>, MediaStreamTrack&);
+    HTML::Window& window() const { return m_window; }
+    // getUserMedia() waits while the page lacks system focus, and the Window sees no event when that changes.
+    void system_focus_changed();
+
     [[nodiscard]] static GC::Ref<MediaDevices> create(HTML::Window&);
+    void stop_all_sources();
 
     MediaTrackSupportedConstraints get_supported_constraints();
     void enumerate_devices(GC::Ref<WebIDL::Promise>);
@@ -55,11 +72,15 @@ private:
 
     struct PendingGetUserMediaRequest final {
         GC::Ref<WebIDL::Promise> promise;
-        Optional<Vector<Utf16String>> requested_device_ids;
+        Optional<DeviceIdConstraint> device_id_constraint;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
 
     struct PendingEnumerateDevicesRequest final {
         GC::Ref<WebIDL::Promise> promise;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
 
     explicit MediaDevices(HTML::Window&);
@@ -76,13 +97,17 @@ private:
     bool has_live_device_of_kind(Utf16FlyString const& kind) const;
     void set_device_information_exposure(bool audio_requested, bool video_requested, bool value);
     void queue_enumerate_devices_task(GC::Ref<WebIDL::Promise>);
-    void queue_get_user_media_task(GC::Ref<WebIDL::Promise>, Optional<Vector<Utf16String>> requested_device_ids);
+    void queue_get_user_media_task(GC::Ref<WebIDL::Promise>, Optional<DeviceIdConstraint>);
     void process_pending_enumerate_devices_requests();
     void process_pending_get_user_media_requests();
     GC::RootVector<GC::Ref<MediaDeviceInfo>> create_list_of_device_info_objects(Vector<StoredDevice> const& device_list);
     void run_device_change_notification_steps(Vector<StoredDevice> const& device_list);
     static Vector<StoredDevice> current_audio_device_snapshot();
     void did_observe_audio_device_cache_update();
+    // Runs the callback once the process has a device list fetched from now on, or at once where no list ever comes.
+    void run_with_fresh_audio_device_list(GC::Ref<GC::Function<void()>>);
+    void end_tracks_of_removed_devices();
+    void end_tracks(GC::RootVector<GC::Ref<MediaStreamTrack>>);
     virtual void visit_edges(Cell::Visitor&) override;
 
     GC::Ref<HTML::Window> m_window;
@@ -100,12 +125,15 @@ private:
     // [[canExposeMicrophoneInfo]]
     bool m_can_expose_microphone_info { false };
     // [[mediaStreamTrackSources]]
-    // FIXME: Replace provider IDs with concrete source objects when MediaCapture source modeling lands.
-    HashTable<u64> m_media_stream_track_sources;
+    // FIXME: Replace the tracks with concrete source objects when MediaCapture source modeling lands.
+    Vector<GC::Weak<MediaStreamTrack>> m_media_stream_track_sources;
     Vector<PendingEnumerateDevicesRequest> m_pending_enumerate_devices_requests;
     Vector<PendingGetUserMediaRequest> m_pending_get_user_media_requests;
+    Vector<GC::Ref<GC::Function<void()>>> m_awaiting_fresh_audio_device_list;
     GC::Ptr<DOM::IDLEventListener> m_pending_request_state_change_listener;
     Optional<u64> m_audio_device_cache_listener_id;
 };
 
 }
+
+GC_UNTRACED_CAPTURE(Web::MediaCapture::DeviceIdConstraint);

@@ -10,14 +10,24 @@
 #include <AK/Optional.h>
 #include <AK/Span.h>
 #include <LibGfx/Forward.h>
+#include <LibMediaCodecs/Color/CodingIndependentCodePoints.h>
 
 namespace Gfx {
+
+enum class PNGCompression : u8 {
+    Default,
+    // Encodes much faster, at the cost of a larger file.
+    Fast,
+};
 
 // This is not a nested struct to work around https://llvm.org/PR36684
 struct PNGWriterOptions {
     // Data for the iCCP chunk.
-    // FIXME: Allow writing cICP, sRGB, or gAMA instead too.
+    // FIXME: Allow writing sRGB or gAMA instead too.
     Optional<ReadonlyBytes> icc_data;
+    // Data for the cICP chunk, which describes the color space in place of an ICC profile.
+    Optional<Media::CodingIndependentCodePoints> cicp {};
+    PNGCompression compression { PNGCompression::Default };
 };
 
 class PNGWriter {

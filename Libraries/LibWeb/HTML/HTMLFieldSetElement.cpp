@@ -5,6 +5,7 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLFieldSetElement.h>
@@ -97,27 +98,20 @@ GC::Ptr<DOM::HTMLCollection> const& HTMLFieldSetElement::elements()
 {
     // The elements IDL attribute must return an HTMLCollection rooted at the fieldset element, whose filter matches listed elements.
     if (!m_elements) {
-        auto filter = [](DOM::Element const& element) {
+        auto filter = GC::create_function(heap(), [](DOM::Element const& element) {
             if (auto const* form_associated_element = as_if<FormAssociatedElement>(element); form_associated_element && form_associated_element->is_listed())
                 return true;
 
             return false;
-        };
-        m_elements = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, move(filter), DOM::HTMLCollection::AttributeInvalidationType::FormControls, nullptr, DOM::HTMLCollection::Kind::FormControls);
+        });
+        m_elements = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, filter, DOM::HTMLCollection::AttributeInvalidationType::FormControls, nullptr, DOM::HTMLCollection::Kind::FormControls);
     }
     return m_elements;
 }
 
-Layout::Node* HTMLFieldSetElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLFieldSetElement::box_kind() const
 {
-    auto& fieldset_box = Layout::allocate_layout_node<Layout::Box>(document(), this, style, Layout::RustFFI::NodeKind::FieldSetBox);
-    // https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
-    // If the computed outer display type is inline, the fieldset is expected to behave as inline-block. Otherwise, it
-    // is expected to behave as flow-root. This does not change the computed value.
-    if (fieldset_box.display().is_flow_inside()) {
-        fieldset_box.set_display(CSS::Display { fieldset_box.display().outside(), CSS::DisplayInside::FlowRoot });
-    }
-    return &fieldset_box;
+    return CSS::ElementBoxKind::FieldSet;
 }
 
 }

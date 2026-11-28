@@ -1,3 +1,5 @@
-no :local-link rule: elementStyleRecomputations=0
-:local-link rule, anchor flips: elementStyleRecomputations=0
-shadow-only :local-link rule, shadow anchor flips: elementStyleRecomputations=1
+PASS: no :local-link rule (restyled: [])
+PASS: :local-link rule, anchor flips (restyled: [same-doc])
+same-doc color: rgb(0, 128, 0)
+PASS: shadow-only :local-link rule, shadow anchor flips (restyled: [same-doc, shadow-anchor])
+shadow-anchor color: rgb(0, 0, 128)

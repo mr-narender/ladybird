@@ -4,15 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/LexicalPath.h>
 #include <AK/Random.h>
-#include <AK/ScopeGuard.h>
-#include <LibCore/Directory.h>
-#include <LibCore/Environment.h>
-#include <LibCore/StandardPaths.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SystemTheme.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #include <LibWebCommon/Page/NavigationTarget.h>
@@ -26,12 +22,12 @@
 namespace {
 
 // Neither WebDriver nor the test harness drives this application, so its renderers get no HTTP-like cookie access.
-class TestApplication : public WebView::Application {
+class TestApplication : public Test::HeadlessApplication {
     WEB_VIEW_APPLICATION(TestApplication)
 
 public:
     explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
+        : Test::HeadlessApplication(move(ladybird_binary_path))
     {
     }
 
@@ -41,8 +37,6 @@ public:
         browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
         web_content_options.is_test_mode = WebView::IsTestMode::No;
     }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
 };
 
 }
@@ -51,28 +45,19 @@ public:
 // The UI process holds every document's origin, so a renderer claiming another origin for a navigation it starts has
 // the navigation refused.
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(renderer_origin_claims)
 {
-    auto test_config_directory = ByteString::formatted("{}/Ladybird-TestRendererOriginClaims-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_config_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_config_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_config_directory, FileSystem::RecursionMode::Allowed));
-    });
-    MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, test_config_directory, Core::Environment::Overwrite::Yes));
+    Test::HeadlessTestEnvironment environment { "TestRendererOriginClaims"sv };
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
-    auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
+    auto theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
 
     auto view = WebView::HeadlessWebView::create(theme, { 800, 600 });
-    auto& stub = static_cast<WebContentClientStub&>(view->client());
-    auto page_id = view->page_id();
-    auto& traversable = view->client().page(page_id)->traversable();
+    auto& stub = static_cast<WebContentClientStub&>(view->page().client());
+    auto page_id = view->page().id();
+    auto& traversable = view->traversable();
 
     auto start_navigation = [&](URL::Origin initiator_origin) {
         auto uuid = generate_random_uuid();
@@ -96,10 +81,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             .navigation_api_state = {},
             .navigation_api_key = {},
             .navigation_api_id = {},
+            .directive_state_id = {},
+            .directive_state_value = {},
         };
         stub.did_request_navigation_start(page_id, traversable.id(), Web::NavigationTarget::TopLevel, URL::about_blank(), navigation_id, move(request));
-        auto const& ongoing_navigation = traversable.ongoing_navigation();
-        return ongoing_navigation.has_value() && ongoing_navigation->navigation_id == navigation_id;
+        return traversable.navigation_with_id(navigation_id) != nullptr;
     };
 
     // An about:blank document takes its initiator origin, so a victim's would give the renderer a document of its origin.
@@ -113,5 +99,4 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     VERIFY(start_navigation(URL::Origin::create_opaque()));
 
     outln("PASS: renderers cannot start a navigation as another origin");
-    return 0;
 }

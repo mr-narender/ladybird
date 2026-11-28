@@ -1,108 +1,126 @@
 /*
- * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ * Copyright (c) 2026-present, the Ladybird developers.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Array.h>
-#include <AK/FixedArray.h>
+#include <AK/ByteBuffer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/YUVData.h>
 #include <LibTest/TestCase.h>
 
-#include <core/SkYUVAPixmaps.h>
+namespace {
 
-struct AllocatedPlanes {
-    FixedArray<u8> storage;
-    Gfx::YUVData data;
+enum class SampleAlignment : u8 {
+    LowBits,
+    HighBits,
 };
 
-static ErrorOr<AllocatedPlanes> allocate_yuv_data(Gfx::IntSize size, u8 bit_depth, Media::Subsampling subsampling, Media::CodingIndependentCodePoints cicp)
+void write_sample(ByteBuffer& plane, size_t offset, u16 value, u8 bit_depth, SampleAlignment alignment)
 {
-    auto sizes = TRY(Gfx::YUVData::plane_sizes(size, bit_depth, subsampling));
-    auto storage = TRY(FixedArray<u8>::create(sizes.total));
-
-    auto y_data = storage.span().slice(0, sizes.y);
-    auto u_data = storage.span().slice(sizes.y, sizes.u);
-    auto v_data = storage.span().slice(sizes.y + sizes.u, sizes.v);
-    auto data = TRY(Gfx::YUVData::create(size, bit_depth, subsampling, cicp, y_data, u_data, v_data));
-
-    return AllocatedPlanes {
-        .storage = move(storage),
-        .data = data,
-    };
+    if (bit_depth <= 8) {
+        plane[offset] = static_cast<u8>(value);
+        return;
+    }
+    if (alignment == SampleAlignment::HighBits)
+        value <<= 16 - bit_depth;
+    plane[offset] = static_cast<u8>(value & 0xff);
+    plane[offset + 1] = static_cast<u8>(value >> 8);
 }
 
-static u16 expand_10_bit_sample_to_full_16_bit_range(u16 sample)
+bool colors_are_close(Gfx::Color a, Gfx::Color b)
 {
-    return static_cast<u16>((sample << 6) | (sample >> 4));
+    auto close = [](u8 x, u8 y) { return (x > y ? x - y : y - x) <= 1; };
+    return close(a.red(), b.red()) && close(a.green(), b.green()) && close(a.blue(), b.blue()) && a.alpha() == b.alpha();
 }
 
-template<size_t Size>
-static void write_samples(Bytes plane, Array<u16, Size> const& samples)
-{
-    auto* destination = reinterpret_cast<u16*>(plane.data());
-    for (size_t i = 0; i < Size; i++)
-        destination[i] = samples[i];
+constexpr size_t PLANE_STRIDE_IN_SAMPLES = 16;
+constexpr u8 PADDING_BYTE = 0xee;
+
 }
 
-template<size_t Size>
-static void expect_samples(Bytes plane, Array<u16, Size> const& expected)
+// Every luma row and every chroma row holds samples of its own. A row that is left out, or that takes its chroma from
+// another row, then converts to different pixels than the planar conversion of the same samples.
+TEST_CASE(biplanar_conversion_matches_planar_conversion)
 {
-    auto const* samples = reinterpret_cast<u16 const*>(plane.data());
-    for (size_t i = 0; i < Size; i++)
-        EXPECT_EQ(samples[i], expected[i]);
-}
+    for (int height : { 1, 2, 3, 4, 5 }) {
+        Gfx::IntSize size { 5, height };
+        for (auto subsampling : { Media::Subsampling::yuv420(), Media::Subsampling::yuv422(), Media::Subsampling::yuv444() }) {
+            for (u8 bit_depth : { 8, 10 }) {
+                size_t bytes_per_sample = bit_depth > 8 ? 2 : 1;
+                u16 scale = bit_depth > 8 ? 4 : 1;
+                size_t stride = PLANE_STRIDE_IN_SAMPLES * bytes_per_sample;
+                auto chroma_size = subsampling.subsampled_size(size.to_type<size_t>());
 
-template<size_t Size>
-static void expect_expanded_pixmap_samples(SkPixmap const& plane, Array<u16, Size> const& native_samples, int width)
-{
-    for (size_t i = 0; i < Size; i++) {
-        auto x = static_cast<int>(i % static_cast<size_t>(width));
-        auto y = static_cast<int>(i / static_cast<size_t>(width));
-        EXPECT_EQ(*plane.addr16(x, y), expand_10_bit_sample_to_full_16_bit_range(native_samples[i]));
+                auto luma_sample = [&](size_t x, size_t y) { return static_cast<u16>((60 + (y * 25) + (x * 4)) * scale); };
+                auto blue_chroma_sample = [&](size_t x, size_t y) { return static_cast<u16>((110 + (y * 10) + (x * 3)) * scale); };
+                auto red_chroma_sample = [&](size_t x, size_t y) { return static_cast<u16>((150 - (y * 10) + (x * 2)) * scale); };
+
+                auto biplanar_luma = MUST(ByteBuffer::create_uninitialized(stride * size.height()));
+                auto biplanar_chroma = MUST(ByteBuffer::create_uninitialized(stride * chroma_size.height()));
+                biplanar_luma.bytes().fill(PADDING_BYTE);
+                biplanar_chroma.bytes().fill(PADDING_BYTE);
+
+                auto plane_sizes = MUST(Gfx::YUVData::plane_sizes(size, bit_depth, subsampling));
+                auto planar_luma = MUST(ByteBuffer::create_zeroed(plane_sizes.y));
+                auto planar_blue_chroma = MUST(ByteBuffer::create_zeroed(plane_sizes.u));
+                auto planar_red_chroma = MUST(ByteBuffer::create_zeroed(plane_sizes.v));
+
+                for (size_t y = 0; y < static_cast<size_t>(size.height()); y++) {
+                    for (size_t x = 0; x < static_cast<size_t>(size.width()); x++) {
+                        auto sample = luma_sample(x, y);
+                        write_sample(biplanar_luma, (y * stride) + (x * bytes_per_sample), sample, bit_depth, SampleAlignment::HighBits);
+                        write_sample(planar_luma, ((y * size.width()) + x) * bytes_per_sample, sample, bit_depth, SampleAlignment::LowBits);
+                    }
+                }
+                for (size_t y = 0; y < chroma_size.height(); y++) {
+                    for (size_t x = 0; x < chroma_size.width(); x++) {
+                        auto blue = blue_chroma_sample(x, y);
+                        auto red = red_chroma_sample(x, y);
+                        auto biplanar_offset = (y * stride) + (x * 2 * bytes_per_sample);
+                        write_sample(biplanar_chroma, biplanar_offset, blue, bit_depth, SampleAlignment::HighBits);
+                        write_sample(biplanar_chroma, biplanar_offset + bytes_per_sample, red, bit_depth, SampleAlignment::HighBits);
+                        auto planar_offset = ((y * chroma_size.width()) + x) * bytes_per_sample;
+                        write_sample(planar_blue_chroma, planar_offset, blue, bit_depth, SampleAlignment::LowBits);
+                        write_sample(planar_red_chroma, planar_offset, red, bit_depth, SampleAlignment::LowBits);
+                    }
+                }
+
+                auto biplanar = MUST(Gfx::biplanar_yuv_to_bitmap(size, bit_depth, subsampling, {},
+                    { .data = biplanar_luma.bytes(), .stride = stride },
+                    { .data = biplanar_chroma.bytes(), .stride = stride }));
+                auto planar = MUST(MUST(Gfx::YUVData::create(size, bit_depth, subsampling, {},
+                                            planar_luma.bytes(), planar_blue_chroma.bytes(), planar_red_chroma.bytes()))
+                        .to_bitmap());
+
+                for (int y = 0; y < size.height(); y++) {
+                    for (int x = 0; x < size.width(); x++) {
+                        auto biplanar_color = biplanar->get_pixel(x, y);
+                        auto planar_color = planar->get_pixel(x, y);
+                        if (!colors_are_close(biplanar_color, planar_color)) {
+                            FAIL(ByteString::formatted("{}x{} at {} bits, chroma {}x{}: pixel ({}, {}) is {}, but the planar conversion gives {}",
+                                size.width(), size.height(), bit_depth, chroma_size.width(), chroma_size.height(), x, y, biplanar_color, planar_color));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
-TEST_CASE(high_bit_depth_pixmaps_expand_without_mutating_native_samples)
+TEST_CASE(biplanar_conversion_refuses_planes_whose_last_row_is_not_padded)
 {
-    auto const cicp = Media::CodingIndependentCodePoints {
-        Media::ColorPrimaries::BT709,
-        Media::TransferCharacteristics::BT709,
-        Media::MatrixCoefficients::BT709,
-        Media::VideoFullRangeFlag::Full,
-    };
-    auto allocated_planes = TRY_OR_FAIL(allocate_yuv_data({ 2, 2 }, 10, Media::Subsampling { false, false }, cicp));
-    auto& yuv_data = allocated_planes.data;
+    constexpr Gfx::IntSize size { 5, 3 };
+    constexpr size_t stride = PLANE_STRIDE_IN_SAMPLES;
 
-    Array<u16, 4> const y_samples { 0, 341, 682, 1023 };
-    Array<u16, 4> const u_samples { 512, 513, 514, 515 };
-    Array<u16, 4> const v_samples { 508, 509, 510, 511 };
+    auto luma = MUST(ByteBuffer::create_zeroed(stride * size.height()));
+    auto chroma = MUST(ByteBuffer::create_zeroed(stride * 2));
+    Gfx::BiplanarYUVPlane padded_luma { .data = luma.bytes(), .stride = stride };
+    Gfx::BiplanarYUVPlane padded_chroma { .data = chroma.bytes(), .stride = stride };
+    Gfx::BiplanarYUVPlane unpadded_luma { .data = luma.bytes().trim((stride * (size.height() - 1)) + size.width()), .stride = stride };
+    Gfx::BiplanarYUVPlane unpadded_chroma { .data = chroma.bytes().trim(stride + 6), .stride = stride };
 
-    write_samples(yuv_data.y_data(), y_samples);
-    write_samples(yuv_data.u_data(), u_samples);
-    write_samples(yuv_data.v_data(), v_samples);
-
-    auto bitmap_before = TRY_OR_FAIL(yuv_data.to_bitmap());
-
-    auto pixmaps = yuv_data.make_pixmaps();
-    EXPECT(pixmaps.isValid());
-    EXPECT(pixmaps.ownsStorage());
-    EXPECT(pixmaps.dataType() == SkYUVAPixmapInfo::DataType::kUnorm16);
-    EXPECT_EQ(pixmaps.numPlanes(), 3);
-
-    expect_expanded_pixmap_samples(pixmaps.plane(0), y_samples, 2);
-    expect_expanded_pixmap_samples(pixmaps.plane(1), u_samples, 2);
-    expect_expanded_pixmap_samples(pixmaps.plane(2), v_samples, 2);
-
-    EXPECT_EQ(yuv_data.bit_depth(), 10);
-    expect_samples(yuv_data.y_data(), y_samples);
-    expect_samples(yuv_data.u_data(), u_samples);
-    expect_samples(yuv_data.v_data(), v_samples);
-
-    auto bitmap_after = TRY_OR_FAIL(yuv_data.to_bitmap());
-    for (int y = 0; y < yuv_data.size().height(); y++) {
-        for (int x = 0; x < yuv_data.size().width(); x++)
-            EXPECT_EQ(bitmap_after->get_pixel(x, y), bitmap_before->get_pixel(x, y));
-    }
+    EXPECT(!Gfx::biplanar_yuv_to_bitmap(size, 8, Media::Subsampling::yuv420(), {}, padded_luma, padded_chroma).is_error());
+    EXPECT(Gfx::biplanar_yuv_to_bitmap(size, 8, Media::Subsampling::yuv420(), {}, unpadded_luma, padded_chroma).is_error());
+    EXPECT(Gfx::biplanar_yuv_to_bitmap(size, 8, Media::Subsampling::yuv420(), {}, padded_luma, unpadded_chroma).is_error());
 }

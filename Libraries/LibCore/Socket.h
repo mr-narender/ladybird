@@ -71,6 +71,9 @@ public:
     //        base class for all address types is appropriate.
     static ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>> resolve_host(ByteString const&, SocketType, AddressFamily = AddressFamily::Unspecified);
 
+    // Whether this host has a route to the IPv6 internet, from an address that can reach it.
+    static bool is_ipv6_globally_reachable();
+
     Function<void()> on_ready_to_read;
 
 protected:
@@ -327,7 +330,6 @@ public:
             notifier->set_enabled(enabled);
     }
 
-    ErrorOr<Bytes> receive_message(Bytes buffer, int flags, Vector<int>& fds);
     ErrorOr<size_t> send_message(ReadonlyBytes msg, int flags, Vector<int, 1> fds = {});
 
     ErrorOr<pid_t> peer_pid() const;

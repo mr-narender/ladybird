@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<style>
+    @property --registered-color {
+        syntax: "<color>";
+        inherits: false;
+        initial-value: black;
+    }
+    #lightDark { color: light-dark(rgb(1, 1, 1), rgb(2, 2, 2)); }
+    #systemColor { background-color: Canvas; }
+    #declaresScheme { color-scheme: light dark; }
+    #registered { --registered-color: light-dark(rgb(3, 3, 3), rgb(4, 4, 4)); }
+    #thinBorder { border: 0.5px solid black; }
+    #imageSet { background-image: image-set(url(a.png) 1x, url(b.png) 2x); }
+    #plain { width: 10px; color: rgb(5, 5, 5); }
+    #plain > span { display: block; }
+</style>
+<div id="lightDark">x</div>
+<div id="systemColor">x</div>
+<div id="declaresScheme">x</div>
+<div id="registered">x</div>
+<div id="thinBorder">x</div>
+<div id="imageSet">x</div>
+<div id="plain"><span id="plainChild">x</span></div>
+<script src="../include.js"></script>
+<script src="../work-test.js"></script>
+<script>
+    const output = [];
+    function report(label, restyled) {
+        output.push(`${label}: lightDark=${getComputedStyle(lightDark).color} systemColor=${getComputedStyle(systemColor).backgroundColor} registered=${getComputedStyle(registered).getPropertyValue("--registered-color")} thinBorder=${getComputedStyle(thinBorder).borderTopWidth}`);
+        output.push(`${label} restyled: [${restyled.map(shortStyleName).join(", ")}]`);
+    }
+    function restyledIn(trace) {
+        return [...new Set(parseStyleTrace(trace, { stylePassesOnly: true }).filter(event => event.event === "restyle" && event.outcome !== "kept").map(event => event.element))];
+    }
+
+    asyncTest(done => {
+        // NB: The preferred color scheme is light to begin with, whatever a test before left it as.
+        internals.setPreferredColorScheme("light");
+
+        // The used color scheme stays light, so only the elements resolving against it restyle.
+        const meta = document.createElement("meta");
+        meta.name = "color-scheme";
+        meta.content = "light dark";
+        report("color-scheme meta", styleWork(() => document.head.appendChild(meta)).restyled());
+
+        // A device pixel ratio change reaches the document's media queries asynchronously, so its window spans
+        // the change event.
+        const changeDevicePixelRatio = ratio => {
+            internals.updateStyle();
+            internals.beginStyleTrace();
+            internals.setDevicePixelRatio(ratio);
+        };
+        const mql = window.matchMedia("(resolution: 2dppx)");
+        mql.addEventListener("change", event => {
+            internals.updateStyle();
+            const restyled = restyledIn(internals.takeStyleTrace());
+            if (event.matches) {
+                report("device pixel ratio 2", restyled);
+                changeDevicePixelRatio(1);
+                return;
+            }
+            report("device pixel ratio 1", restyled);
+
+            // The used color scheme of every element moves with the preferred one.
+            report("preferred dark", styleWork(() => internals.setPreferredColorScheme("dark")).restyled());
+            internals.setPreferredColorScheme("auto");
+            for (const line of output)
+                println(line);
+            done();
+        });
+        changeDevicePixelRatio(2);
+    });
+</script>

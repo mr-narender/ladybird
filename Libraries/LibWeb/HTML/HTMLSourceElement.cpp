@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -58,7 +59,15 @@ void HTMLSourceElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<DOM::N
     // The source HTML element moving steps, given movedNode, isSubtreeRoot, and oldAncestor are:
     Base::moved_from(is_subtree_root, old_ancestor);
 
-    // 1. If isSubtreeRoot is true and oldAncestor is a picture element, then for each child of oldAncestor's
+    // 1. If movedNode's parent is a media element that has no src attribute and whose networkState has the value
+    //    NETWORK_EMPTY, then invoke that media element's resource selection algorithm.
+    if (auto* media_element = as_if<HTMLMediaElement>(parent()); media_element
+        && !media_element->has_attribute(HTML::AttributeNames::src)
+        && media_element->network_state() == HTMLMediaElement::NetworkState::Empty) {
+        media_element->select_resource();
+    }
+
+    // 2. If isSubtreeRoot is true and oldAncestor is a picture element, then for each child of oldAncestor's
     //    children: if child is an img element, then count this as a relevant mutation for child.
     if (is_subtree_root == IsSubtreeRoot::Yes) {
         if (auto* picture = as_if<HTMLPictureElement>(old_ancestor.ptr()))
@@ -106,8 +115,12 @@ void HTMLSourceElement::attribute_changed(Utf16FlyString const& name, Optional<U
 
     // Only following img siblings consider this source a "previous sibling".
     for (auto* sibling = next_sibling(); sibling; sibling = sibling->next_sibling()) {
-        if (auto* img = as_if<HTMLImageElement>(sibling))
+        if (auto* img = as_if<HTMLImageElement>(sibling)) {
+            // An image whose dimension attribute source this is maps its width and height.
+            if (name.is_one_of(HTML::AttributeNames::width, HTML::AttributeNames::height) && &img->dimension_attribute_source() == this)
+                CSS::republish_presentational_hints(*img);
             img->update_the_image_data(true);
+        }
     }
 }
 

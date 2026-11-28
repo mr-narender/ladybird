@@ -6,17 +6,10 @@
 
 #include <AK/Checked.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/SkiaBackendContext.h>
 #include <LibGfx/YUVData.h>
 #include <RustFFI.h>
 
-#include <core/SkColorSpace.h>
-#include <core/SkImage.h>
-#include <core/SkYUVAInfo.h>
-#include <core/SkYUVAPixmaps.h>
 #include <cstddef>
-#include <gpu/ganesh/GrDirectContext.h>
-#include <gpu/ganesh/SkImageGanesh.h>
 
 namespace Gfx {
 
@@ -34,7 +27,7 @@ ErrorOr<YUVData::PlaneSizes> YUVData::plane_sizes(IntSize size, u8 bit_depth, Me
 {
     if (size.is_empty())
         return Error::from_string_literal("YUVData size is empty");
-    if (bit_depth == 0 || bit_depth > 16)
+    if (bit_depth == 0 || bit_depth > 12)
         return Error::from_string_literal("Invalid YUVData bit depth");
 
     auto component_size = bit_depth <= 8 ? 1 : 2;
@@ -99,6 +92,43 @@ static FFI::YUVMatrix yuv_matrix_for_cicp(Media::CodingIndependentCodePoints con
     }
 }
 
+// Where one of the components of an RGB picture lies, in a plane of its own or interleaved with another.
+struct RGBComponent {
+    u8 const* first_sample;
+    size_t row_stride;
+    size_t samples_per_pixel;
+};
+
+// Each stored sample holds padding_bit_count unused bits below its value.
+template<typename Sample>
+static void rgb_components_to_bitmap(Bitmap& bitmap, u8 bit_depth, u8 padding_bit_count, Media::VideoFullRangeFlag range, RGBComponent green, RGBComponent blue, RGBComponent red)
+{
+    auto bits_beyond_eight = max(bit_depth, 8) - 8;
+    // ITU-T H.273, 8.3: studio range RGB spans 16 to 235 at 8 bits, scaled up for deeper samples.
+    auto is_studio_range = range == Media::VideoFullRangeFlag::Studio;
+    u32 black = 16u << bits_beyond_eight;
+    u32 span = 219u << bits_beyond_eight;
+
+    auto size = bitmap.size();
+    for (int row = 0; row < size.height(); row++) {
+        auto* destination = bitmap.scanline_u8(row);
+        auto sample_at = [&](RGBComponent const& component, int column) -> u8 {
+            auto const* samples = reinterpret_cast<Sample const*>(component.first_sample + (static_cast<size_t>(row) * component.row_stride));
+            u32 sample = samples[static_cast<size_t>(column) * component.samples_per_pixel] >> padding_bit_count;
+            if (!is_studio_range)
+                return static_cast<u8>(sample >> bits_beyond_eight);
+            sample = clamp(sample, black, black + span) - black;
+            return static_cast<u8>(((sample * 255) + (span / 2)) / span);
+        };
+        for (int column = 0; column < size.width(); column++) {
+            destination[(column * 4) + 0] = sample_at(red, column);
+            destination[(column * 4) + 1] = sample_at(green, column);
+            destination[(column * 4) + 2] = sample_at(blue, column);
+            destination[(column * 4) + 3] = 255;
+        }
+    }
+}
+
 ErrorOr<NonnullRefPtr<Bitmap>> YUVData::to_bitmap() const
 {
     VERIFY(m_bit_depth <= 12);
@@ -114,45 +144,18 @@ ErrorOr<NonnullRefPtr<Bitmap>> YUVData::to_bitmap() const
         if (m_subsampling.x() || m_subsampling.y())
             return Error::from_string_literal("Subsampled RGB is unsupported");
 
+        // The planes hold green, blue and red, in that order.
         if (m_bit_depth <= 8) {
-            auto const* y_data = m_y_data.data();
-            auto const* u_data = m_u_data.data();
-            auto const* v_data = m_v_data.data();
-            auto y_stride = static_cast<int>(width);
-
-            for (u32 row = 0; row < height; row++) {
-                auto* dst_row = dst + (static_cast<size_t>(row) * dst_stride);
-                auto const* y_row = y_data + (static_cast<size_t>(row) * y_stride);
-                auto const* u_row = u_data + (static_cast<size_t>(row) * y_stride);
-                auto const* v_row = v_data + (static_cast<size_t>(row) * y_stride);
-                for (u32 col = 0; col < width; col++) {
-                    dst_row[(col * 4) + 0] = v_row[col];
-                    dst_row[(col * 4) + 1] = y_row[col];
-                    dst_row[(col * 4) + 2] = u_row[col];
-                    dst_row[(col * 4) + 3] = 255;
-                }
-            }
+            RGBComponent green { m_y_data.data(), width, 1 };
+            RGBComponent blue { m_u_data.data(), width, 1 };
+            RGBComponent red { m_v_data.data(), width, 1 };
+            rgb_components_to_bitmap<u8>(*bitmap, m_bit_depth, 0, m_cicp.video_full_range_flag(), green, blue, red);
         } else {
-            // Our buffers hold native N-bit values in the low bits of each u16; shift right to reduce
-            // to 8-bit for the output.
-            auto shift = m_bit_depth - 8;
-            auto const* y_data = reinterpret_cast<u16 const*>(m_y_data.data());
-            auto const* u_data = reinterpret_cast<u16 const*>(m_u_data.data());
-            auto const* v_data = reinterpret_cast<u16 const*>(m_v_data.data());
-            auto y_stride = static_cast<int>(width);
-
-            for (u32 row = 0; row < height; row++) {
-                auto* dst_row = dst + (static_cast<size_t>(row) * dst_stride);
-                auto const* y_row = y_data + (static_cast<size_t>(row) * y_stride);
-                auto const* u_row = u_data + (static_cast<size_t>(row) * y_stride);
-                auto const* v_row = v_data + (static_cast<size_t>(row) * y_stride);
-                for (u32 col = 0; col < width; col++) {
-                    dst_row[(col * 4) + 0] = static_cast<u8>(v_row[col] >> shift);
-                    dst_row[(col * 4) + 1] = static_cast<u8>(y_row[col] >> shift);
-                    dst_row[(col * 4) + 2] = static_cast<u8>(u_row[col] >> shift);
-                    dst_row[(col * 4) + 3] = 255;
-                }
-            }
+            auto row_stride = width * sizeof(u16);
+            RGBComponent green { m_y_data.data(), row_stride, 1 };
+            RGBComponent blue { m_u_data.data(), row_stride, 1 };
+            RGBComponent red { m_v_data.data(), row_stride, 1 };
+            rgb_components_to_bitmap<u16>(*bitmap, m_bit_depth, 0, m_cicp.video_full_range_flag(), green, blue, red);
         }
 
         return bitmap;
@@ -195,10 +198,27 @@ ErrorOr<NonnullRefPtr<Bitmap>> YUVData::to_bitmap() const
     return bitmap;
 }
 
-ErrorOr<NonnullRefPtr<Bitmap>> biplanar_yuv_to_bitmap(IntSize size, u8 bit_depth, Media::CodingIndependentCodePoints cicp, BiplanarYUVPlane luma, BiplanarYUVPlane chroma)
+ErrorOr<NonnullRefPtr<Bitmap>> biplanar_yuv_to_bitmap(IntSize size, u8 bit_depth, Media::Subsampling subsampling, Media::CodingIndependentCodePoints cicp, BiplanarYUVPlane luma, BiplanarYUVPlane chroma)
 {
-    if (cicp.matrix_coefficients() == Media::MatrixCoefficients::Identity)
+    auto is_rgb = cicp.matrix_coefficients() == Media::MatrixCoefficients::Identity;
+    if (is_rgb && subsampling != Media::Subsampling::yuv444())
         return Error::from_string_literal("Subsampled RGB is unsupported");
+    if (size.is_empty())
+        return Error::from_string_literal("Bi-planar YUV size is empty");
+
+    size_t bytes_per_sample = bit_depth > 8 ? 2 : 1;
+    auto plane_covers_rows = [](BiplanarYUVPlane const& plane, size_t row_byte_count, size_t row_count) {
+        if (plane.stride < row_byte_count)
+            return false;
+        Checked<size_t> required_size = plane.stride;
+        required_size *= row_count;
+        return !required_size.has_overflow() && plane.data.size() >= required_size.value();
+    };
+    auto chroma_size = subsampling.subsampled_size(size.to_type<size_t>());
+    auto chroma_width = chroma_size.width();
+    auto chroma_height = chroma_size.height();
+    if (!plane_covers_rows(luma, size.width() * bytes_per_sample, size.height()) || !plane_covers_rows(chroma, chroma_width * 2 * bytes_per_sample, chroma_height))
+        return Error::from_string_literal("Bi-planar YUV planes are smaller than their size requires");
 
     auto bitmap = TRY(Bitmap::create(BitmapFormat::RGBA8888, AlphaType::Premultiplied, size));
     auto* destination = reinterpret_cast<u8*>(bitmap->scanline(0));
@@ -207,23 +227,37 @@ ErrorOr<NonnullRefPtr<Bitmap>> biplanar_yuv_to_bitmap(IntSize size, u8 bit_depth
     auto width = static_cast<u32>(size.width());
     auto height = static_cast<u32>(size.height());
 
+    if (is_rgb) {
+        // The luma plane holds green, and the chroma plane holds blue and red in that order.
+        RGBComponent green { luma.data.data(), luma.stride, 1 };
+        RGBComponent blue { chroma.data.data(), chroma.stride, 2 };
+        RGBComponent red { chroma.data.data() + bytes_per_sample, chroma.stride, 2 };
+        if (bytes_per_sample == 1)
+            rgb_components_to_bitmap<u8>(*bitmap, bit_depth, 0, cicp.video_full_range_flag(), green, blue, red);
+        else
+            rgb_components_to_bitmap<u16>(*bitmap, bit_depth, 16 - bit_depth, cicp.video_full_range_flag(), green, blue, red);
+        return bitmap;
+    }
+
     bool full_range = cicp.video_full_range_flag() == Media::VideoFullRangeFlag::Full;
     auto range = full_range ? FFI::YUVRange::Full : FFI::YUVRange::Limited;
     auto matrix = yuv_matrix_for_cicp(cicp);
 
     bool success;
     if (bit_depth <= 8) {
-        success = FFI::yuv_nv12_to_rgba(
+        success = FFI::yuv_biplanar_u8_to_rgba(
             luma.data.data(), static_cast<u32>(luma.stride),
             chroma.data.data(), static_cast<u32>(chroma.stride),
             width, height,
+            subsampling.x(), subsampling.y(),
             destination, destination_stride,
             range, matrix);
     } else {
-        success = FFI::yuv_p010_to_rgba(
+        success = FFI::yuv_biplanar_u16_to_rgba(
             reinterpret_cast<u16 const*>(luma.data.data()), static_cast<u32>(luma.stride / sizeof(u16)),
             reinterpret_cast<u16 const*>(chroma.data.data()), static_cast<u32>(chroma.stride / sizeof(u16)),
             width, height,
+            subsampling.x(), subsampling.y(),
             destination, destination_stride,
             range, matrix);
     }
@@ -232,129 +266,6 @@ ErrorOr<NonnullRefPtr<Bitmap>> biplanar_yuv_to_bitmap(IntSize size, u8 bit_depth
         return Error::from_string_literal("YUV-to-RGB conversion failed");
 
     return bitmap;
-}
-
-SkYUVColorSpace skia_yuv_color_space(Media::CodingIndependentCodePoints cicp)
-{
-    bool full_range = cicp.video_full_range_flag() == Media::VideoFullRangeFlag::Full;
-
-    switch (cicp.matrix_coefficients()) {
-    case Media::MatrixCoefficients::BT709:
-        return full_range ? kRec709_Full_SkYUVColorSpace : kRec709_Limited_SkYUVColorSpace;
-    case Media::MatrixCoefficients::FCC:
-        return full_range ? kFCC_Full_SkYUVColorSpace : kFCC_Limited_SkYUVColorSpace;
-    case Media::MatrixCoefficients::BT470BG:
-    case Media::MatrixCoefficients::BT601:
-        return full_range ? kJPEG_Full_SkYUVColorSpace : kRec601_Limited_SkYUVColorSpace;
-    case Media::MatrixCoefficients::SMPTE240:
-        return full_range ? kSMPTE240_Full_SkYUVColorSpace : kSMPTE240_Limited_SkYUVColorSpace;
-    case Media::MatrixCoefficients::YCgCo:
-        return full_range ? kYCgCo_16bit_Full_SkYUVColorSpace : kYCgCo_16bit_Limited_SkYUVColorSpace;
-    case Media::MatrixCoefficients::BT2020NonConstantLuminance:
-    case Media::MatrixCoefficients::BT2020ConstantLuminance:
-        return full_range ? kBT2020_16bit_Full_SkYUVColorSpace : kBT2020_16bit_Limited_SkYUVColorSpace;
-    case Media::MatrixCoefficients::SMPTE2085:
-        return full_range ? kYDZDX_Full_SkYUVColorSpace : kYDZDX_Limited_SkYUVColorSpace;
-    case Media::MatrixCoefficients::Identity:
-        return kIdentity_SkYUVColorSpace;
-    default:
-        // Default to BT.709 for unsupported matrix coefficients
-        return full_range ? kRec709_Full_SkYUVColorSpace : kRec709_Limited_SkYUVColorSpace;
-    }
-}
-
-static SkYUVAInfo::Subsampling skia_subsampling(Media::Subsampling subsampling)
-{
-    if (!subsampling.x() && !subsampling.y())
-        return SkYUVAInfo::Subsampling::k444;
-    if (subsampling.x() && !subsampling.y())
-        return SkYUVAInfo::Subsampling::k422;
-    if (!subsampling.x() && subsampling.y())
-        return SkYUVAInfo::Subsampling::k440;
-    return SkYUVAInfo::Subsampling::k420;
-}
-
-static u16 expand_sample_to_full_16_bit_range(u16 sample, u8 bit_depth)
-{
-    if (bit_depth >= 16)
-        return sample;
-
-    auto const shift = 16 - bit_depth;
-    auto const inverse_shift = bit_depth - shift;
-    return static_cast<u16>((sample << shift) | (sample >> inverse_shift));
-}
-
-static void copy_plane_expanded_to_full_16_bit_range(ReadonlyBytes source_buffer, SkPixmap const& destination, IntSize plane_size, u8 bit_depth)
-{
-    VERIFY(bit_depth > 8);
-
-    auto const* source = reinterpret_cast<u16 const*>(source_buffer.data());
-    auto source_stride = static_cast<size_t>(plane_size.width());
-
-    for (int row = 0; row < plane_size.height(); row++) {
-        auto const* source_row = source + (static_cast<size_t>(row) * source_stride);
-        auto* destination_row = destination.writable_addr16(0, row);
-        for (int column = 0; column < plane_size.width(); column++)
-            destination_row[column] = expand_sample_to_full_16_bit_range(source_row[column], bit_depth);
-    }
-}
-
-SkYUVAPixmaps YUVData::make_pixmaps() const
-{
-    auto skia_size = SkISize::Make(m_size.width(), m_size.height());
-
-    auto yuva_info = SkYUVAInfo(
-        skia_size,
-        SkYUVAInfo::PlaneConfig::kY_U_V,
-        skia_subsampling(m_subsampling),
-        skia_yuv_color_space(m_cicp));
-
-    SkColorType color_type;
-    SkYUVAPixmapInfo::DataType data_type;
-    size_t component_size;
-    if (m_bit_depth <= 8) {
-        color_type = kAlpha_8_SkColorType;
-        data_type = SkYUVAPixmapInfo::DataType::kUnorm8;
-        component_size = 1;
-    } else {
-        SkYUVAPixmapInfo pixmap_info(yuva_info, SkYUVAPixmapInfo::DataType::kUnorm16, nullptr);
-        auto pixmaps = SkYUVAPixmaps::Allocate(pixmap_info);
-        if (!pixmaps.isValid())
-            return pixmaps;
-
-        copy_plane_expanded_to_full_16_bit_range(m_y_data, pixmaps.plane(0), m_size, m_bit_depth);
-
-        auto uv_size = m_subsampling.subsampled_size(m_size);
-        copy_plane_expanded_to_full_16_bit_range(m_u_data, pixmaps.plane(1), uv_size, m_bit_depth);
-        copy_plane_expanded_to_full_16_bit_range(m_v_data, pixmaps.plane(2), uv_size, m_bit_depth);
-
-        return pixmaps;
-    }
-
-    auto y_row_bytes = static_cast<size_t>(m_size.width()) * component_size;
-
-    auto uv_size = m_subsampling.subsampled_size(m_size);
-    auto uv_row_bytes = static_cast<size_t>(uv_size.width()) * component_size;
-
-    SkYUVAPixmapInfo pixmap_info(yuva_info, data_type, nullptr);
-
-    // Create pixmaps from our buffers
-    SkPixmap y_pixmap(
-        SkImageInfo::Make(skia_size, color_type, kOpaque_SkAlphaType),
-        m_y_data.data(),
-        y_row_bytes);
-    SkPixmap u_pixmap(
-        SkImageInfo::Make(uv_size.width(), uv_size.height(), color_type, kOpaque_SkAlphaType),
-        m_u_data.data(),
-        uv_row_bytes);
-    SkPixmap v_pixmap(
-        SkImageInfo::Make(uv_size.width(), uv_size.height(), color_type, kOpaque_SkAlphaType),
-        m_v_data.data(),
-        uv_row_bytes);
-
-    SkPixmap plane_pixmaps[SkYUVAInfo::kMaxPlanes] = { y_pixmap, u_pixmap, v_pixmap, {} };
-
-    return SkYUVAPixmaps::FromExternalPixmaps(yuva_info, plane_pixmaps);
 }
 
 }

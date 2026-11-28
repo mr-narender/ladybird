@@ -11,10 +11,10 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/Vector.h>
-#include <LibGfx/TextLayout.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/RenderedText.h>
 
 namespace Web::Layout {
 
@@ -22,32 +22,21 @@ class GeneratedTextNode;
 
 class TextNode : public Node {
 public:
-    TextNode(DOM::Document&, DOM::Text&, AttachToDOMNode = AttachToDOMNode::Yes);
+    TextNode(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
     virtual ~TextNode() override;
 
-    DOM::Text const& dom_node() const { return static_cast<DOM::Text const&>(*Node::dom_node()); }
-    virtual DOM::Text const* dom_text() const { return &dom_node(); }
+    DOM::Text const& dom_node() const
+    {
+        auto const* text = TextNode::dom_text();
+        VERIFY(text);
+        return *text;
+    }
+    // Null for generated text, and for a text node kept after its DOM node was removed.
+    virtual DOM::Text const* dom_text() const { return static_cast<DOM::Text const*>(Node::dom_node()); }
 
-    virtual Utf16String const& text() const { return dom_node().data(); }
-
-    // Borrows the arena's rendered text until this node's content is republished or freed.
-    Utf16View text_for_rendering() const;
-    Utf16String rendered_text_for_dom(bool collapse_whitespace) const;
+    Utf16String rendered_text_for_dom() const;
+    RenderedTextForDOM rendered_text_for_dom_with_offset_mapping() const;
     RustFFI::FfiTextSourceRange word_range_at(size_t dom_offset) const;
-    void invalidate_text_for_rendering();
-
-    // The returned views survive until the next DOM mutation.
-    RustFFI::FfiTextSource text_source() const;
-
-    void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList) const;
-
-    bool update_produces_line_box_fragment_when_empty_flag();
-
-protected:
-    TextNode(DOM::Document&, RustFFI::NodeKind);
-
-    virtual GC::Ptr<DOM::Element const> parent_element_for_text_transform() const;
-    virtual bool is_password_input() const;
 
 private:
     virtual bool is_text_node() const final { return true; }
@@ -55,23 +44,11 @@ private:
 
 class GeneratedTextNode final : public TextNode {
 public:
-    GeneratedTextNode(DOM::Document&, Utf16String);
+    GeneratedTextNode(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
     virtual ~GeneratedTextNode() override;
 
     virtual DOM::Text const* dom_text() const override { return nullptr; }
-    virtual Utf16String const& text() const override { return m_text; }
-
-private:
-    virtual GC::Ptr<DOM::Element const> parent_element_for_text_transform() const override;
-    virtual bool is_password_input() const override { return false; }
-
-    Utf16String m_text;
 };
-
-// Classifies a code point for direction-run splitting during text chunking:
-// strong LTR/RTL, direction-neutral Common, or ContextDependent (resolved
-// from surrounding runs).
-Gfx::GlyphRun::TextType text_type_for_code_point(u32 code_point);
 
 template<>
 inline bool Node::fast_is<TextNode>() const { return is_text_node(); }

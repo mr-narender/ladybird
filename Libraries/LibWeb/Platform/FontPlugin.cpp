@@ -6,7 +6,6 @@
  */
 
 #include <AK/ByteString.h>
-#include <AK/HashTable.h>
 #include <AK/String.h>
 #include <AK/TypeCasts.h>
 #include <LibCore/Resource.h>
@@ -15,7 +14,6 @@
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/PathFontProvider.h>
 #include <LibGfx/Font/Typeface.h>
-#include <LibGfx/Font/TypefaceSkia.h>
 #include <LibWeb/Platform/FontPlugin.h>
 
 namespace Web::Platform {
@@ -37,9 +35,6 @@ void FontPlugin::install(FontPlugin& plugin)
 FontPlugin::FontPlugin(bool is_layout_test_mode, Gfx::SystemFontProvider* font_provider)
     : m_is_layout_test_mode(is_layout_test_mode)
 {
-    if (is_layout_test_mode)
-        Gfx::force_hinting_for_testing(Gfx::FontHintingStyle::Normal);
-
     if (!font_provider)
         font_provider = &static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
     if (is<Gfx::PathFontProvider>(*font_provider)) {
@@ -51,7 +46,7 @@ FontPlugin::FontPlugin(bool is_layout_test_mode, Gfx::SystemFontProvider* font_p
 
     update_generic_fonts();
 
-    auto default_fixed_width_font_name = generic_font_name(GenericFont::UiMonospace, 400, 0);
+    auto default_fixed_width_font_name = generic_font_name(GenericFont::UiMonospace);
     m_default_fixed_width_font = Gfx::FontDatabase::the().get(default_fixed_width_font_name, 12.0, 400, Gfx::FontWidth::Normal, 0);
     VERIFY(m_default_fixed_width_font);
 
@@ -63,13 +58,8 @@ FontPlugin::~FontPlugin() = default;
 
 RefPtr<Gfx::Font> FontPlugin::default_font(float point_size, Optional<Gfx::FontVariationSettings> const& font_variation_settings, Optional<Gfx::ShapeFeatures> const& shape_features)
 {
-    auto font_name = generic_font_name(GenericFont::UiSansSerif, 400, 0);
+    auto font_name = generic_font_name(GenericFont::UiSansSerif);
     return Gfx::FontDatabase::the().get(font_name, point_size, 400, Gfx::FontWidth::Normal, 0, font_variation_settings, shape_features);
-}
-
-Gfx::Font& FontPlugin::default_fixed_width_font()
-{
-    return *m_default_fixed_width_font;
 }
 
 Vector<FlyString> FontPlugin::symbol_font_names()
@@ -79,6 +69,7 @@ Vector<FlyString> FontPlugin::symbol_font_names()
 
 void FontPlugin::set_system_font_family(FlyString system_font_family)
 {
+    MutexLocker locker(m_generic_font_cache_mutex);
     if (m_system_font_family == system_font_family)
         return;
     m_system_font_family = move(system_font_family);
@@ -88,7 +79,7 @@ void FontPlugin::set_system_font_family(FlyString system_font_family)
 void FontPlugin::update_generic_fonts()
 {
     // Store fallback font lists for each generic font category.
-    // The actual font selection happens in generic_font_name() based on the requested style.
+    // The actual font selection happens in generic_font_name() based on availability.
 
     m_generic_font_fallbacks.resize(to_underlying(GenericFont::__Count));
 
@@ -97,6 +88,10 @@ void FontPlugin::update_generic_fonts()
     // (We also add Android-specific font names to the list from W3 where required.)
     Vector<FlyString> cursive_fallbacks { "Comic Sans MS"_fly_string, "Comic Sans"_fly_string, "Apple Chancery"_fly_string, "Bradley Hand"_fly_string, "Brush Script MT"_fly_string, "Snell Roundhand"_fly_string, "URW Chancery L"_fly_string, "Dancing Script"_fly_string };
     Vector<FlyString> fantasy_fallbacks { "Impact"_fly_string, "Luminari"_fly_string, "Chalkduster"_fly_string, "Jazz LET"_fly_string, "Blippo"_fly_string, "Stencil Std"_fly_string, "Marker Felt"_fly_string, "Trattatello"_fly_string, "Coming Soon"_fly_string };
+    // NB: Fonts with an OpenType MATH table: the one macOS users most often have first, then the ones TeX and Linux
+    //     distributions ship, then the one Windows ships. STIXGeneral, which macOS ships, has no MATH table, but was
+    //     made for mathematical text.
+    Vector<FlyString> math_fallbacks { "STIX Two Math"_fly_string, "Latin Modern Math"_fly_string, "XITS Math"_fly_string, "Libertinus Math"_fly_string, "TeX Gyre Termes Math"_fly_string, "DejaVu Math TeX Gyre"_fly_string, "Cambria Math"_fly_string, "STIXGeneral"_fly_string };
     Vector<FlyString> monospace_fallbacks { "Andale Mono"_fly_string, "Courier New"_fly_string, "Courier"_fly_string, "FreeMono"_fly_string, "OCR A Std"_fly_string, "Noto Sans Mono"_fly_string, "DejaVu Sans Mono"_fly_string, "Droid Sans Mono"_fly_string, "Liberation Mono"_fly_string };
     Vector<FlyString> sans_serif_fallbacks { "Arial"_fly_string, "Helvetica"_fly_string, "Verdana"_fly_string, "Trebuchet MS"_fly_string, "Gill Sans"_fly_string, "Noto Sans"_fly_string, "Avantgarde"_fly_string, "Optima"_fly_string, "Arial Narrow"_fly_string, "Liberation Sans"_fly_string, "Roboto"_fly_string };
     Vector<FlyString> serif_fallbacks { "Times"_fly_string, "Times New Roman"_fly_string, "Didot"_fly_string, "Georgia"_fly_string, "Palatino"_fly_string, "Bookman"_fly_string, "New Century Schoolbook"_fly_string, "American Typewriter"_fly_string, "Liberation Serif"_fly_string, "Roman"_fly_string, "Noto Serif"_fly_string };
@@ -107,6 +102,7 @@ void FontPlugin::update_generic_fonts()
 
     fallback_set(GenericFont::Cursive) = move(cursive_fallbacks);
     fallback_set(GenericFont::Fantasy) = move(fantasy_fallbacks);
+    fallback_set(GenericFont::Math) = move(math_fallbacks);
     fallback_set(GenericFont::Monospace) = move(monospace_fallbacks);
     fallback_set(GenericFont::SansSerif) = move(sans_serif_fallbacks);
     fallback_set(GenericFont::Serif) = move(serif_fallbacks);
@@ -116,23 +112,24 @@ void FontPlugin::update_generic_fonts()
     fallback_set(GenericFont::UiSerif) = fallback_set(GenericFont::Serif);
 }
 
-FlyString FontPlugin::generic_font_name(GenericFont generic_font, int weight, int slope)
+FlyString FontPlugin::generic_font_name(GenericFont generic_font)
 {
     if (m_is_layout_test_mode)
         return "SerenitySans"_fly_string;
 
-    GenericFontKey key { generic_font, weight, slope };
-    return m_generic_font_cache.ensure(key, [&] {
-        return compute_generic_font_name(generic_font, weight, slope);
+    MutexLocker locker(m_generic_font_cache_mutex);
+    return m_generic_font_cache.ensure(generic_font, [&] {
+        return compute_generic_font_name(generic_font);
     });
 }
 
-FlyString FontPlugin::compute_generic_font_name(GenericFont generic_font, int weight, int slope)
+FlyString FontPlugin::compute_generic_font_name(GenericFont generic_font)
 {
     // https://drafts.csswg.org/css-fonts-4/#generic-font-families
     // User agents should provide reasonable default choices for the generic font families, that express the
     // characteristics of each family as well as possible, within the limits allowed by the underlying technology.
-    // NB: We prefer fonts that support the requested weight and slope, falling back to fonts with more style variety.
+    // NB: Choose a family in fallback order, independently of weight and slope. Font matching selects a face
+    //     within that family, so different styles do not switch to unrelated families.
 
     auto const& fallbacks = m_generic_font_fallbacks[to_underlying(generic_font)];
 
@@ -143,6 +140,9 @@ FlyString FontPlugin::compute_generic_font_name(GenericFont generic_font, int we
         break;
     case GenericFont::Fantasy:
         generic_family_name = "fantasy"sv;
+        break;
+    case GenericFont::Math:
+        generic_family_name = "math"sv;
         break;
     case GenericFont::Monospace:
     case GenericFont::UiMonospace:
@@ -170,50 +170,26 @@ FlyString FontPlugin::compute_generic_font_name(GenericFont generic_font, int we
             return m_system_font_family.value();
     }
 
-    auto name = Gfx::FontDatabase::the().resolve_generic_family(generic_family_name, weight, slope);
+    auto name = Gfx::FontDatabase::the().resolve_generic_family(generic_family_name, 400, 0);
     if (name.has_value()) {
-        if (Gfx::FontDatabase::the().get(name.value(), 16, weight, Gfx::FontWidth::Normal, slope))
+        if (Gfx::FontDatabase::the().get(name.value(), 16, 400, Gfx::FontWidth::Normal, 0))
             return FlyString { name.release_value() };
     }
 
-    // Score each fallback family based on how well it can satisfy the requested style.
-    // Higher score = better match.
-    FlyString best_family;
-    int best_score = -1;
-
     for (auto const& family : fallbacks) {
-        int score = 0;
-        bool has_requested_weight = false;
-        bool has_requested_slope = false;
-        HashTable<u16> available_weights;
-
-        Gfx::FontDatabase::the().for_each_typeface_with_family_name(family, [&](Gfx::Typeface const& typeface) {
-            available_weights.set(typeface.weight());
-            if (typeface.weight() == static_cast<u16>(weight))
-                has_requested_weight = true;
-            if (typeface.slope() == static_cast<u8>(slope))
-                has_requested_slope = true;
+        bool is_available = false;
+        Gfx::FontDatabase::the().for_each_typeface_with_family_name(family, [&](Gfx::Typeface const&) {
+            is_available = true;
         });
-
-        // Strongly prefer families that have the exact requested weight.
-        if (has_requested_weight)
-            score += 1000;
-
-        // Prefer families that have the exact requested slope.
-        if (has_requested_slope)
-            score += 100;
-
-        // As a tiebreaker, prefer families with more weight variety.
-        // This helps select fonts that can handle both regular and bold text.
-        score += available_weights.size();
-
-        if (score > best_score) {
-            best_score = score;
-            best_family = family;
-        }
+        if (is_available)
+            return family;
     }
 
-    return best_family;
+    // NB: Without a math font, math text is drawn in the serif font, rather than in the family listed after math.
+    if (generic_font == GenericFont::Math)
+        return compute_generic_font_name(GenericFont::Serif);
+
+    return fallbacks.first();
 }
 
 }

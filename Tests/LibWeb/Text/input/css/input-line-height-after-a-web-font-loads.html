@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<!-- The used line-height of a single-line input is never smaller than a line-height of normal, which reads the metrics
+     of its first available font: a web font arriving moves them. -->
+<style>
+    input {
+        font-family: "Tall", sans-serif;
+        font-size: 16px;
+        line-height: 1.25;
+    }
+</style>
+<input id="input">
+<script src="../include.js"></script>
+<script>
+    asyncTest(async done => {
+        const input = document.getElementById("input");
+        // The face is added only now, so no style pass before the first read can have started its load: A style that
+        // reads a pending face's metrics loads it, and a fast load would land before that read.
+        const face = new FontFace("Tall", 'url("../../../Assets/NotoSansEthiopic.woff2")');
+        document.fonts.add(face);
+        println(`Before the load: ${getComputedStyle(input).lineHeight}`);
+        await face.load();
+        await document.fonts.ready;
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        println(`After the load: ${getComputedStyle(input).lineHeight}`);
+        done();
+    });
+</script>

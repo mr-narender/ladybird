@@ -194,3 +194,94 @@ describe("errors", () => {
         }).toThrowWithMessage(TypeError, "foo is not a function");
     });
 });
+
+describe("length and name of bound functions", () => {
+    test("own properties in definition order with their attributes", () => {
+        function f(a, b, c) {}
+        const bound = f.bind(null, 1);
+        expect(Object.getOwnPropertyNames(bound)).toEqual(["length", "name"]);
+        expect(Object.getOwnPropertyDescriptor(bound, "length")).toEqual({
+            value: 2,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        });
+        expect(Object.getOwnPropertyDescriptor(bound, "name")).toEqual({
+            value: "bound f",
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        });
+        expect(bound.bind().name).toBe("bound bound f");
+    });
+
+    test("accessors and missing properties of the target", () => {
+        function f(a) {}
+        const calls = [];
+        Object.defineProperty(f, "length", {
+            get() {
+                calls.push("length");
+                return 5;
+            },
+        });
+        Object.defineProperty(f, "name", {
+            get() {
+                calls.push("name");
+                return 42;
+            },
+        });
+        const bound = f.bind(null, 1, 2);
+        expect(calls).toEqual(["length", "name"]);
+        expect(bound.length).toBe(3);
+        expect(bound.name).toBe("bound ");
+
+        function g() {}
+        delete g.length;
+        delete g.name;
+        expect(g.bind().length).toBe(0);
+        expect(g.bind().name).toBe("bound ");
+
+        function h() {}
+        Object.defineProperty(h, "length", { value: Infinity });
+        Object.defineProperty(h, "name", { value: "été" });
+        expect(h.bind().length).toBe(Infinity);
+        expect(h.bind().name).toBe("bound été");
+    });
+
+    test("targets with another prototype or behind a proxy", () => {
+        function f(a, b) {}
+        const prototype = function () {};
+        Object.setPrototypeOf(f, prototype);
+        const bound = f.bind();
+        expect(Object.getPrototypeOf(bound)).toBe(prototype);
+        expect(bound.length).toBe(2);
+        expect(bound.name).toBe("bound f");
+
+        const proxy = new Proxy(f, {});
+        expect(proxy.bind().name).toBe("bound f");
+        expect(proxy.bind(null, 1).length).toBe(1);
+
+        expect(Math.max.bind().name).toBe("bound max");
+        expect(Math.max.bind().length).toBe(2);
+    });
+
+    test("a very deep chain of bound functions does not overflow the stack", () => {
+        let f = function (...args) {
+            return new.target ? { args } : args.length;
+        };
+        for (let i = 0; i < 300_000; ++i) {
+            f = f.bind();
+            // Keeps each bind from copying an ever longer "bound bound ..." name.
+            Object.defineProperty(f, "name", { value: "" });
+        }
+
+        // instanceof recurses through the chain, which may or may not fit on the stack.
+        try {
+            expect({} instanceof f).toBeFalse();
+        } catch (error) {
+            expect(error).toBeInstanceOf(InternalError);
+        }
+        expect(f(1, 2)).toBe(2);
+        expect(new f(1, 2).args).toEqual([1, 2]);
+    });
+});

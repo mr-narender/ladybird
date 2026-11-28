@@ -9,7 +9,8 @@
 #include <LibCore/StandardPaths.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/TypefaceSkia.h>
+#include <LibGfx/Font/SystemFallbackFonts.h>
+#include <LibGfx/Font/SystemFontMatcher.h>
 
 #if defined(AK_OS_HAIKU)
 #    include <FindDirectory.h>
@@ -41,15 +42,18 @@ RefPtr<Typeface> SystemFontProvider::get_typeface_by_id(u64, u64)
 
 RefPtr<Gfx::Font> SystemFontProvider::get_font_for_code_point(u32 code_point, float point_size, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
 {
-    auto typeface_or_error = TypefaceSkia::find_typeface_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
-    if (typeface_or_error.is_error() || !typeface_or_error.value())
+    auto match = SystemFontMatcher::match_code_point(code_point, weight, width, slope, prefer_color_emoji);
+    if (!match.has_value())
         return nullptr;
-    return typeface_or_error.release_value()->font(point_size, {});
+    auto typeface = SystemFontMatcher::load(*match);
+    if (typeface.is_error())
+        return nullptr;
+    return typeface.value()->font(point_size, {});
 }
 
 Optional<FlyString> SystemFontProvider::resolve_generic_family(StringView family_name, u16 weight, u8 slope)
 {
-    return TypefaceSkia::resolve_generic_family(family_name, weight, slope);
+    return SystemFontMatcher::resolve_generic_family(family_name, weight, slope);
 }
 
 FontDatabase& FontDatabase::the()
@@ -61,14 +65,9 @@ FontDatabase& FontDatabase::the()
 SystemFontProvider& FontDatabase::install_system_font_provider(NonnullOwnPtr<SystemFontProvider> provider)
 {
     VERIFY(!m_system_font_provider);
+    clear_system_fallback_font_cache();
     m_system_font_provider = move(provider);
     return *m_system_font_provider;
-}
-
-StringView FontDatabase::system_font_provider_name() const
-{
-    VERIFY(m_system_font_provider);
-    return m_system_font_provider->name();
 }
 
 FontDatabase::FontDatabase() = default;
