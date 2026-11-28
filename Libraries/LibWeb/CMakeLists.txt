@@ -285,11 +285,11 @@ set(SOURCES
     Fetch/Fetching/Checks.cpp
     Fetch/Fetching/ClientContextSnapshots.cpp
     Fetch/Fetching/NetworkBodyPump.cpp
+    Fetch/Fetching/NetworkObserverHooks.cpp
     Fetch/Fetching/FetchEngine.cpp
     Fetch/Fetching/FetchEventSink.cpp
     Fetch/Fetching/Fetching.cpp
     Fetch/Fetching/PendingResponse.cpp
-    Fetch/Fetching/PreloadWaitHandle.cpp
     Fetch/Fetching/RefCountedFlag.cpp
     Fetch/FetchMethod.cpp
     Fetch/Headers.cpp
@@ -369,7 +369,6 @@ set(SOURCES
     HTML/CustomElements/CustomElementReactions.cpp
     HTML/CustomElements/CustomElementRegistry.cpp
     HTML/CustomElements/CustomStateSet.cpp
-    HTML/DataTransfer.cpp
     HTML/Dates.cpp
     HTML/DecodedImageData.cpp
     HTML/DedicatedWorkerGlobalScope.cpp

@@ -227,6 +227,7 @@ enum class InvalidateLayoutTreeReason {
     X(HTMLInputElementHeight, true)                 \
     X(HTMLInputElementWidth, true)                  \
     X(HTMLLabelElementActivationBehavior, false)    \
+    X(HTMLTextAreaElementHardWrap, false)           \
     X(HighlightRegistryHighlightsFromPoint, false)  \
     X(InspectAccessibilityTree, false)              \
     X(InspectDOMTree, false)                        \
@@ -1248,6 +1249,7 @@ public:
     void unload(GC::Ptr<Document> new_document = nullptr, Optional<UnloadOfReplacedDocument>* unload_of_replaced_document = nullptr);
     void take_unload_timing_of_replaced_document(UnloadOfReplacedDocument const&);
     void set_window_is_taken_over_after_unload() { m_window_is_taken_over_after_unload = true; }
+    bool window_is_taken_over_after_unload() const { return m_window_is_taken_over_after_unload; }
 
     // https://html.spec.whatwg.org/multipage/dom.html#active-parser
     GC::Ptr<HTML::HTMLParser> active_parser() const;
@@ -1903,6 +1905,8 @@ protected:
 
 private:
     bool script_edits_for_the_user() const;
+
+    void cancel_active_refresh();
 
     bool update_is_fully_active() const;
     bool compute_is_fully_active() const;

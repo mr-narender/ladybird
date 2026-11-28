@@ -540,6 +540,21 @@ void BrowserWindow::initialize_application_menu()
     setMenuBar(Application::the().create_application_menu_bar(Application::ForBrowserWindow::Yes));
     menuBar()->setObjectName("LadybirdMenuBar");
 
+#if defined(AK_OS_MACOS)
+    // Like any Mac app's Window menu, this one sits before the Help menu, and AppKit adds its own window commands to it.
+    auto* window_menu = new QMenu("&Window", menuBar());
+    menuBar()->insertMenu(Application::the().help_menu()->menuAction(), window_menu);
+
+    auto* minimize_action = window_menu->addAction("Minimize");
+    minimize_action->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_M));
+    connect(minimize_action, &QAction::triggered, this, [this] { showMinimized(); });
+
+    auto* zoom_action = window_menu->addAction("Zoom");
+    connect(zoom_action, &QAction::triggered, this, [this] { toggle_window_maximized(); });
+
+    register_windows_menu(*window_menu, *this);
+#endif
+
     create_menu_bar_window_controls();
     update_menu_bar_visibility();
 }
@@ -2080,11 +2095,14 @@ void BrowserWindow::changeEvent(QEvent* event)
 
 void BrowserWindow::appearance_changed()
 {
-    SystemAppearance::the().apply_interface_theme(Application::settings().appearance().interface_theme);
-    SystemAppearance::the().apply_color_theme(Application::settings().appearance().color_theme);
-    update_menu_bar_visibility();
+    auto const& appearance = Application::settings().appearance();
+    SystemAppearance::the().apply_interface_theme(appearance.interface_theme);
+    SystemAppearance::the().apply_color_theme(appearance.color_theme);
 
+    update_menu_bar_visibility();
+    m_tabs_container->update_toolbar_button_visibility();
     m_tabs_container->update_bookmarks_bar_visibility();
+
     for_each_tab([](Tab& tab) {
         tab.view().update_palette();
     });

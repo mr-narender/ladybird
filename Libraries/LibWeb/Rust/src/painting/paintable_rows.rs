@@ -17,6 +17,7 @@ use crate::painting::stacking_context::entries::{StackingContextEntryColumn, dro
 use crate::painting::visual_context::dirty::{RemovedBoxBlocks, VisualContextBoxDirtyKind, VisualContextUpdateScope};
 use crate::painting::visual_context::{
     BoxVisualContextNodeHandles, EMPTY_BOX_VISUAL_CONTEXT_NODE_HANDLES, PaintableVisualContextRecord,
+    records::{HeldVisualContextRecord, SharedDescendantVisualContexts},
 };
 use smallvec::{SmallVec, smallvec};
 use std::cell::RefCell;
@@ -210,12 +211,21 @@ impl UniqueNodeIdColumn {
     }
 
     /// Publishes the names of the nodes the rows of a chunk new to the arena carry, from its first slot
-    /// `first_slot_index` on, each in its first generation, `generation`; a row whose name is 0 carries none.
-    pub(crate) fn publish_new_chunk(&mut self, first_slot_index: usize, generation: u8, ids: &[i64]) {
+    /// `first_slot_index` on, each in its first generation, `generation`; a row whose name is 0 carries none. The
+    /// chunks adopted with it end at the slot `end_slot_index`.
+    pub(crate) fn publish_new_chunk(
+        &mut self,
+        first_slot_index: usize,
+        end_slot_index: usize,
+        generation: u8,
+        ids: &[i64],
+    ) {
         if ids.iter().all(|&id| id == 0) {
             return;
         }
         debug_assert!(self.ids.len() <= first_slot_index);
+        // OPTIMIZATION: The column makes room for every chunk adopted with this one at once, and for no more.
+        self.ids.reserve_for_len(end_slot_index);
         self.ids.resize_with_default(first_slot_index);
         let block: Vec<(NodeSlotId, i64)> = ids
             .iter()
@@ -257,7 +267,8 @@ pub(crate) struct PaintableRowStore {
     pub(crate) paint_change_stamps: CowColumn<PaintChangeStamps, PAINTABLE_SLOTS_PER_CHUNK>,
     pub(crate) paint_generations: PaintGenerations,
     // NB: Boxed, as most rows have no record, and a row holds no more than a pointer for one.
-    visual_context_records: CowColumn<Option<Box<PaintableVisualContextRecord>>, PAINTABLE_SLOTS_PER_CHUNK>,
+    visual_context_records: CowColumn<Option<Box<HeldVisualContextRecord>>, PAINTABLE_SLOTS_PER_CHUNK>,
+    shared_descendant_visual_contexts: SharedDescendantVisualContexts,
     /// The visual context node handles of each row that has a record. They are kept here only, in
     /// a column a frame publishes, so the visual context update and the recording read the same.
     visual_context_node_handles: VisualContextNodeHandleColumn,
@@ -507,6 +518,82 @@ impl CommittedFragmentLinkSlot {
 }
 
 impl PaintableRowStore {
+    /// Lets the columns stop storing the rows of the `count` slots from `first_slot`, in each column where they are
+    /// all the default, as the rows of freed slots are. Both are multiples of the columns' chunk size.
+    pub(crate) fn stop_storing_default_rows(&mut self, first_slot: usize, count: usize) {
+        let first = first_slot / PAINTABLE_SLOTS_PER_CHUNK;
+        for chunk in first..first + count / PAINTABLE_SLOTS_PER_CHUNK {
+            self.rows.release_chunk_if_default(chunk);
+            self.side_data
+                .release_chunk_if_all(chunk, PaintableSideData::is_default);
+            self.ink_overflow.release_chunk_if_default(chunk);
+            self.committed_side_data.release_chunk_if_default(chunk);
+            self.paint_change_stamps.release_chunk_if_default(chunk);
+            self.visual_context_records.release_chunk_if_default(chunk);
+            self.visual_context_node_handles.release_chunk_if_default(chunk);
+            self.stacking_context_entries.release_chunk_if_default(chunk);
+            self.committed_fragment_links.release_chunk_if_default(chunk);
+        }
+    }
+
+    /// Counts the columns of the paintable rows, and what the committed links reach.
+    pub(crate) fn report_memory(&self, report: &mut crate::layout::memory_report::LayoutMemoryReport) {
+        use crate::layout::memory_report::LayoutMemoryOwner;
+        let mut links = Vec::new();
+        let committed_links = self.committed_fragment_links.heap_size(&mut report.sizer, |slot, _| {
+            links.extend(slot.link.as_ref().map(|link| link.fragment.clone()));
+            slot.link.as_ref().map_or(0, |link| link.placement.heap_bytes())
+        });
+        report.add(LayoutMemoryOwner::CommittedLinks, committed_links);
+        for fragment in &links {
+            report.add_fragment_tree(fragment);
+        }
+        let mut contents = Vec::new();
+        let rows = self.rows.heap_size(&mut report.sizer, |_, _| 0)
+            + self.ink_overflow.heap_size(&mut report.sizer, |_, _| 0)
+            + self.ink_overflow_dirty.row_bytes()
+            + self.side_data.heap_size(&mut report.sizer, |_, _| 0)
+            + self.committed_side_data.heap_size(&mut report.sizer, |row, _| {
+                contents.extend(row.inline_content.clone());
+                0
+            })
+            + self.paint_change_stamps.heap_size(&mut report.sizer, |_, _| 0)
+            + self.stacking_context_entries.heap_size(&mut report.sizer, |_, _| 0)
+            + self.unique_node_ids.ids.row_bytes()
+            + crate::heap_size::vec_bytes(&self.ink_overflow_requests)
+            + crate::heap_size::vec_bytes(&self.stacking_context_roots_flagged_for_resort)
+            + crate::heap_size::vec_bytes(&self.line_roots_needing_fragment_ownership);
+        report.add(LayoutMemoryOwner::PaintableRows, rows);
+        for content in &contents {
+            report.add_inline_content(content);
+        }
+        let visual_contexts = self
+            .visual_context_records
+            .heap_size(&mut report.sizer, |record, sizer| {
+                record.as_ref().map_or(0, |record| {
+                    size_of::<HeldVisualContextRecord>()
+                        + sizer.arc_shallow(&record.inherited_input)
+                        + sizer.arc_shallow(&record.output_for_descendants)
+                })
+            })
+            + self
+                .visual_context_node_handles
+                .heap_size(&mut report.sizer, |handles, sizer| {
+                    handles.as_ref().map_or(0, |handles| {
+                        let shallow = sizer.arc_shallow(handles);
+                        if shallow == 0 {
+                            return 0;
+                        }
+                        shallow
+                            + crate::heap_size::vec_bytes(&handles.spatial)
+                            + crate::heap_size::vec_bytes(&handles.chain_clips)
+                            + crate::heap_size::vec_bytes(&handles.descendant_clips)
+                            + crate::heap_size::vec_bytes(&handles.effects)
+                    })
+                });
+        report.add(LayoutMemoryOwner::VisualContexts, visual_contexts);
+    }
+
     pub(crate) fn with_current_committed_fragment_link<R>(
         &self,
         layout_slot_index: u32,
@@ -748,8 +835,8 @@ impl LayoutNodeArena {
         store.visual_context_node_handles.grow_to(index + 1);
         store.stacking_context_entries.grow_to(index + 1);
         store.paint_change_stamps.grow_to(index + 1);
-        while store.side_data.len() <= index {
-            store.side_data.push(PaintableSideData::default());
+        if store.side_data.len() <= index {
+            store.side_data.resize_with_default(index + 1);
         }
 
         store.population_writes += 1;
@@ -801,7 +888,7 @@ impl LayoutNodeArena {
                 .dirty_boxes
                 .note_removed(RemovedBoxBlocks {
                     slot: id,
-                    node_handles: Arc::unwrap_or_clone(node_handles),
+                    node_handles,
                     former_paint_parent,
                 });
         } else {
@@ -813,7 +900,10 @@ impl LayoutNodeArena {
         let index = id.slot_index() as usize;
         store.population_writes += 1;
         store.rows.set(index, PaintableData::default());
-        store.side_data[index] = PaintableSideData::default();
+        // OPTIMIZATION: A write copies the chunk a snapshot shares, and makes one where the column stores none.
+        if store.side_data.get(index).is_some_and(|row| !row.is_default()) {
+            store.side_data[index] = PaintableSideData::default();
+        }
         store.committed_side_data.set(index, CommittedSideData::default());
         store.paint_change_stamps.set(index, PaintChangeStamps::default());
         store.visual_context_records.set(index, None);
@@ -843,7 +933,7 @@ impl LayoutNodeArena {
         &mut self.paintable_rows.unique_node_ids
     }
 
-    pub(crate) fn paintable_visual_context_record(&self, id: NodeSlotId) -> Option<&PaintableVisualContextRecord> {
+    pub(crate) fn paintable_visual_context_record(&self, id: NodeSlotId) -> Option<&HeldVisualContextRecord> {
         if !self.paintable_row_is_populated(id) {
             return None;
         }
@@ -857,7 +947,7 @@ impl LayoutNodeArena {
     pub(crate) fn take_paintable_visual_context_record(
         &mut self,
         id: NodeSlotId,
-    ) -> Option<(PaintableVisualContextRecord, Arc<BoxVisualContextNodeHandles>)> {
+    ) -> Option<(HeldVisualContextRecord, BoxVisualContextNodeHandles)> {
         if !self.paintable_row_is_populated(id) {
             return None;
         }
@@ -873,7 +963,8 @@ impl LayoutNodeArena {
             .visual_context_node_handles
             .row_mut(index)
             .and_then(|mut handles| handles.take())
-            .expect("a row with a record has node handles");
+            .map(Arc::unwrap_or_clone)
+            .unwrap_or_default();
         Some((record, node_handles))
     }
 
@@ -890,11 +981,21 @@ impl LayoutNodeArena {
                 crate::painting::style_queries::z_index(self, id),
             )
         });
+        // OPTIMIZATION: Almost every box owns no node, and a row without handles reads as one that owns none, so only
+        //               a box that owns a node holds an allocation for them.
         set_visual_context_node_handles(
             &mut self.paintable_rows.visual_context_node_handles,
             id.slot_index() as usize,
-            Some(node_handles),
+            (!node_handles.is_empty()).then_some(node_handles),
         );
+        let shared = &mut self.paintable_rows.shared_descendant_visual_contexts;
+        let record = HeldVisualContextRecord {
+            inherited_input: shared.share(record.inherited_input),
+            output_for_descendants: shared.share(record.output_for_descendants),
+            owns_geometry_dependent_nodes: record.owns_geometry_dependent_nodes,
+            subtree_may_own_geometry_dependent_nodes: record.subtree_may_own_geometry_dependent_nodes,
+            stacking_context: record.stacking_context,
+        };
         self.paintable_rows
             .visual_context_records
             .set(id.slot_index() as usize, Some(Box::new(record)));
@@ -927,7 +1028,7 @@ impl LayoutNodeArena {
         self.paintable_rows.visual_context_node_handles.publish()
     }
 
-    /// A row's visual context node handles, if it has a visual context record.
+    /// A row's visual context node handles, if it has a visual context record and owns a node.
     pub(crate) fn paintable_visual_context_node_handles(&self, id: NodeSlotId) -> Option<&BoxVisualContextNodeHandles> {
         if !self.paintable_row_is_populated(id) {
             return None;
@@ -957,9 +1058,10 @@ impl LayoutNodeArena {
         }
     }
 
-    /// The nodes of the box that an animation of the kind drives: the effect nodes of an opacity,
-    /// background color or filter animation, or the spatial nodes of a transform animation, as far
-    /// as the tree holds nodes of the right kind for them.
+    /// The nodes of the box that an animation of the kind drives, as far as the tree holds nodes of the right kind
+    /// for them: the effect nodes of a background color animation, the spatial nodes of a transform animation, or
+    /// the innermost effects node of an opacity or filter animation, which holds the opacity and filter of the box.
+    /// An effects node above that one only blends the box with its backdrop above the masks of the box.
     pub(crate) fn paintable_visual_animation_target_indices(
         &self,
         id: NodeSlotId,
@@ -971,19 +1073,16 @@ impl LayoutNodeArena {
             return Vec::new();
         };
         self.with_paintable_visual_context_node_handles(id, |handles| {
-            let valid_targets = |indices: &mut dyn Iterator<Item = u32>| -> Vec<u32> {
-                indices
-                    .filter(|&index| tree.visual_animation_target_is_valid(target_kind, index))
-                    .collect()
-            };
+            let is_valid_target = |index: &u32| tree.visual_animation_target_is_valid(target_kind, *index);
+            let effects = handles.effects.iter().map(|index| index.0);
             match target_kind {
-                FfiVisualAnimationTargetKind::Opacity
-                | FfiVisualAnimationTargetKind::BackgroundColor
-                | FfiVisualAnimationTargetKind::Filter => {
-                    valid_targets(&mut handles.effects.iter().map(|index| index.0))
+                FfiVisualAnimationTargetKind::Opacity | FfiVisualAnimationTargetKind::Filter => {
+                    effects.rev().find(is_valid_target).into_iter().collect()
                 }
+                FfiVisualAnimationTargetKind::BackgroundColor => effects.filter(is_valid_target).collect(),
                 FfiVisualAnimationTargetKind::Transform => {
-                    valid_targets(&mut handles.spatial.iter().map(|index| index.0))
+                    let spatial = handles.spatial.iter().map(|index| index.0);
+                    spatial.filter(is_valid_target).collect()
                 }
             }
         })

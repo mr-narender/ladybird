@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::font::FontHandle;
+use crate::font::{FontFacts, FontHandle};
+use crate::geometry::FloatRect;
 use hashbrown::hash_map::EntryRef;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -166,14 +167,6 @@ unsafe extern "C" {
         emit: unsafe extern "C" fn(*mut c_void, *const ShapedGlyph, usize, f32, usize, f32, f32, bool),
     );
 
-    fn ladybird_gfx_glyph_run_bounding_box(
-        font: *const c_void,
-        glyphs: *const ShapedGlyph,
-        glyph_count: usize,
-        scale: f32,
-        out_rect: *mut f32,
-    );
-
     fn ladybird_gfx_glyph_run_ink_bounding_box(
         font: *const c_void,
         glyphs: *const ShapedGlyph,
@@ -200,22 +193,75 @@ fn shaped_glyphs_of(glyphs: &GlyphBuffer) -> Vec<ShapedGlyph> {
     glyphs.placed().map(ShapedGlyph::from).collect()
 }
 
+/// How far synthetic bold can spread the ink of a font's glyphs past their outlines, in device pixels. The rasterizer
+/// decides the stroke, so this allows for the widest it's known to use: It bounds what a run may paint, and isn't a
+/// measurement of its ink.
+fn synthetic_bold_outset(facts: &FontFacts, scale: f32) -> f32 {
+    if !facts.has_synthetic_bold {
+        return 0.0;
+    }
+    (facts.pixel_size * scale / 24.0).max(1.0)
+}
+
+/// Conservative bounds of the painted glyphs in device pixels, relative to the run's baseline origin (glyph positions
+/// scaled by `scale`, with the font ascent added to y), as x, y, width and height. The box of the glyph origins is grown
+/// by the box every glyph of the font fits in, or, where the font records no such box, the tight extents of the glyphs
+/// are united instead.
 #[must_use]
 pub fn glyph_run_bounding_box(font: &FontHandle, glyphs: &GlyphBuffer, scale: f32) -> [f32; 4] {
-    let glyphs = shaped_glyphs_of(glyphs);
-    let mut out_rect = [0.0f32; 4];
-    // SAFETY: The handle keeps the font live and the glyph slice stays valid
-    // for the synchronous call, which fills the four floats out_rect points at.
-    unsafe {
-        ladybird_gfx_glyph_run_bounding_box(
-            font.as_raw(),
-            glyphs.as_ptr(),
-            glyphs.len(),
-            scale,
-            out_rect.as_mut_ptr(),
-        );
+    let facts = font.facts();
+    let mut has_painted_glyphs = false;
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for placed in glyphs.placed() {
+        if !placed.glyph.should_paint() {
+            continue;
+        }
+        let origin_x = placed.x * scale;
+        let origin_y = (placed.y + facts.ascent) * scale;
+        if !origin_x.is_finite() || !origin_y.is_finite() {
+            return [0.0; 4];
+        }
+        min_x = min_x.min(origin_x);
+        min_y = min_y.min(origin_y);
+        max_x = max_x.max(origin_x);
+        max_y = max_y.max(origin_y);
+        has_painted_glyphs = true;
     }
-    out_rect
+    if !has_painted_glyphs {
+        return [0.0; 4];
+    }
+
+    let outset = synthetic_bold_outset(facts, scale);
+    let Some(font_bounding_box) = facts.bounding_box_of_all_glyphs else {
+        // NB: HarfBuzz slants the extents of a synthetic oblique itself.
+        let mut bounds = FloatRect::from_array(glyph_run_ink_bounding_box(font, glyphs, scale));
+        if outset > 0.0 && !bounds.is_empty() {
+            bounds = bounds.inflated(outset * 2.0, outset * 2.0);
+        }
+        return [bounds.x, bounds.y, bounds.width, bounds.height];
+    };
+
+    let font_units_to_pixels = facts.pixel_size * scale / f32::from(font_bounding_box.units_per_em);
+    // Font units have y pointing up, device pixels have y pointing down.
+    let mut left = min_x + f32::from(font_bounding_box.x_min) * font_units_to_pixels;
+    let mut right = max_x + f32::from(font_bounding_box.x_max) * font_units_to_pixels;
+    let mut top = min_y - f32::from(font_bounding_box.y_max) * font_units_to_pixels;
+    let mut bottom = max_y - f32::from(font_bounding_box.y_min) * font_units_to_pixels;
+    // A synthetic oblique shifts each point of a glyph along the line by its height above the baseline.
+    if facts.synthetic_slant != 0.0 {
+        let shift_at_top = f32::from(font_bounding_box.y_max) * font_units_to_pixels * facts.synthetic_slant;
+        let shift_at_bottom = f32::from(font_bounding_box.y_min) * font_units_to_pixels * facts.synthetic_slant;
+        left += shift_at_top.min(shift_at_bottom).min(0.0);
+        right += shift_at_top.max(shift_at_bottom).max(0.0);
+    }
+    left -= outset;
+    right += outset;
+    top -= outset;
+    bottom += outset;
+    [left, top, right - left, bottom - top]
 }
 
 /// Tight bounds of the ink of the painted glyphs, from their own extents, in the coordinates of
@@ -444,7 +490,28 @@ pub struct GlyphBuffer {
 
 const _: () = assert!(size_of::<GlyphBuffer>() == 40);
 
+impl<T> GlyphStorage<T> {
+    fn heap_bytes(&self, first_sight: &mut impl FnMut(*const ()) -> bool) -> usize {
+        match self {
+            Self::Shared(glyphs) if first_sight(Arc::as_ptr(glyphs).cast()) => {
+                2 * size_of::<usize>() + size_of_val::<[T]>(glyphs)
+            }
+            Self::Shared(_) => 0,
+            Self::Owned(glyphs) => glyphs.capacity() * size_of::<T>(),
+        }
+    }
+}
+
 impl GlyphBuffer {
+    /// The bytes the buffer holds on the heap. Glyphs it shares with other buffers count where `first_sight` says
+    /// their allocation is reached for the first time.
+    pub fn heap_bytes(&self, mut first_sight: impl FnMut(*const ()) -> bool) -> usize {
+        self.glyphs.heap_bytes(&mut first_sight)
+            + self.placements.as_ref().map_or(0, |placements| {
+                size_of::<GlyphStorage<GlyphPlacement>>() + placements.heap_bytes(&mut first_sight)
+            })
+    }
+
     fn from_shaped(shaped: &[ShapedGlyph]) -> Self {
         let glyphs: Arc<[DrawGlyph]> = shaped
             .iter()
@@ -480,6 +547,16 @@ impl GlyphBuffer {
             size_of::<GlyphStorage<GlyphPlacement>>() + size_of_val(placements.as_slice())
         });
         glyphs + placements
+    }
+
+    /// Lets go of the room the buffer keeps for glyphs appended later, for a buffer that is done growing.
+    pub fn shrink_to_fit(&mut self) {
+        if let GlyphStorage::Owned(glyphs) = &mut self.glyphs {
+            glyphs.shrink_to_fit();
+        }
+        if let Some(GlyphStorage::Owned(placements)) = self.placements.as_deref_mut() {
+            placements.shrink_to_fit();
+        }
     }
 
     /// The same glyphs in the form that clones without copying them.
@@ -836,28 +913,44 @@ struct ShapeForParams {
     shape: Arc<CachedShape>,
 }
 
+/// The shapes of a text.
+// OPTIMIZATION: Almost every text is shaped with one set of parameters, whose shape the entry holds itself, so that
+//               it costs no allocation of its own.
 struct ShapesForText {
-    last_used_tick: u64,
-    shapes: Vec<ShapeForParams>,
+    last_used_tick: u32,
+    params: ShapeParams,
+    shape: Arc<CachedShape>,
+    /// The shapes for the other parameters the text was shaped with.
+    more_shapes: Option<Box<MoreShapes>>,
 }
+
+/// The shapes of a text beyond its first, which few texts have, behind one word in the text's entry.
+#[derive(Default)]
+struct MoreShapes(Vec<ShapeForParams>);
+
+const _: () = assert!(size_of::<ShapesForText>() == 32);
 
 impl ShapesForText {
     /// About what the entry for `text` holds: the text, the entry, and its shapes.
     fn size_in_bytes(&self, text: &[u16]) -> usize {
         size_of_val(text)
             + size_of::<(Box<[u16]>, ShapesForText)>()
-            + self
-                .shapes
-                .iter()
-                .map(|shape| size_of::<ShapeForParams>() + shape.shape.size_in_bytes())
-                .sum::<usize>()
+            + self.shape.size_in_bytes()
+            + self.more_shapes.as_ref().map_or(0, |more_shapes| {
+                size_of::<MoreShapes>()
+                    + more_shapes
+                        .0
+                        .iter()
+                        .map(|shape| size_of::<ShapeForParams>() + shape.shape.size_in_bytes())
+                        .sum::<usize>()
+            })
     }
 }
 
 type FastMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
 
 struct FontShapeCache {
-    last_used_tick: u64,
+    last_used_tick: u32,
     single_ascii_common_shapes: [Option<Arc<CachedShape>>; SINGLE_ASCII_SHAPE_CACHE_SIZE],
     shapes_by_text: FastMap<Box<[u16]>, ShapesForText>,
     /// What the entries of `shapes_by_text` hold, see `ShapesForText::size_in_bytes()`.
@@ -880,7 +973,7 @@ impl FontShapeCache {
     /// bytes of the whole cache.
     fn shape_for(
         &mut self,
-        tick: u64,
+        tick: u32,
         text: &[u16],
         params: ShapeParams,
         total_bytes: &mut usize,
@@ -905,38 +998,51 @@ impl FontShapeCache {
         }
         let entry = match self.shapes_by_text.entry_ref(text) {
             EntryRef::Occupied(entry) => entry.into_mut(),
-            EntryRef::Vacant(entry) => entry.insert_with_key(
-                Box::from(text),
-                ShapesForText {
-                    last_used_tick: tick,
-                    shapes: Vec::new(),
-                },
-            ),
+            EntryRef::Vacant(entry) => {
+                let entry = entry.insert_with_key(
+                    Box::from(text),
+                    ShapesForText {
+                        last_used_tick: tick,
+                        params,
+                        shape: Arc::new(shape_uncached()),
+                        more_shapes: None,
+                    },
+                );
+                let added_bytes = entry.size_in_bytes(text);
+                self.bytes += added_bytes;
+                *total_bytes += added_bytes;
+                return &entry.shape;
+            }
         };
         entry.last_used_tick = tick;
-        let index = match entry.shapes.iter().position(|entry| entry.params.matches(&params)) {
+        if entry.params.matches(&params) {
+            return &entry.shape;
+        }
+        let known = entry
+            .more_shapes
+            .as_ref()
+            .and_then(|more_shapes| more_shapes.0.iter().position(|entry| entry.params.matches(&params)));
+        let index = match known {
             Some(index) => index,
             None => {
-                let bytes_before = if entry.shapes.is_empty() {
-                    0
-                } else {
-                    entry.size_in_bytes(text)
-                };
-                entry.shapes.push(ShapeForParams {
+                let bytes_before = entry.size_in_bytes(text);
+                let more_shapes = &mut entry.more_shapes.get_or_insert_default().0;
+                more_shapes.push(ShapeForParams {
                     params,
                     shape: Arc::new(shape_uncached()),
                 });
+                let index = more_shapes.len() - 1;
                 let added_bytes = entry.size_in_bytes(text) - bytes_before;
                 self.bytes += added_bytes;
                 *total_bytes += added_bytes;
-                entry.shapes.len() - 1
+                index
             }
         };
-        &entry.shapes[index].shape
+        &entry.more_shapes.as_ref().expect("the text has more shapes").0[index].shape
     }
 
     /// Returns the bytes the evicted texts held.
-    fn evict_texts_used_at_or_before(&mut self, threshold: u64) -> usize {
+    fn evict_texts_used_at_or_before(&mut self, threshold: u32) -> usize {
         let mut evicted_bytes = 0;
         self.shapes_by_text.retain(|text, entry| {
             if entry.last_used_tick > threshold {
@@ -956,8 +1062,8 @@ impl FontShapeCache {
     }
 }
 
-fn median_tick(ticks: impl Iterator<Item = u64>) -> Option<u64> {
-    let mut ticks: Vec<u64> = ticks.collect();
+fn median_tick(ticks: impl Iterator<Item = u32>) -> Option<u32> {
+    let mut ticks: Vec<u32> = ticks.collect();
     if ticks.is_empty() {
         return None;
     }
@@ -970,7 +1076,8 @@ fn median_tick(ticks: impl Iterator<Item = u64>) -> Option<u64> {
 #[derive(Default)]
 struct ShapingCache {
     caches_by_font_id: FastMap<u64, FontShapeCache>,
-    tick: u64,
+    /// Counts the shapes asked for. Starts over, with an empty cache, when it runs out.
+    tick: u32,
     /// What the texts of all fonts hold, see `FontShapeCache::bytes`.
     bytes: usize,
 }
@@ -983,6 +1090,9 @@ impl ShapingCache {
         params: ShapeParams,
         shape_uncached: impl FnOnce() -> CachedShape,
     ) -> Arc<CachedShape> {
+        if self.tick == u32::MAX {
+            *self = Self::default();
+        }
         self.tick += 1;
         if self.caches_by_font_id.len() > MAX_SHAPE_CACHE_FONTS {
             self.evict_least_recently_used_font();

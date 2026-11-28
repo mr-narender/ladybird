@@ -18,6 +18,8 @@
 #include <LibWeb/Fetch/Engine/FetchByteChannel.h>
 #include <LibWeb/Fetch/Engine/FetchExecutor.h>
 #include <LibWeb/Fetch/Engine/Ids.h>
+#include <LibWeb/Fetch/Engine/NetworkActivity.h>
+#include <LibWeb/Fetch/Engine/NetworkInterception.h>
 #include <LibWeb/Fetch/Infrastructure/FetchControlBlock.h>
 #include <LibWeb/Fetch/Infrastructure/FetchControllerRegistry.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
@@ -26,12 +28,6 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
-
-namespace Web::Fetch::Fetching {
-
-class PendingResponse;
-
-}
 
 namespace Web::Fetch::Infrastructure {
 
@@ -61,6 +57,8 @@ public:
 
     // Posts the answer to the manual redirect handed over last, unless it was answered before.
     void resolve_redirect(Engine::Command::ResolveRedirect::Resolution);
+
+    void resolve_network_interception(Engine::ContinuationId, Engine::NetworkDecision);
     [[nodiscard]] bool has_unanswered_redirect() const { return m_redirect_continuation_id.has_value(); }
     // The continuation of the manual redirect handed over last, if it waits for an answer.
     void set_redirect_continuation_id(Optional<Engine::ContinuationId> continuation_id) { m_redirect_continuation_id = continuation_id; }
@@ -75,15 +73,12 @@ public:
     Optional<HTML::IPCSerializationRecord> const& serialized_abort_reason() const { return m_serialized_abort_reason; }
     void terminate();
 
-    void set_algorithms(Badge<FetchParams>, GC::Ref<FetchAlgorithms const>);
+    // Creates the controller's fetch params, whose fetch runs the algorithms. Called once.
+    [[nodiscard]] NonnullRefPtr<FetchParams> create_fetch_params(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+
     [[nodiscard]] GC::Ref<FetchAlgorithms const> algorithms() const;
 
-    // The fetch params created with the controller, for which WebDriver BiDi reports errors and intercepts requests.
-    void set_original_fetch_params(Badge<FetchParams>, FetchParams const&);
-    [[nodiscard]] RefPtr<FetchParams> original_fetch_params() const;
-
     // The request the controller's fetch params were created with.
-    void set_request(Badge<FetchParams>, NonnullRefPtr<Request>);
     [[nodiscard]] NonnullRefPtr<Request> request() const;
 
     // The realm that started the fetch.
@@ -99,8 +94,16 @@ public:
     void set_preload_reports_timing(bool preload_reports_timing) { m_preload_reports_timing = preload_reports_timing; }
 
     // The network observation of the request the controller's fetch params were created with.
-    void set_network_observation(Badge<FetchParams>, NonnullRefPtr<NetworkObservation>);
     [[nodiscard]] RefPtr<NetworkObservation> const& network_observation() const { return m_network_observation; }
+
+    // The network observation of one of the fetch's CORS preflights, which the controller keeps from the preflight's
+    // first network event on.
+    [[nodiscard]] NonnullRefPtr<NetworkObservation> cors_preflight_network_observation(Engine::CorsPreflightId);
+
+    // The fetch's own request as its latest network event reported it, or as it was when main fetch handed the fetch to
+    // its engine.
+    [[nodiscard]] Optional<Engine::Event::ObservedRequest> const& observed_request() const { return m_observed_request; }
+    void set_observed_request(Engine::Event::ObservedRequest observed_request) { m_observed_request = move(observed_request); }
 
     [[nodiscard]] TaskDestination const& task_destination() const { return m_task_destination; }
     void set_task_destination(TaskDestination task_destination) { m_task_destination = move(task_destination); }
@@ -116,12 +119,6 @@ public:
     void set_keepalive(bool is_keepalive) { m_is_keepalive = is_keepalive; }
 
     [[nodiscard]] bool response_arrived() const { return m_control_block->response_arrived(); }
-    [[nodiscard]] RefPtr<Fetching::PendingResponse> const& pending_preloaded_response() const { return m_pending_preloaded_response; }
-    void set_pending_preloaded_response(RefPtr<Fetching::PendingResponse>);
-    // The handle in the callback of the preload entry whose response the fetch's preloaded response candidate waits for,
-    // while that callback lives.
-    [[nodiscard]] WeakPtr<Fetching::PreloadWaitHandle> const& preload_wait_handle() const { return m_preload_wait_handle; }
-    void set_preload_wait_handle(WeakPtr<Fetching::PreloadWaitHandle> preload_wait_handle) { m_preload_wait_handle = move(preload_wait_handle); }
 
     bool requires_network() const { return m_control_block->requires_network(); }
     bool has_started_request() const { return m_control_block->has_started_request(); }
@@ -144,17 +141,16 @@ private:
     virtual void visit_edges(JS::Cell::Visitor&) override;
     virtual void finalize() override;
 
-    void report_webdriver_bidi_fetch_error(StringView error_text) const;
-    void cancel_webdriver_bidi_network_interception() const;
     void stop_request();
 
     WeakPtr<FetchControllerRegistry> m_registry;
     FetchControllerToken m_token;
     NonnullRefPtr<FetchControlBlock> m_control_block;
-    WeakPtr<FetchParams> m_original_fetch_params;
     RefPtr<Request> m_request;
     GC::Ptr<JS::Realm> m_realm;
     RefPtr<NetworkObservation> m_network_observation;
+    HashMap<Engine::CorsPreflightId, NonnullRefPtr<NetworkObservation>> m_cors_preflight_network_observations;
+    Optional<Engine::Event::ObservedRequest> m_observed_request;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // report timing steps (default null)
@@ -207,11 +203,6 @@ private:
 
     bool m_is_keepalive { false };
     bool m_preload_reports_timing { false };
-
-    // NB: Assumes one waiting consumer for a pending preloaded response.
-    // Widen this if preload handoff ever supports multiple consumers.
-    RefPtr<Fetching::PendingResponse> m_pending_preloaded_response;
-    WeakPtr<Fetching::PreloadWaitHandle> m_preload_wait_handle;
 
     struct StartedFetch {
         Engine::FetchId fetch_id;

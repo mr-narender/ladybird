@@ -9,6 +9,7 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/Variant.h>
+#include <LibWeb/ContentSecurityPolicy/RequestViolation.h>
 #include <LibWeb/Fetch/Engine/BodyPresentation.h>
 #include <LibWeb/Fetch/Engine/FetchTimingSeed.h>
 #include <LibWeb/Fetch/Engine/Ids.h>
@@ -88,6 +89,10 @@ struct ReadRequestBodyStream { };
 // A request's body is sent from its source.
 struct RequestBodySentFromSource { };
 
+struct ViolationReport {
+    ContentSecurityPolicy::RequestViolation violation;
+};
+
 // The fetch's last event: its engine will send nothing more for it.
 struct FetchEnded { };
 
@@ -107,7 +112,9 @@ using EngineEvent = Variant<
     Event::RequestBodyEndOfBody,
     Event::ReadRequestBodyStream,
     Event::RequestBodySentFromSource,
-    Event::NetworkActivity,
+    Event::TransportActivity,
+    Event::FetchNetworkActivity,
+    Event::ViolationReport,
     Event::FetchEnded>;
 
 }

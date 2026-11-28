@@ -47,6 +47,12 @@ pub struct Class {
     /// Whether LibGC may only trace the cells of this class on the thread that owns their heap, see
     /// traced_on_owner_thread_only().
     owner_thread_only: bool,
+    /// Whether the cells of this class come from the allocator that the classes like it share, see
+    /// shares_allocator().
+    shares_allocator: bool,
+    /// The trace of the cells of this class, which type_info.visit_edges calls with the visitor LibGC passes, for
+    /// tracing them with a visitor that is not one of LibGC's (see record_cell_slots()).
+    pub trace: unsafe fn(cell: *const c_void, visitor: &mut Visitor<'_>),
 }
 
 // The layout module's mirror of the class, through which Layout.h tells an embedder where a class keeps its id and
@@ -67,7 +73,7 @@ pub(crate) const MIN_CELL_SIZE: usize = 24;
 const MAX_CELL_ALIGNMENT: usize = 16;
 
 impl Class {
-    pub const fn new<T: Trace>(
+    pub const fn new<T: Trace + 'static>(
         name: &'static str,
         id: ClassId,
         kind: CellKind,
@@ -82,6 +88,18 @@ impl Class {
             matches!(kind, CellKind::Object) == object_methods.is_some(),
             "exactly the object classes have internal methods"
         );
+        // NB: A class that adds no state to the one it extends has cells of the same layout, which nothing can take
+        //     for cells of another layout, so it needs no blocks of its own.
+        let shares_allocator = match parent {
+            Some(parent) => {
+                size_of::<T>() == parent.type_info.cell_size as usize
+                    && align_of::<T>() <= size_of::<&'static Class>()
+                    && kind as u8 == parent.type_info.kind
+                    && core::mem::needs_drop::<T>() == parent.type_info.destroy.is_some()
+                    && !Self::is_movable_id(id)
+            }
+            None => false,
+        };
         Self {
             type_info: CellTypeInfo {
                 cell_size: size_of::<T>() as u32,
@@ -103,7 +121,36 @@ impl Class {
             object_methods,
             kind,
             owner_thread_only: false,
+            shares_allocator,
+            trace: trace::<T>,
         }
+    }
+
+    /// Whether the cells of this class come from an allocator that it shares with other classes, instead of one of
+    /// its own: that of the nearest class it extends that has one of its own, see allocating_class(). A class shares
+    /// when its cells have the layout of the class it extends and LibGC handles them the same way, so it adds no
+    /// state, traces, finalizes and drops as that class does, and is not movable. Each cell of a shared allocator
+    /// keeps its class in the word after it (see `class_at`). The classes of built-in prototypes and constructors are
+    /// like this: there is one cell of each for a realm, and each would keep a block of its own otherwise.
+    pub const fn shares_allocator(&self) -> bool {
+        self.shares_allocator
+    }
+
+    /// Has the class keep an allocator of its own, as a class must whose cells LibGC handles differently from those
+    /// of the class it extends.
+    pub const fn with_allocator_of_its_own(mut self) -> Self {
+        self.shares_allocator = false;
+        self
+    }
+
+    /// The class whose cells have the layout of the cells of this one, and whose type info LibGC handles them
+    /// through: the nearest one, starting with this class, that does not share an allocator.
+    pub fn allocating_class(&'static self) -> &'static Class {
+        let mut class = self;
+        while class.shares_allocator {
+            class = class.parent.expect("a class that shares an allocator extends another");
+        }
+        class
     }
 
     pub fn kind(&self) -> CellKind {
@@ -130,8 +177,12 @@ impl Class {
         if self.is_derived_at_run_time() {
             return false;
         }
+        Self::is_movable_id(self.id)
+    }
+
+    const fn is_movable_id(id: ClassId) -> bool {
         matches!(
-            self.id,
+            id,
             ClassId::ValueStorage
                 | ClassId::Object
                 | ClassId::Array
@@ -159,6 +210,35 @@ impl Class {
                 | ClassId::Set
                 | ClassId::SetIterator
                 | ClassId::Promise
+                | ClassId::PromiseResolvingFunction
+                | ClassId::PromiseCapability
+                | ClassId::PromiseReaction
+                | ClassId::JobCallback
+                | ClassId::CapturingNativeFunction
+                | ClassId::WatchpointSet
+                | ClassId::DeclarativeEnvironmentRareData
+                | ClassId::SharedFunctionInstanceData
+                | ClassId::Executable
+                | ClassId::CallEnvironmentTemplate
+                | ClassId::EnvironmentShape
+                | ClassId::ObjectPropertyIteratorCacheData
+                | ClassId::RawNativeFunction
+                | ClassId::DirectGetterFunction
+                | ClassId::ArrayBuffer
+                | ClassId::TypedArrayBase
+                | ClassId::Uint8Array
+                | ClassId::Uint8ClampedArray
+                | ClassId::Uint16Array
+                | ClassId::Uint32Array
+                | ClassId::BigUint64Array
+                | ClassId::Int8Array
+                | ClassId::Int16Array
+                | ClassId::Int32Array
+                | ClassId::BigInt64Array
+                | ClassId::Float16Array
+                | ClassId::Float32Array
+                | ClassId::Float64Array
+                | ClassId::DataView
         )
     }
 
@@ -177,10 +257,17 @@ impl Class {
     }
 }
 
-unsafe extern "C" fn visit_edges<T: Trace>(cell: *mut c_void, visitor: *mut GCVisitor) {
+unsafe extern "C" fn visit_edges<T: Trace + 'static>(cell: *mut c_void, visitor: *mut GCVisitor) {
     // SAFETY: LibGC passes a live cell of this class and a visitor that outlives the call.
-    let (cell, mut visitor) = unsafe { (&*cell.cast::<T>(), Visitor::from_raw(visitor)) };
-    cell.trace(&mut visitor);
+    unsafe { trace::<T>(cell, &mut Visitor::from_raw(visitor)) };
+}
+
+/// # Safety
+///
+/// `cell` must be a live cell of the class of `T`, which stays where it is while the visitor visits it.
+unsafe fn trace<T: Trace + 'static>(cell: *const c_void, visitor: &mut Visitor<'_>) {
+    // SAFETY: The caller vouches for the cell.
+    unsafe { &*cell.cast::<T>() }.trace(visitor);
 }
 
 /// Cells that need to act before they are destroyed. Finalizers run during a collection, while every cell that dies
@@ -228,7 +315,7 @@ impl Class {
     /// Creates a class that extends `parent` while the runtime runs, as an embedder needs one for each class of host
     /// object it defines. Its cells have the parent's layout, so it shares the parent's type info and id, and code that
     /// tells classes apart by id sees the parent. It has a name and internal methods of its own, and its cells come from
-    /// an allocator of their own once allocated with Heap::allocate_in(). The class lives as long as the process.
+    /// the allocator that Heap::allocate_in() is given for it. The class lives as long as the process.
     pub fn derive_runtime(
         parent: &'static Class,
         name: &'static str,
@@ -264,6 +351,9 @@ impl Class {
             object_methods,
             kind: parent.kind,
             owner_thread_only: parent.owner_thread_only,
+            // NB: Heap::allocate_in() chooses the allocator of a class derived at run time.
+            shares_allocator: false,
+            trace: parent.trace,
         }));
         #[cfg(feature = "address-sanitizer")]
         // SAFETY: The class is a live allocation, which the process keeps for as long as it runs.
@@ -338,7 +428,9 @@ unsafe impl Extends<CellHeader> for CellHeader {}
 /// A cell's block starts at the cell's address rounded down to a multiple of BLOCK_SIZE, and holds the class of its
 /// cells at BLOCK_CLASS_OFFSET: the foreign type of the allocator that created the block (see Heap::create_allocator).
 /// The block of an allocator that classes share holds the class they extend with BLOCK_CLASS_TAIL_TAG added, and each of
-/// its cells keeps its own class in the word after the cell_size bytes of that class.
+/// its cells keeps its own class in the word after the cell_size bytes of that class. Classes derived at run time share
+/// one if their embedder asks for it, and the classes define_cell! defines if they add no state to the one they extend
+/// (see Class::shares_allocator()).
 pub const BLOCK_SIZE: usize = 16 * 1024;
 pub const BLOCK_CLASS_OFFSET: usize = 2 * size_of::<usize>();
 pub use crate::layout::cell::BLOCK_CLASS_TAIL_TAG;
@@ -467,7 +559,7 @@ impl CellHeaderTail {
 }
 
 impl CellHeader {
-    /// The header of a cell of `class`, which must also be the class of the allocator the cell comes from.
+    /// The header of a cell of `class`, which must also be the class the cell is allocated as.
     pub fn for_class(class: &'static Class) -> Self {
         Self {
             unused: [0; 8],
@@ -489,6 +581,10 @@ impl CellHeader {
 /// Finalize implementation, and `external_memory_size` into reporting its ExternalMemorySize. A class that names none
 /// of them inherits them from the class it extends, as C++ subclasses inherit virtual methods, so the Finalize
 /// implementation of a subclass has to finalize its base as well.
+///
+/// A cell type that adds no field to the one it extends, and names none of these or `traced_on`, shares an allocator
+/// with the other such types (see Class::shares_allocator()). LibGC then traces and drops its cells as the type it
+/// extends, so it must derive Trace and must not implement Drop.
 macro_rules! define_cell {
     ($type:ident, $kind:ident $(, extends: [$parent:ident $(, $ancestor:ident)*])? $(, methods: $methods:path)? $(, finalize: $finalize:ident)? $(, external_memory_size: $external_memory_size:ident)? $(, traced_on: $traced_on:ident)?) => {
         const _: () = {
@@ -503,7 +599,7 @@ macro_rules! define_cell {
                 )
                 .with_external_memory_size(define_cell!(@external_memory_size $type [$($parent)?] [$($external_memory_size)?]));
                 $(let class = define_cell!(@traced_on $traced_on class);)?
-                class
+                define_cell!(@allocator class [$($finalize)?] [$($external_memory_size)?] [$($traced_on)?])
             };
 
             // SAFETY: Checked by the asserts in Class::new and the cell's #[repr(C)] layout.
@@ -519,6 +615,10 @@ macro_rules! define_cell {
         };
     };
     (@traced_on owner_thread_only $class:ident) => { $class.traced_on_owner_thread_only() };
+    (@allocator $class:ident [] [] []) => { $class };
+    (@allocator $class:ident [$($finalize:ident)?] [$($external_memory_size:ident)?] [$($traced_on:ident)?]) => {
+        $class.with_allocator_of_its_own()
+    };
     (@parent) => { None };
     (@parent $parent:ident) => { Some(<$parent as $crate::gc::class::GcCell>::CLASS) };
     (@methods [] []) => { None };

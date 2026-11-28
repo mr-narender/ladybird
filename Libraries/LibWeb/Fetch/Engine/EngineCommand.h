@@ -9,11 +9,12 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Variant.h>
 #include <LibIPC/TransportHandle.h>
-#include <LibWeb/Fetch/Engine/BodyPresentation.h>
 #include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
 #include <LibWeb/Fetch/Engine/Ids.h>
+#include <LibWeb/Fetch/Engine/NetworkInterception.h>
 #include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Engine/StartFetchInput.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 
 namespace Web::Fetch::Engine::Command {
 
@@ -35,7 +36,10 @@ struct Stop {
 
 // The answer to the continuation of a manual redirect a fetch handed over, given at most once.
 struct ResolveRedirect {
-    struct Follow { };
+    // The redirect's next hop, whose in-parallel steps the engine runs while the fetch is ongoing.
+    struct Follow {
+        MainFetchInput next_hop;
+    };
     struct AcceptAsFinal { };
     struct Abandon { };
     using Resolution = Variant<Follow, AcceptAsFinal, Abandon>;
@@ -45,26 +49,17 @@ struct ResolveRedirect {
     Resolution resolution;
 };
 
-// Only ever complete: all bytes present, or a network error with no body.
-struct CompletedPreloadResponse {
-    struct Completed {
-        Delivered<Core::ImmutableBytes> body;
-    };
-    struct Failure {
-        NullBody body;
-    };
-
-    Variant<Completed, Failure> outcome;
-};
-
+// The response of the preload that the fetch's main fetch waits for, or null if the preload was cancelled.
 struct PreloadResponseResolved {
     FetchId fetch_id;
-    CompletedPreloadResponse response;
+    RefPtr<Infrastructure::Response> response;
 };
 
-// Main fetch's wait for a preload's response, which the agent can no longer resolve.
-struct PreloadWaitAbandoned {
+// The decision of the agent that started the fetch for a network interception the engine offered it.
+struct ResolveNetworkInterception {
     FetchId fetch_id;
+    ContinuationId continuation_id;
+    NetworkDecision decision;
 };
 
 struct TransportControl {
@@ -102,7 +97,7 @@ using EngineCommand = Variant<
     Command::Stop,
     Command::ResolveRedirect,
     Command::PreloadResponseResolved,
-    Command::PreloadWaitAbandoned,
+    Command::ResolveNetworkInterception,
     Command::TransportControl,
     Command::NavigationBodyAdopted,
     Command::AdoptNetworkTransport>;

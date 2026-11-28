@@ -315,7 +315,7 @@ public:
     void did_complete_window_rect_request(u64 completion_id);
     void set_window_rect_observer(GC::Ptr<GC::Function<void(DevicePixelRect, u64)>> window_rect_observer) { m_window_rect_observer = window_rect_observer; }
 
-    void did_receive_network_activity(Fetch::Engine::Event::NetworkActivity const&);
+    void did_receive_network_activity(Fetch::Engine::Event::TransportActivity const&);
 
     void did_request_alert(Utf16String const& message);
     void alert_closed();
@@ -563,7 +563,7 @@ private:
     template<typename Callback>
     void for_each_canvas_element(Callback&& callback);
 
-    Vector<GC::Root<DOM::Document>> documents_in_active_window() const;
+    Vector<GC::Root<DOM::Document>> documents_to_search() const;
     void discard_provisional_navigable_of(HTML::RemoteNavigable&);
 
     enum class SearchDirection {

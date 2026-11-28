@@ -43,6 +43,7 @@ from Generators.libweb_bindings.rust_members import RustNamedProperties
 from Generators.libweb_bindings.rust_members import RustOperation
 from Generators.libweb_bindings.rust_members import RustOperationSet
 from Generators.libweb_bindings.rust_members import RustPairIterator
+from Generators.libweb_bindings.rust_members import experimental_member_name
 from Generators.libweb_bindings.rust_members import rust_members
 from Generators.libweb_bindings.rust_names import rust_identifier
 from Generators.libweb_bindings.rust_names import rust_local_name
@@ -617,7 +618,15 @@ def has_unforgeable_attributes(interface: Interface) -> bool:
     return any("LegacyUnforgeable" in attribute.extended_attributes for attribute in interface.regular_attributes)
 
 
-def write_ensure_web_prototype_implementation(out: TextIO, intrinsics: List[Interface]) -> None:
+def cpp_unforgeable_attribute_interfaces(interface: Interface, context: GenerationContext) -> list[Interface]:
+    return [
+        ancestor for ancestor in reversed(context.inheritance_stack(interface)) if has_unforgeable_attributes(ancestor)
+    ]
+
+
+def write_ensure_web_prototype_implementation(
+    out: TextIO, intrinsics: List[Interface], context: GenerationContext
+) -> None:
     rust_interfaces = [
         interface for interface in intrinsics if is_implemented_in_rust(interface) and not interface.is_namespace
     ]
@@ -691,14 +700,15 @@ void web_bindings_define_unforgeable_attributes(void* realm, JSObject* wrapper, 
     switch (static_cast<InterfaceName>(interface_name)) {
 """
     )
-    out.writelines(
-        f"""    case InterfaceName::{interface.name}:
-        {interface.prototype_class}::define_unforgeable_attributes(js_realm, object);
-        return;
-"""
-        for interface in intrinsics
-        if interface.name in cpp_parent_names and has_unforgeable_attributes(interface)
-    )
+    for interface in intrinsics:
+        if interface.name not in cpp_parent_names:
+            continue
+        ancestors = cpp_unforgeable_attribute_interfaces(interface, context)
+        if ancestors:
+            out.write(f"    case InterfaceName::{interface.name}:\n")
+            for ancestor in ancestors:
+                out.write(f"        {ancestor.prototype_class}::define_unforgeable_attributes(js_realm, object);\n")
+            out.write("        return;\n")
     out.write(
         """    default:
         VERIFY_NOT_REACHED();
@@ -1196,7 +1206,7 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
         sequence_from_js, sequence_to_js, to_array_buffer_view, to_boolean, to_buffer_source, to_byte_string, to_cpp_interface,
         to_cpp_interface_in_union, to_dom_string,
         to_dom_string_treating_null_as_empty, to_double, to_float, to_long, to_long_enforcing_range, to_long_long,
-        to_long_long_clamping, to_long_long_enforcing_range, to_object, to_promise, to_shared_array_buffer, to_typed_array,
+        to_long_long_clamping, to_long_long_enforcing_range, to_object, to_promise, to_shared_array_buffer, to_short, to_typed_array,
         to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_clamping, to_unsigned_short,
         to_unsigned_long_enforcing_range,
         to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string, to_window_proxy,
@@ -1207,8 +1217,9 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
         define_attribute, define_cached_attribute, define_constants, define_indexed_properties_iterator,
         define_interface_object_properties, define_operation, define_to_string_tag, define_unimplemented_property,
         define_value_iterator_properties, entry_point_arguments, implementation_if, implementation_of,
-        SecurityCheckType, prototype_from_new_target, realm_is_secure_context, realm_is_window, set_dictionary_member,
-        set_interface_prototype_object_prototype, this_cpp_object, this_object, to_interface,
+        SecurityCheckType, prototype_from_new_target, realm_exposes_experimental_member, realm_is_secure_context,
+        realm_is_window, set_dictionary_member, set_interface_prototype_object_prototype, this_cpp_object, this_object,
+        to_interface,
     };
     use crate::bindings::async_iterable::{
         AsyncIterable, DefaultAsyncIterator, DefaultAsyncIteratorClasses, async_iterator_next, async_iterator_return,
@@ -1336,7 +1347,7 @@ def write_rust_interface(
         cpp_ancestor = context.interfaces.get(cpp_ancestor.parent_name)
     unforgeable_attributes_interface = (
         f"Some({cpp_interface_name_constant(cpp_ancestor)})"
-        if cpp_ancestor is not None and has_unforgeable_attributes(cpp_ancestor)
+        if cpp_ancestor is not None and cpp_unforgeable_attribute_interfaces(cpp_ancestor, context)
         else "None"
     )
     method_documentation = "".join(
@@ -1457,6 +1468,7 @@ def write_rust_interface(
         name = attribute.attribute.name
         getter = f"raw_native!({attribute.getter_function})"
         is_secure_context_only = "SecureContext" in attribute.attribute.extended_attributes
+        experimental_name = experimental_member_name(interface, name, attribute.attribute.extended_attributes)
         if attribute.is_cached:
             definition = f'define_cached_attribute(vm, realm, prototype, "{name}", {getter});'
             out.write(
@@ -1464,6 +1476,7 @@ def write_rust_interface(
                     definition,
                     secure_context_only=is_secure_context_only,
                     exposure_condition=attribute.exposure_condition,
+                    experimental_name=experimental_name,
                 )
             )
             defined_property_names.append(name)
@@ -1473,7 +1486,10 @@ def write_rust_interface(
         definition = f'define_attribute(vm, realm, prototype, "{name}", {getter}, {setter});'
         out.write(
             member_exposure_definition(
-                definition, secure_context_only=is_secure_context_only, exposure_condition=attribute.exposure_condition
+                definition,
+                secure_context_only=is_secure_context_only,
+                exposure_condition=attribute.exposure_condition,
+                experimental_name=experimental_name,
             )
         )
         defined_property_names.append(name)
@@ -1491,6 +1507,9 @@ def write_rust_interface(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
                 exposure_condition=operation_set.exposure_condition,
+                experimental_name=experimental_member_name(
+                    interface, operation_set.name, operation_set.overloads[0].operation.extended_attributes
+                ),
             )
         )
         defined_property_names.append(name)
@@ -1582,6 +1601,9 @@ def write_rust_interface(
                 definition,
                 secure_context_only="SecureContext" in attribute.attribute.extended_attributes,
                 exposure_condition=attribute.exposure_condition,
+                experimental_name=experimental_member_name(
+                    interface, attribute.attribute.name, attribute.attribute.extended_attributes
+                ),
             )
         )
     for operation_set in members.static_operation_sets:
@@ -1595,6 +1617,9 @@ def write_rust_interface(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
                 exposure_condition=operation_set.exposure_condition,
+                experimental_name=experimental_member_name(
+                    interface, operation_set.name, operation_set.overloads[0].operation.extended_attributes
+                ),
             )
         )
     out.write("    }\n")
@@ -1726,9 +1751,19 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
 """
     )
     for attribute in members.attributes:
+        definition = (
+            f'define_attribute(vm, realm, object, "{attribute.attribute.name}", '
+            f"raw_native!({attribute.getter_function}), None);"
+        )
         out.write(
-            f'        define_attribute(vm, realm, object, "{attribute.attribute.name}", '
-            f"raw_native!({attribute.getter_function}), None);\n"
+            member_exposure_definition(
+                definition,
+                secure_context_only="SecureContext" in attribute.attribute.extended_attributes,
+                exposure_condition=attribute.exposure_condition,
+                experimental_name=experimental_member_name(
+                    interface, attribute.attribute.name, attribute.attribute.extended_attributes
+                ),
+            )
         )
     for operation_set in members.operation_sets:
         definition = (
@@ -1740,6 +1775,9 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
                 exposure_condition=operation_set.exposure_condition,
+                experimental_name=experimental_member_name(
+                    interface, operation_set.name, operation_set.overloads[0].operation.extended_attributes
+                ),
             )
         )
     if "WithInitializer" in interface.extended_attributes:
@@ -1748,7 +1786,11 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
 
 
 def member_exposure_definition(
-    definition: str, *, secure_context_only: bool = False, exposure_condition: Optional[str] = None
+    definition: str,
+    *,
+    secure_context_only: bool = False,
+    exposure_condition: Optional[str] = None,
+    experimental_name: Optional[str] = None,
 ) -> str:
     """Defines a member on the interface or prototype object when it is exposed in the realm."""
     conditions = []
@@ -1756,6 +1798,8 @@ def member_exposure_definition(
         conditions.append("realm_is_secure_context(realm)")
     if exposure_condition is not None:
         conditions.append(exposure_condition)
+    if experimental_name is not None:
+        conditions.append(f'realm_exposes_experimental_member(realm, "{experimental_name}")')
     if not conditions:
         return f"        {definition}\n"
     return f"""        if {" && ".join(conditions)} {{
@@ -1793,6 +1837,9 @@ def write_default_to_json(out: TextIO, context: GenerationContext, interface: In
                     definition,
                     secure_context_only="SecureContext" in attribute.attribute.extended_attributes,
                     exposure_condition=attribute.exposure_condition,
+                    experimental_name=experimental_member_name(
+                        interface_in_chain, attribute.attribute.name, attribute.attribute.extended_attributes
+                    ),
                 )
             )
     out.write(
@@ -2654,7 +2701,7 @@ pub(crate) mod definitions {
         sequence_to_js, throw_no_union_types_matched, to_array_buffer_view, to_boolean, to_buffer_source,
         to_byte_string, to_cpp_interface, to_cpp_interface_in_union,
         to_dom_string, to_dom_string_treating_null_as_empty, to_double, to_enumeration_value, to_float, to_long,
-        to_long_enforcing_range, to_long_long, to_long_long_enforcing_range, to_object, to_shared_array_buffer, to_typed_array,
+        to_long_enforcing_range, to_long_long, to_long_long_enforcing_range, to_object, to_shared_array_buffer, to_short, to_typed_array,
         to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_clamping, to_unsigned_short,
         to_unsigned_long_enforcing_range,
         to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string, to_window_proxy,

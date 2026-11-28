@@ -17,7 +17,7 @@ INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]')
 FOLLOWED_ROOTS = {"AK", "Libraries"}
 FORBIDDEN_PREFIXES = ("LibJS/", "LibGC/")
 
-# Defines GC_HOLDS_NO_CELL_EDGES and nothing else.
+# Defines the macros that declare a type holds no cell edges, and the trait they specialize.
 ALLOWED_GC_HEADER = "LibGC/HoldsNoCellEdges.h"
 
 # The generated headers the engine reaches, which hold debug macros, export macros, a bindings enum, and IPC codec and
@@ -25,10 +25,12 @@ ALLOWED_GC_HEADER = "LibGC/HoldsNoCellEdges.h"
 GENERATED_HEADERS = {
     "AK/Debug.h",
     "LibCore/Export.h",
+    "LibHTTP/Cookie/CookieCodecs.h",
     "LibURL/RustFFI.h",
     "LibWeb/Export.h",
     "LibWebCommon/Bindings/SecurityPolicyViolationEvent.h",
     "LibWebCommon/Export.h",
+    "LibWebCommon/MixedContent/ProhibitsMixedSecurityContextsCodecs.h",
     "LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicyCodecs.h",
 }
 

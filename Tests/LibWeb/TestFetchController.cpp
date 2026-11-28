@@ -48,7 +48,7 @@ static NonnullRefPtr<FetchParams> create_fetch_params(FetchController& controlle
     auto algorithms = FetchAlgorithms::create(FetchAlgorithms::Input { Web::Fetch::Engine::BodyIntent::DrainAndDiscard });
     auto request = Web::Fetch::Infrastructure::Request::create();
     auto timing_info = Web::Fetch::Infrastructure::FetchTimingInfo::create();
-    return FetchParams::create(controller, move(request), algorithms, move(timing_info), Web::current_loader_config());
+    return controller.create_fetch_params(move(request), algorithms, move(timing_info), Web::current_loader_config());
 }
 
 static NonnullRefPtr<Web::Fetch::Engine::FetchEngineRecord> start_fetch(FetchEngineRecords& records)
@@ -90,10 +90,9 @@ TEST_CASE(a_cors_preflight_stops_its_own_body_transport_and_not_that_of_its_fetc
     auto controller = GC::make_root(FetchController::create(registry));
     auto fetch_params = create_fetch_params(*controller);
     fetch_params->set_engine_record(start_fetch(records));
-    auto preflight_controller = GC::make_root(FetchController::create(registry));
-    auto preflight_fetch_params = create_fetch_params(*preflight_controller);
+    auto preflight_fetch_params = FetchParams::create(controller->token(), registry.make_weak_ptr(), Web::Fetch::Infrastructure::FetchControlBlock::create(), Web::Fetch::Infrastructure::Request::create(), Web::Fetch::Infrastructure::FetchTimingInfo::create(), Web::current_loader_config());
     preflight_fetch_params->set_engine_record(*fetch_params->engine_record());
-    preflight_fetch_params->set_is_cors_preflight();
+    preflight_fetch_params->set_cors_preflight_id(fetch_params->engine_record()->start_cors_preflight());
 
     auto transport = WholeBodyTransport::create();
     bool stopped = false;

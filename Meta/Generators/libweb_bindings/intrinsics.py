@@ -9,6 +9,7 @@ from typing import Optional
 from typing import Set
 from typing import TextIO
 
+from Generators.libweb_bindings.context import GenerationContext
 from Generators.libweb_bindings.cpp_types import fully_qualified_name_for_interface
 from Generators.libweb_bindings.cpp_types import implementation_header_for_interface
 from Generators.libweb_bindings.named_and_indexed_properties import create_named_properties_object_function_name
@@ -176,14 +177,12 @@ def interface_prototype_has_immutable_prototype(interface: Interface) -> bool:
 # NB: The host class name is the internal class name that LibJS prints in errors, such as "[object Node] is not a
 #     constructor".
 def interface_prototype_host_class(interface: Interface) -> str:
-    flags = "JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT"
-    if interface_prototype_has_immutable_prototype(interface):
-        flags += " | JS_HOST_CLASS_IMMUTABLE_PROTOTYPE"
+    flags = "JS_HOST_CLASS_IMMUTABLE_PROTOTYPE" if interface_prototype_has_immutable_prototype(interface) else "0"
     return f'JS::make_host_class(JS_HOST_CLASS_OBJECT, "{interface.name}"sv, &interface_prototype_object_parent_host_class, nullptr, &metadata, {flags})'
 
 
 def interface_constructor_host_class(name: str, metadata_variable: str) -> str:
-    return f'JS::make_host_class(JS_HOST_CLASS_FUNCTION, "{name}"sv, &interface_constructor_parent_host_class, &interface_constructor_hooks, &{metadata_variable}, JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT | JS_HOST_CLASS_HAS_CONSTRUCTOR)'
+    return f'JS::make_host_class(JS_HOST_CLASS_FUNCTION, "{name}"sv, &interface_constructor_parent_host_class, &interface_constructor_hooks, &{metadata_variable}, JS_HOST_CLASS_HAS_CONSTRUCTOR)'
 
 
 def lookup_legacy_constructor(interface: Interface) -> Optional[LegacyConstructor]:
@@ -236,7 +235,9 @@ bool is_exposed(InterfaceName, JS::Realm const&);
     )
 
 
-def write_intrinsic_definitions_implementation(out: TextIO, interface_sets: InterfaceSets) -> None:
+def write_intrinsic_definitions_implementation(
+    out: TextIO, interface_sets: InterfaceSets, context: GenerationContext
+) -> None:
     out.write(
         """#include <LibGC/DeferGC.h>
 #include <LibJS/HostClassBuilder.h>
@@ -331,7 +332,7 @@ bool is_exposed(InterfaceName name, JS::Realm const& realm)
             write_interface_creation(out, interface)
             write_iterator_prototype_creation(out, interface)
 
-    write_ensure_web_prototype_implementation(out, interface_sets.intrinsics)
+    write_ensure_web_prototype_implementation(out, interface_sets.intrinsics, context)
 
     out.write(
         """}

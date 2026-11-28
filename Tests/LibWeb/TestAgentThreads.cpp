@@ -21,6 +21,9 @@
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/Fetch/Engine/EngineCommand.h>
+#include <LibWeb/Fetch/Engine/EngineCommandSink.h>
+#include <LibWeb/Fetch/Engine/InlineFetchExecutor.h>
 #include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
@@ -271,10 +274,17 @@ static constexpr auto AGENT_SCRIPT = R"~~~(
         const matrix = new DOMMatrix([1, 2, 3, 4, 5, 6]).translate(1, 2);
         check("matrix", matrix.e === 12);
 
-        const result = await navigator.locks.request("lock", async lock => lock.name);
+        // NB: The agents have the same storage key, so they share the lock: one agent holds it at a time.
+        let clientId;
+        const result = await navigator.locks.request("lock", async lock => {
+            const holders = (await navigator.locks.query()).held.filter(held => held.name === lock.name);
+            check("lock holders", holders.length === 1);
+            clientId = holders[0].clientId;
+            return lock.name;
+        });
         check("locks", result === "lock");
         const state = await navigator.locks.query();
-        check("lock state", state.held.length === 0);
+        check("lock state", !state.held.some(held => held.clientId === clientId));
 
         check("navigator", navigator.userAgent.length > 0 && navigator.platform.length > 0 && navigator.language.length > 0);
         check("hardware", navigator.hardwareConcurrency > 0);
@@ -408,6 +418,34 @@ static Web::HTML::SerializedEnvironmentSettingsObject outside_settings(URL::URL 
     };
 }
 
+// The fetch params of the fetches an agent started.
+struct StartedFetches : RefCounted<StartedFetches> {
+    Vector<NonnullRefPtr<Web::Fetch::Infrastructure::FetchParams const>> fetch_params;
+};
+
+// Records the fetch params of each fetch the agent starts, and hands each command on to the agent's earlier executor.
+class StartRecordingEngine final : public Web::Fetch::Engine::EngineCommandSink {
+public:
+    StartRecordingEngine(NonnullRefPtr<StartedFetches> started, NonnullRefPtr<Web::Fetch::Engine::FetchExecutor> engine_executor)
+        : m_started(move(started))
+        , m_engine_executor(move(engine_executor))
+    {
+    }
+
+    virtual void attach_to_executor(Web::Fetch::Engine::FetchExecutor&) override { }
+
+    virtual void handle_command(Web::Fetch::Engine::EngineCommand command) override
+    {
+        if (auto const* start = command.get_pointer<Web::Fetch::Engine::Command::StartFetch>())
+            m_started->fetch_params.append(start->input.main_fetch.fetch_params);
+        m_engine_executor->post(move(command));
+    }
+
+private:
+    NonnullRefPtr<StartedFetches> m_started;
+    NonnullRefPtr<Web::Fetch::Engine::FetchExecutor> m_engine_executor;
+};
+
 class TestAgent {
 public:
     TestAgent()
@@ -489,24 +527,30 @@ public:
     }
 
     // Fetches the URL, and runs the worker's tasks until the fetch's request is done. Returns the fetch's params.
-    NonnullRefPtr<Web::Fetch::Infrastructure::FetchParams> fetch_until_done(StringView url)
+    NonnullRefPtr<Web::Fetch::Infrastructure::FetchParams const> fetch_until_done(StringView url)
     {
+        auto started = make_ref_counted<StartedFetches>();
+        auto& agent = Web::HTML::surrounding_agent();
+        Web::Fetch::Engine::FetchExecutorServices services {
+            .event_loop = Core::EventLoop::current_weak(),
+            .known_hsts_host_provider = agent.fetch_executor->known_hsts_host_provider(),
+        };
+        agent.fetch_executor = Web::Fetch::Engine::InlineFetchExecutor::create(move(services), make<StartRecordingEngine>(started, NonnullRefPtr { *agent.fetch_executor }));
+
         auto request = Web::Fetch::Infrastructure::Request::create();
         request->set_url_list({ *URL::Parser::basic_parse(url) });
         request->set_client(m_settings->address());
         auto algorithms = Web::Fetch::Infrastructure::FetchAlgorithms::create(Web::Fetch::Infrastructure::FetchAlgorithms::Input { Web::Fetch::Engine::BodyIntent::DrainAndDiscard });
 
-        GC::Ptr<Web::Fetch::Infrastructure::FetchController> controller;
         {
             Web::HTML::TemporaryExecutionContext execution_context { m_settings->realm(), Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-            controller = Web::Fetch::Fetching::fetch(m_settings->realm(), request, algorithms);
+            (void)Web::Fetch::Fetching::fetch(m_settings->realm(), request, algorithms);
         }
-        auto fetch_params = controller->original_fetch_params();
-        VERIFY(fetch_params);
         Web::HTML::current_event_loop().spin_until(GC::create_function(GC::Heap::the(), GC::captures(request), [](auto& request) {
             return request->done();
         }));
-        return fetch_params.release_nonnull();
+        VERIFY(started->fetch_params.size() == 1);
+        return started->fetch_params.take_first();
     }
 
     // What the host of a worker does once the worker's event loop is destroyed.
@@ -667,11 +711,10 @@ TEST_CASE(a_fetch_started_just_before_close_never_runs_its_in_parallel_steps)
         auto request = agent.fetch_and_close("about:blank"sv, Web::Fetch::Infrastructure::FetchAlgorithms::Input { Web::Fetch::Engine::BodyIntent::DrainAndDiscard });
 
         // The worker's event loop has stopped with the command that runs the fetch's in-parallel steps still queued.
-        // Those steps keep the fetch's controller alive.
         EXPECT(has_queued_commands(*Web::HTML::surrounding_agent().fetch_executor, 1));
 
-        // So does the agent's registry, until the fetch ends, which it never does. The registry's roots go with the agent,
-        // before its heap.
+        // The agent's registry keeps the fetch's controller alive until the fetch ends, which it never does. The
+        // registry's roots go with the agent, before its heap.
         {
             auto& registry = Web::HTML::surrounding_agent().fetch_controller_registry;
             auto controllers = registry.controllers();

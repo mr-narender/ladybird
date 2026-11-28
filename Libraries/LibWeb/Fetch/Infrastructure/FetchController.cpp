@@ -10,7 +10,6 @@
 #include <LibWeb/Fetch/Engine/EngineCommand.h>
 #include <LibWeb/Fetch/Engine/EngineEvent.h>
 #include <LibWeb/Fetch/Engine/FetchExecutor.h>
-#include <LibWeb/Fetch/Fetching/PendingResponse.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchParams.h>
@@ -20,7 +19,6 @@
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
-#include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <LibWeb/WebDriver/BiDi/Network.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
@@ -73,16 +71,18 @@ void FetchController::finalize()
         m_registry->remove({}, m_token);
 }
 
-void FetchController::set_algorithms(Badge<FetchParams>, GC::Ref<FetchAlgorithms const> algorithms)
+NonnullRefPtr<FetchParams> FetchController::create_fetch_params(NonnullRefPtr<Request> request, GC::Ref<FetchAlgorithms const> algorithms, NonnullRefPtr<FetchTimingInfo> timing_info, NonnullRefPtr<LoaderConfigSnapshot const> loader_config)
 {
     VERIFY(!m_algorithms);
+    VERIFY(!m_request);
+    VERIFY(!m_network_observation);
+
+    auto fetch_params = FetchParams::create(m_token, m_registry, m_control_block, request, move(timing_info), move(loader_config));
     m_algorithms = algorithms;
     m_control_block->set_body_intent({}, algorithms->body_intent());
-}
-
-void FetchController::set_pending_preloaded_response(RefPtr<Fetching::PendingResponse> pending_preloaded_response)
-{
-    m_pending_preloaded_response = move(pending_preloaded_response);
+    m_network_observation = request->ensure_network_observation();
+    m_request = move(request);
+    return fetch_params;
 }
 
 void FetchController::retarget(TaskDestination task_destination, Engine::BodyIntent body_intent)
@@ -91,42 +91,9 @@ void FetchController::retarget(TaskDestination task_destination, Engine::BodyInt
     m_control_block->set_body_intent({}, body_intent);
 }
 
-void FetchController::set_original_fetch_params(Badge<FetchParams>, FetchParams const& fetch_params)
+NonnullRefPtr<NetworkObservation> FetchController::cors_preflight_network_observation(Engine::CorsPreflightId cors_preflight_id)
 {
-    m_original_fetch_params = fetch_params;
-}
-
-void FetchController::set_network_observation(Badge<FetchParams>, NonnullRefPtr<NetworkObservation> network_observation)
-{
-    VERIFY(!m_network_observation);
-    m_network_observation = move(network_observation);
-}
-
-void FetchController::report_webdriver_bidi_fetch_error(StringView error_text) const
-{
-    if (!WebDriver::BiDi::network_events_enabled())
-        return;
-    if (auto fetch_params = m_original_fetch_params.strong_ref())
-        WebDriver::BiDi::network_fetch_error(*fetch_params, error_text);
-}
-
-void FetchController::cancel_webdriver_bidi_network_interception() const
-{
-    if (!WebDriver::BiDi::is_active())
-        return;
-    if (auto fetch_params = original_fetch_params())
-        WebDriver::BiDi::cancel_network_interception(*fetch_params);
-}
-
-RefPtr<FetchParams> FetchController::original_fetch_params() const
-{
-    return m_original_fetch_params.strong_ref();
-}
-
-void FetchController::set_request(Badge<FetchParams>, NonnullRefPtr<Request> request)
-{
-    VERIFY(!m_request);
-    m_request = move(request);
+    return m_cors_preflight_network_observations.ensure(cors_preflight_id, [] { return NetworkObservation::create(); });
 }
 
 NonnullRefPtr<Request> FetchController::request() const
@@ -192,6 +159,17 @@ void FetchController::resolve_redirect(Engine::Command::ResolveRedirect::Resolut
     m_started_fetch->fetch_executor->post(move(resolve));
 }
 
+void FetchController::resolve_network_interception(Engine::ContinuationId continuation_id, Engine::NetworkDecision decision)
+{
+    VERIFY(m_started_fetch.has_value());
+    Engine::Command::ResolveNetworkInterception resolve {
+        .fetch_id = m_started_fetch->fetch_id,
+        .continuation_id = continuation_id,
+        .decision = move(decision),
+    };
+    m_started_fetch->fetch_executor->post(move(resolve));
+}
+
 void FetchController::when_body_ends(Engine::DeliveryId delivery_id, GC::Ptr<GC::Function<void(HighResolutionTime::DOMHighResTimeStamp)>> steps)
 {
     if (m_fetch_ended)
@@ -234,8 +212,7 @@ void FetchController::abort(JS::Realm& realm, Optional<JS::Value> error)
 {
     // 1. Set controller’s state to "aborted".
     m_control_block->set_state({}, State::Aborted);
-    report_webdriver_bidi_fetch_error("Fetch was aborted"sv);
-    cancel_webdriver_bidi_network_interception();
+    WebDriver::BiDi::network_fetch_stopped(*this, "Fetch was aborted"sv);
 
     // 2. Let fallbackError be an "AbortError" DOMException.
     auto fallback_error = WebIDL::AbortError::create("Fetch was aborted"_utf16);
@@ -263,8 +240,7 @@ void FetchController::terminate()
 {
     // To terminate a fetch controller controller, set controller’s state to "terminated".
     m_control_block->set_state({}, State::Terminated);
-    report_webdriver_bidi_fetch_error("Fetch was terminated"sv);
-    cancel_webdriver_bidi_network_interception();
+    WebDriver::BiDi::network_fetch_stopped(*this, "Fetch was terminated"sv);
 
     stop_request();
 }
@@ -294,8 +270,7 @@ void FetchController::stop_fetch()
         return;
 
     m_control_block->set_state({}, State::Stopped);
-    report_webdriver_bidi_fetch_error("Fetch was stopped"sv);
-    cancel_webdriver_bidi_network_interception();
+    WebDriver::BiDi::network_fetch_stopped(*this, "Fetch was stopped"sv);
 
     // AD-HOC: Some HTML elements need to stop an ongoing fetching process without causing any network error to be raised
     //         (which abort() and terminate() will both do). This is tricky because the fetch process runs across several
